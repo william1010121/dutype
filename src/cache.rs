@@ -232,7 +232,10 @@ impl Reader<'_> {
     }
 
     fn node(&mut self, depth: usize) -> Option<Node> {
-        if depth > 4096 {
+        // Deeper than any sane tree, and keeps the recursion well within
+        // small (2 MiB) thread stacks even in debug builds. Deeper snapshots
+        // are just a cache miss.
+        if depth > 256 {
             return None;
         }
         let name: Box<str> = std::str::from_utf8(self.bytes()?).ok()?.into();
@@ -242,9 +245,14 @@ impl Reader<'_> {
         let mut hardlink_flag = flags & 4 != 0;
         let dir = if flags & 1 != 0 {
             let count = usize::try_from(self.varint()?).ok()?;
-            // `count` is untrusted: never reserve more than a bounded amount up
-            // front; a corrupt count then fails on missing data, not on OOM.
-            let mut children = Vec::with_capacity(count.min(4096));
+            // `count` is untrusted. Every child takes several bytes, so a count
+            // beyond the remaining data is corrupt; and nothing is reserved from
+            // it (not even capped: nested dirs would add up), so memory only
+            // grows with children actually decoded.
+            if count > self.data.len() - self.pos {
+                return None;
+            }
+            let mut children = Vec::new();
             let mut cats = vec![0u64; reg().len()].into_boxed_slice();
             // Checked arithmetic throughout: a damaged file is a miss, never
             // a panic or a wrapped (wrong) total.
@@ -411,6 +419,20 @@ mod tests {
         let huge_file = temp("huge").join("c.bin");
         fs::write(&huge_file, &huge).unwrap();
         assert!(read_from(&huge_file, &src).is_none());
+
+        // A deep chain of dirs each claiming 4096 children (but holding one)
+        // is a miss without reserving memory per level.
+        let mut chain = Vec::from(&MAGIC[..]);
+        chain.extend(reg().fingerprint.to_le_bytes());
+        chain.extend([0, 0, 0]);
+        Writer(&mut chain).bytes(src.as_os_str().as_encoded_bytes()).unwrap();
+        for _ in 0..400 {
+            chain.extend([1, b'd', 0, 0, 1]); // dir "d", size 0
+            Writer(&mut chain).varint(4096).unwrap();
+        }
+        let chain_file = temp("chain").join("c.bin");
+        fs::write(&chain_file, &chain).unwrap();
+        assert!(read_from(&chain_file, &src).is_none());
 
         // A corrupt timestamp is a miss, not a panic.
         let mut bad = Vec::from(&MAGIC[..]);
