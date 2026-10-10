@@ -144,12 +144,14 @@ fn call_tool(name: &str, args: &Value, opts: CacheOpts) -> Result<Value, String>
         }
         let progress = Progress::default();
         let started = Instant::now();
+        let root_dev = scan::device_of(&path).ok();
         let root = scan::scan(&path, one_fs, &progress).map_err(|e| format!("{}: {e}", path.display()))?;
         let snap = Snapshot {
             root,
             cached_at: None,
             scan_time: started.elapsed(),
             errors: progress.errors.load(Ordering::Relaxed),
+            root_dev,
         };
         let value = render(&snap);
         if use_cache {

@@ -125,12 +125,14 @@ fn run(args: Args) -> Result<(), String> {
             None => {
                 let progress = Progress::default();
                 let started = Instant::now();
+                let root_dev = scan::device_of(&path).ok();
                 let root = scan::scan(&path, one_fs, &progress).map_err(|e| format!("{}: {e}", path.display()))?;
                 let snap = Snapshot {
                     root,
                     cached_at: None,
                     scan_time: started.elapsed(),
                     errors: progress.errors.load(Ordering::Relaxed),
+                    root_dev,
                 };
                 if use_cache && let Err(e) = cache::save(&path, one_fs, &snap) {
                     eprintln!("dutype: cannot write cache: {e}");
@@ -175,8 +177,8 @@ fn run(args: Args) -> Result<(), String> {
         // Status to show after a full rescan (e.g. why `r` became `R`).
         let mut carried_status: Option<String> = None;
         loop {
-            // The root's device when this tree was built: `r` compares against
-            // it, so a remounted root forces a full rescan.
+            // The root's device when a fresh tree is scanned (measured before
+            // the scan); a cached tree carries its own. `r` compares against it.
             let root_dev = scan::device_of(&path).ok();
             let snap = match snap.take() {
                 Some(s) => s,
@@ -191,6 +193,7 @@ fn run(args: Args) -> Result<(), String> {
                         cached_at: None,
                         scan_time,
                         errors,
+                        root_dev,
                     }
                 }
             };
@@ -198,9 +201,10 @@ fn run(args: Args) -> Result<(), String> {
                 true => cache::save(&path, one_fs, &snap).err(),
                 false => None,
             };
+            let snap_root_dev = snap.root_dev;
             let mut app = App::new(snap.root, path.clone(), snap.scan_time, snap.errors);
             app.cached_at = snap.cached_at;
-            app.root_dev = root_dev;
+            app.root_dev = snap_root_dev;
             app.show_keys = args.show_keys;
             app.go_to(&location);
             app.status = save_error
@@ -361,6 +365,7 @@ fn save_tree(app: &mut App, one_fs: bool) -> Option<std::io::Error> {
         cached_at: None,
         scan_time: app.scan_time,
         errors: app.errors,
+        root_dev: app.root_dev,
     };
     let result = cache::save(&app.root_path, one_fs, &snap).err();
     app.root = snap.root;

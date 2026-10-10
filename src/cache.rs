@@ -9,9 +9,10 @@ use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-// v4: directories store their own unreadable-entry count; flag bit 2 marks
-// hard-linked files, bit 3 lossy (non-UTF-8) names.
-const MAGIC: &[u8; 8] = b"DUTYPE\0\x04";
+// v5: header stores the root's device; directories store their own
+// unreadable-entry count; flag bit 2 marks hard-linked files, bit 3 lossy
+// (non-UTF-8) names.
+const MAGIC: &[u8; 8] = b"DUTYPE\0\x05";
 
 pub struct Snapshot {
     pub root: Node,
@@ -19,6 +20,9 @@ pub struct Snapshot {
     pub cached_at: Option<SystemTime>,
     pub scan_time: Duration,
     pub errors: u64,
+    /// Device of the root when the tree was scanned. A snapshot whose root is
+    /// now on another device (remounted) is stale and not loaded.
+    pub root_dev: Option<u64>,
 }
 
 pub fn fnv1a(seed: u64, bytes: &[u8]) -> u64 {
@@ -97,7 +101,13 @@ pub fn load(root: &Path, one_fs: bool) -> Option<Snapshot> {
     if inside_cache_dir(root) {
         return None;
     }
-    read_from(&file_for(root, one_fs)?, root)
+    read_from(&file_for(root, one_fs)?, root).filter(|snap| same_device(snap, root))
+}
+
+/// The snapshot's root is still on the device it was scanned on (a root
+/// remounted since describes another filesystem).
+fn same_device(snap: &Snapshot, root: &Path) -> bool {
+    snap.root_dev.is_none() || snap.root_dev == crate::scan::device_of(root).ok()
 }
 
 /// Save a scan. Returns `Ok(None)` without writing when `root_path` is the
@@ -123,6 +133,8 @@ fn write_to(file: &Path, root_path: &Path, snap: &Snapshot) -> io::Result<()> {
         w.varint(at.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()))?;
         w.varint(snap.scan_time.as_millis() as u64)?;
         w.varint(snap.errors)?;
+        w.0.write_all(&[snap.root_dev.is_some() as u8])?;
+        w.varint(snap.root_dev.unwrap_or(0))?;
         w.bytes(root_path.as_os_str().as_encoded_bytes())?;
         w.node(&snap.root)?;
         w.0.into_inner().map_err(|e| e.into_error())?.sync_all()
@@ -145,6 +157,9 @@ fn read_from(file: &Path, root_path: &Path) -> Option<Snapshot> {
     let at = UNIX_EPOCH.checked_add(Duration::from_secs(r.varint()?))?;
     let scan_time = Duration::from_millis(r.varint()?);
     let errors = r.varint()?;
+    let has_dev = *r.take(1)?.first()? != 0;
+    let dev = r.varint()?;
+    let root_dev = has_dev.then_some(dev);
     // A hash collision between two paths must not show the wrong tree.
     if r.bytes()? != root_path.as_os_str().as_encoded_bytes() {
         return None;
@@ -155,6 +170,7 @@ fn read_from(file: &Path, root_path: &Path) -> Option<Snapshot> {
         cached_at: Some(at),
         scan_time,
         errors,
+        root_dev,
     })
 }
 
@@ -343,6 +359,7 @@ mod tests {
             cached_at: None,
             scan_time: Duration::ZERO,
             errors,
+            root_dev: None,
         };
         write_to(&file, &src, &snap(1)).unwrap();
         write_to(&file, &src, &snap(2)).unwrap();
@@ -361,6 +378,7 @@ mod tests {
             cached_at: None,
             scan_time: Duration::ZERO,
             errors: 0,
+            root_dev: None,
         };
         write_to(&file, &src, &snap).unwrap();
         let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
@@ -382,20 +400,24 @@ mod tests {
             cached_at: None,
             scan_time: Duration::from_millis(1234),
             errors: 3,
+            root_dev: Some(42),
         };
 
         let file = temp("out").join("c.bin");
         write_to(&file, &src, &snap).unwrap();
         let back = read_from(&file, &src).unwrap();
         same(&snap.root, &back.root);
-        assert_eq!((back.scan_time, back.errors), (snap.scan_time, 3));
+        assert_eq!(
+            (back.scan_time, back.errors, back.root_dev),
+            (snap.scan_time, 3, Some(42))
+        );
         assert!(back.cached_at.is_some());
 
         // Child sizes whose sum overflows u64 are a miss, not a panic or a
         // wrapped total: root dir (size 5) with two files of u64::MAX bytes.
         let mut over = Vec::from(&MAGIC[..]);
         over.extend(reg().fingerprint.to_le_bytes());
-        over.extend([0, 0, 0]); // cached_at, scan_time, errors
+        over.extend([0, 0, 0, 0, 0]); // cached_at, scan_time, errors, no root dev
         let path = src.as_os_str().as_encoded_bytes();
         Writer(&mut over).bytes(path).unwrap();
         let max = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01];
@@ -412,7 +434,7 @@ mod tests {
         // A huge corrupt child count is a miss, not a huge allocation.
         let mut huge = Vec::from(&MAGIC[..]);
         huge.extend(reg().fingerprint.to_le_bytes());
-        huge.extend([0, 0, 0]);
+        huge.extend([0, 0, 0, 0, 0]);
         Writer(&mut huge).bytes(src.as_os_str().as_encoded_bytes()).unwrap();
         huge.extend([1, b'r', 5, 0, 1]); // dir "r"
         Writer(&mut huge).varint(u64::from(u32::MAX) * 1000).unwrap(); // children
@@ -424,7 +446,7 @@ mod tests {
         // is a miss without reserving memory per level.
         let mut chain = Vec::from(&MAGIC[..]);
         chain.extend(reg().fingerprint.to_le_bytes());
-        chain.extend([0, 0, 0]);
+        chain.extend([0, 0, 0, 0, 0]);
         Writer(&mut chain).bytes(src.as_os_str().as_encoded_bytes()).unwrap();
         for _ in 0..400 {
             chain.extend([1, b'd', 0, 0, 1]); // dir "d", size 0
@@ -442,6 +464,18 @@ mod tests {
         let bad_file = temp("bad").join("c.bin");
         fs::write(&bad_file, &bad).unwrap();
         assert!(read_from(&bad_file, &src).is_none());
+
+        // A snapshot from another device (root remounted since) is stale.
+        let dev = crate::scan::device_of(&src).unwrap();
+        let on = |root_dev| Snapshot {
+            root: scan(&src, true, &Progress::default()).unwrap(),
+            cached_at: None,
+            scan_time: Duration::ZERO,
+            errors: 0,
+            root_dev,
+        };
+        assert!(same_device(&on(Some(dev)), &src));
+        assert!(!same_device(&on(Some(dev.wrapping_add(1))), &src));
 
         // Another path, or a truncated file, is a miss rather than a wrong tree.
         assert!(read_from(&file, &src.join("node_modules")).is_none());
