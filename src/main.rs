@@ -1,5 +1,6 @@
 mod app;
 mod category;
+mod mcp;
 mod report;
 mod scan;
 mod ui;
@@ -29,6 +30,10 @@ struct Args {
     /// Print a JSON report (for scripts and LLM agents)
     #[arg(long)]
     json: bool,
+    /// With --report / --json: only list the largest items of this category
+    /// (e.g. "node_modules", "PDF", "Python env")
+    #[arg(long, value_name = "NAME")]
+    category: Option<String>,
     /// Number of entries in each list of --report / --json
     #[arg(long, default_value_t = 20, value_name = "N")]
     top: usize,
@@ -41,6 +46,9 @@ struct Args {
     /// Print the built-in category rules (a config template) and exit
     #[arg(long)]
     dump_config: bool,
+    /// Run as an MCP server on stdio, for LLM agents
+    #[arg(long)]
+    mcp: bool,
 }
 
 fn main() -> ExitCode {
@@ -65,6 +73,19 @@ fn run(args: Args) -> Result<(), String> {
         return Ok(());
     }
     category::init(args.config.as_deref())?;
+    if args.mcp {
+        return mcp::serve();
+    }
+    let only = match &args.category {
+        Some(name) => Some(category::reg().find_by_name(name).ok_or_else(|| {
+            let names: Vec<_> = category::reg().all().map(|c| c.label()).collect();
+            format!("unknown category {name:?}; known: {}", names.join(", "))
+        })?),
+        None => None,
+    };
+    if only.is_some() && !(args.report || args.json) {
+        return Err("--category needs --report or --json".into());
+    }
 
     let path = std::fs::canonicalize(&args.path).map_err(|e| format!("{}: {e}", args.path.display()))?;
     let progress = Arc::new(Progress::default());
@@ -80,6 +101,18 @@ fn run(args: Args) -> Result<(), String> {
     if args.report || args.json {
         let root = finish(handle)?;
         let errors = progress.errors.load(Ordering::Relaxed);
+        if let Some(cat) = only {
+            let items = report::find(&root, &path, cat, args.top);
+            if args.json {
+                let doc = serde_json::json!({"path": path.display().to_string(), "category": cat.label(), "items": items});
+                print(&serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?);
+                print("\n");
+            } else {
+                print(&report::find_to_text(cat, &items));
+            }
+            std::mem::forget(root);
+            return Ok(());
+        }
         let r = report::build(&root, &path, started.elapsed(), errors, args.top);
         if args.json {
             print(&serde_json::to_string_pretty(&r).map_err(|e| e.to_string())?);

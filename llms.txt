@@ -1,0 +1,17 @@
+# dutype
+
+> Parallel disk usage analyzer that breaks a directory down by kind: file types (video, PDF, archives, ML models, data, code, ...) and special directories (node_modules, Python envs, .git, build output, package caches, ML caches). Interactive TUI for humans; JSON output and an MCP server for scripts and LLM agents. Written in Rust.
+
+Agent usage: always pass `--json` or `--report`; plain `dutype PATH` opens an interactive TUI.
+
+- `dutype --json PATH`: totals, per-category shares, biggest children, biggest special dirs (cleanup candidates), biggest files. Paths are absolute, sizes are bytes allocated on disk (`size_bytes`) plus a human string (`size`).
+- `dutype --json --category NAME PATH`: largest items of one category, e.g. `node_modules`, `Python env`, `Build output`, `Video`, `PDF`. Directory categories return directories, file categories return files.
+- `dutype --top N`: list lengths (default 20). `--cross-fs`: descend into other mounts.
+- `dutype --dump-config`: every category and its rules (TOML). Users extend them in `~/.config/dutype/config.toml`.
+- `dutype --mcp`: MCP server on stdio with read-only tools `disk_usage` and `find_by_category`.
+
+## Docs
+
+- [README](https://github.com/william1010121/dutype/blob/main/README.md): features, install, benchmarks
+- [Agent skill](https://github.com/william1010121/dutype/blob/main/skills/dutype/SKILL.md): workflow for "what is filling my disk"
+- [Built-in categories](https://github.com/william1010121/dutype/blob/main/src/default_config.toml): rule format and defaults

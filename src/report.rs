@@ -167,3 +167,28 @@ pub fn to_text(r: &Report, root: &Node) -> String {
     }
     out
 }
+
+/// Largest items of one category below `root`: the matching special dirs for
+/// directory categories (e.g. every node_modules), files otherwise.
+pub fn find(root: &Node, root_path: &Path, cat: Category, top: usize) -> Vec<Entry> {
+    let mut list = TopN::new(top);
+    let want_dirs = cat.is_dir_kind();
+    walk(root, &mut PathBuf::new(), &mut |n, p| {
+        let hit = if want_dirs { n.special && n.cat == cat } else { !n.is_dir() && n.cat == cat };
+        if hit && list.accepts(|min: &(u64, PathBuf)| n.size > min.0) {
+            list.push((n.size, p.to_path_buf()));
+        }
+        !(hit && want_dirs)
+    });
+    list.into_sorted().into_iter().map(|(s, p)| entry(root_path, p, s, cat)).collect()
+}
+
+pub fn find_to_text(cat: Category, items: &[Entry]) -> String {
+    use std::fmt::Write as _;
+    let total: u64 = items.iter().map(|e| e.size_bytes).sum();
+    let mut out = format!("Largest {} ({} shown, {} total):\n", cat.label(), items.len(), human(total));
+    for e in items {
+        let _ = writeln!(out, "  {:>10}  {}", e.size, e.path);
+    }
+    out
+}

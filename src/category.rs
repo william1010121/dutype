@@ -224,6 +224,10 @@ impl Registry {
         (0..self.defs.len()).map(|i| Category(i as u8))
     }
 
+    pub fn find_by_name(&self, name: &str) -> Option<Category> {
+        self.find(name)
+    }
+
     pub fn other(&self) -> Category {
         self.other
     }
