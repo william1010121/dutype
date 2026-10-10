@@ -247,6 +247,24 @@ mod tests {
         assert_eq!(before.files(), after.files());
     }
 
+    /// A refresh replaces an existing snapshot. `fs::rename` replaces an
+    /// existing file on Windows too; CI runs this on Windows.
+    #[test]
+    fn save_replaces_existing_snapshot() {
+        let src = fs::canonicalize(temp("replace-src")).unwrap();
+        fs::write(src.join("a.txt"), "a").unwrap();
+        let file = temp("replace-out").join("c.bin");
+        let snap = |errors| Snapshot {
+            root: scan(&src, true, &Progress::default()).unwrap(),
+            cached_at: None,
+            scan_time: Duration::ZERO,
+            errors,
+        };
+        write_to(&file, &src, &snap(1)).unwrap();
+        write_to(&file, &src, &snap(2)).unwrap();
+        assert_eq!(read_from(&file, &src).unwrap().errors, 2);
+    }
+
     #[test]
     fn round_trip() {
         let src = temp("src");

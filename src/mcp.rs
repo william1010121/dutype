@@ -72,7 +72,16 @@ fn expand(path: &str) -> PathBuf {
     }
 }
 
-fn call_tool(name: &str, args: &Value, use_cache: bool) -> Result<Value, String> {
+/// Cache behaviour for the whole server, from `dutype --mcp [--cache|--refresh]`.
+#[derive(Clone, Copy)]
+pub struct CacheOpts {
+    pub use_cache: bool,
+    /// `--refresh`: every call rescans (and updates the cache).
+    pub always_refresh: bool,
+}
+
+fn call_tool(name: &str, args: &Value, opts: CacheOpts) -> Result<Value, String> {
+    let use_cache = opts.use_cache;
     let path = args
         .get("path")
         .and_then(Value::as_str)
@@ -82,7 +91,7 @@ fn call_tool(name: &str, args: &Value, use_cache: bool) -> Result<Value, String>
         .and_then(Value::as_u64)
         .map(|t| t.clamp(1, 500) as usize);
     let cross_fs = args.get("cross_fs").and_then(Value::as_bool).unwrap_or(false);
-    let refresh = args.get("refresh").and_then(Value::as_bool).unwrap_or(false);
+    let refresh = opts.always_refresh || args.get("refresh").and_then(Value::as_bool).unwrap_or(false);
     let category = match name {
         "disk_usage" => None,
         "find_by_category" => {
@@ -137,7 +146,7 @@ fn call_tool(name: &str, args: &Value, use_cache: bool) -> Result<Value, String>
     value.map_err(|e| e.to_string())
 }
 
-fn handle(msg: &Value, use_cache: bool) -> Option<Value> {
+fn handle(msg: &Value, opts: CacheOpts) -> Option<Value> {
     let id = msg.get("id")?.clone(); // notifications get no response
     let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
     let result = match method {
@@ -156,7 +165,7 @@ fn handle(msg: &Value, use_cache: bool) -> Option<Value> {
             let name = params.get("name").and_then(Value::as_str).unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
             // Tool failures are results with isError, not protocol errors.
-            Ok(match call_tool(name, &args, use_cache) {
+            Ok(match call_tool(name, &args, opts) {
                 Ok(v) => json!({
                     "content": [{"type": "text", "text": serde_json::to_string(&v).unwrap_or_default()}],
                     "structuredContent": v,
@@ -173,7 +182,7 @@ fn handle(msg: &Value, use_cache: bool) -> Option<Value> {
     })
 }
 
-pub fn serve(use_cache: bool) -> Result<(), String> {
+pub fn serve(opts: CacheOpts) -> Result<(), String> {
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
     for line in stdin.lock().lines() {
@@ -182,7 +191,7 @@ pub fn serve(use_cache: bool) -> Result<(), String> {
             continue;
         }
         let response = match serde_json::from_str::<Value>(&line) {
-            Ok(msg) => handle(&msg, use_cache),
+            Ok(msg) => handle(&msg, opts),
             Err(e) => Some(json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32700, "message": e.to_string()}})),
         };
         if let Some(r) = response {

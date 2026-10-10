@@ -90,7 +90,10 @@ fn run(args: Args) -> Result<(), String> {
     category::init(args.config.as_deref(), args.icons)?;
     let use_cache = args.cache || args.refresh;
     if args.mcp {
-        return mcp::serve(use_cache);
+        return mcp::serve(mcp::CacheOpts {
+            use_cache,
+            always_refresh: args.refresh,
+        });
     }
     let only = match &args.category {
         Some(name) => Some(category::reg().find_by_name(name).ok_or_else(|| {
