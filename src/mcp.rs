@@ -105,6 +105,10 @@ fn call_tool(name: &str, args: &Value, opts: CacheOpts) -> Result<Value, String>
     };
 
     let path = std::fs::canonicalize(expand(path)).map_err(|e| format!("{path}: {e}"))?;
+    if use_cache {
+        // After canonicalize, so a bad path never gets created; before the scan.
+        let _ = cache::prepare();
+    }
     let one_fs = !cross_fs;
     let snap = match (use_cache && !refresh).then(|| cache::load(&path, one_fs)).flatten() {
         Some(s) => s,

@@ -129,6 +129,34 @@ impl Ctx<'_> {
     }
 }
 
+/// `base/name` on disk, where `name` is a node's display name. Names that
+/// were not valid UTF-8 are stored lossily, so if the plain join does not
+/// exist, look for the one entry of `base` whose lossy name matches.
+pub fn resolve_child(base: &Path, name: &str) -> PathBuf {
+    let plain = base.join(name);
+    if fs::symlink_metadata(&plain).is_ok() {
+        return plain;
+    }
+    let mut matches = fs::read_dir(base)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.file_name())
+        .filter(|n| n.to_str().is_none() && n.to_string_lossy() == name);
+    match (matches.next(), matches.next()) {
+        (Some(raw), None) => base.join(raw),
+        _ => plain,
+    }
+}
+
+/// `base` joined with a relative path of display names, resolved like
+/// [`resolve_child`] component by component.
+pub fn resolve_relative(base: &Path, rel: &Path) -> PathBuf {
+    rel.components().fold(base.to_path_buf(), |p, c| {
+        resolve_child(&p, &c.as_os_str().to_string_lossy())
+    })
+}
+
 /// Name for display and classification; no copy when it is valid UTF-8.
 fn display_name(n: OsString) -> Box<str> {
     n.into_string()

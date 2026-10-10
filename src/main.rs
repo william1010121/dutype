@@ -89,9 +89,6 @@ fn run(args: Args) -> Result<(), String> {
     }
     category::init(args.config.as_deref(), args.icons)?;
     let use_cache = args.cache || args.refresh;
-    if use_cache && let Err(e) = cache::prepare() {
-        eprintln!("dutype: cannot create cache directory: {e}");
-    }
     if args.mcp {
         return mcp::serve(mcp::CacheOpts {
             use_cache,
@@ -110,6 +107,11 @@ fn run(args: Args) -> Result<(), String> {
     }
 
     let path = std::fs::canonicalize(&args.path).map_err(|e| format!("{}: {e}", args.path.display()))?;
+    // After validating the target (so an invalid path is never created as a
+    // side effect) and before any scan (see cache::prepare).
+    if use_cache && let Err(e) = cache::prepare() {
+        eprintln!("dutype: cannot create cache directory: {e}");
+    }
     let one_fs = !args.cross_fs;
     let cached = || {
         (use_cache && !args.refresh)
@@ -286,7 +288,7 @@ fn rescan_current(
         app.quit = true;
         app.status = Some("hard links here: rescanning everything".into());
     };
-    let target = app.current_path();
+    let target = app.fs_path();
     if app.current().hardlink {
         full_rescan(app);
         return Ok(());

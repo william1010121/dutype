@@ -4,7 +4,7 @@
 
 use crate::category::{Category, reg};
 use crate::scan::{DirInfo, Node};
-use std::fs::{self, File};
+use std::fs;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -50,8 +50,32 @@ pub fn dir() -> Option<PathBuf> {
 /// they were measured, making the first and later scans disagree.
 pub fn prepare() -> io::Result<()> {
     match dir() {
-        Some(d) => fs::create_dir_all(d),
+        Some(d) => platform::create_private_dir(&d),
         None => Ok(()),
+    }
+}
+
+/// Snapshots list every file and directory name below the scanned root, so
+/// they are private to the user (0600 files, 0700 directories on unix).
+mod platform {
+    use std::fs::{DirBuilder, File, OpenOptions};
+    use std::io;
+    use std::path::Path;
+
+    pub fn create_private_dir(dir: &Path) -> io::Result<()> {
+        let mut b = DirBuilder::new();
+        b.recursive(true);
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
+        b.create(dir)
+    }
+
+    pub fn create_private_file(path: &Path) -> io::Result<File> {
+        let mut o = OpenOptions::new();
+        o.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+        o.open(path)
     }
 }
 
@@ -83,7 +107,7 @@ pub fn save(root_path: &Path, one_fs: bool, snap: &Snapshot) -> io::Result<Optio
         return Ok(None);
     }
     let file = file_for(root_path, one_fs).ok_or_else(|| io::Error::other("no cache directory"))?;
-    fs::create_dir_all(file.parent().unwrap())?;
+    platform::create_private_dir(file.parent().unwrap())?;
     write_to(&file, root_path, snap)?;
     Ok(Some(file))
 }
@@ -92,7 +116,7 @@ fn write_to(file: &Path, root_path: &Path, snap: &Snapshot) -> io::Result<()> {
     // Write a sibling and rename, so readers never see a half-written file.
     let tmp = file.with_extension(format!("tmp{}", std::process::id()));
     let result = (|| {
-        let mut w = Writer(BufWriter::with_capacity(1 << 20, File::create(&tmp)?));
+        let mut w = Writer(BufWriter::with_capacity(1 << 20, platform::create_private_file(&tmp)?));
         w.0.write_all(MAGIC)?;
         w.0.write_all(&reg().fingerprint.to_le_bytes())?;
         let at = snap.cached_at.unwrap_or_else(SystemTime::now);
@@ -313,6 +337,25 @@ mod tests {
         write_to(&file, &src, &snap(1)).unwrap();
         write_to(&file, &src, &snap(2)).unwrap();
         assert_eq!(read_from(&file, &src).unwrap().errors, 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshots_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let src = fs::canonicalize(temp("perm-src")).unwrap();
+        let file = temp("perm-out").join("sub").join("c.bin");
+        platform::create_private_dir(file.parent().unwrap()).unwrap();
+        let snap = Snapshot {
+            root: scan(&src, true, &Progress::default()).unwrap(),
+            cached_at: None,
+            scan_time: Duration::ZERO,
+            errors: 0,
+        };
+        write_to(&file, &src, &snap).unwrap();
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&file), 0o600);
+        assert_eq!(mode(file.parent().unwrap()), 0o700);
     }
 
     #[test]

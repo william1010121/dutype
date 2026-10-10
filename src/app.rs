@@ -134,6 +134,18 @@ impl App {
         p
     }
 
+    /// The current folder's real path on disk, for filesystem operations
+    /// (rescan, copy, reveal); [`Self::current_path`] is for display.
+    pub fn fs_path(&self) -> PathBuf {
+        let mut p = self.root_path.clone();
+        let mut n = &self.root;
+        for &i in &self.stack {
+            n = &n.children()[i];
+            p = crate::scan::resolve_child(&p, &n.name);
+        }
+        p
+    }
+
     /// Names from the root to the current directory.
     pub fn location(&self) -> Vec<Box<str>> {
         let mut n = &self.root;
@@ -294,15 +306,17 @@ impl App {
             }
             KeyCode::Char('o') => {
                 if let Some(i) = self.selected_entry() {
-                    let path = self.current_path().join(&*self.current().children()[i].name);
+                    let path = crate::scan::resolve_child(&self.fs_path(), &self.current().children()[i].name);
                     reveal(&path);
                 }
             }
             KeyCode::Char('y') => {
                 // The selected entry, or the current folder from the breakdown pane.
                 let path = match (self.focus, self.selected_entry()) {
-                    (Focus::Entries, Some(i)) => self.current_path().join(&*self.current().children()[i].name),
-                    _ => self.current_path(),
+                    (Focus::Entries, Some(i)) => {
+                        crate::scan::resolve_child(&self.fs_path(), &self.current().children()[i].name)
+                    }
+                    _ => self.fs_path(),
                 };
                 self.copy(&path);
             }
@@ -369,7 +383,7 @@ impl App {
             KeyCode::PageDown => step(&mut popup.state, len, 15),
             KeyCode::Char('o') | KeyCode::Enter => {
                 if let Some(i) = popup.state.selected() {
-                    reveal(&popup.base.join(&popup.items[i].0));
+                    reveal(&crate::scan::resolve_relative(&popup.base, &popup.items[i].0));
                 }
             }
             KeyCode::Char('y') => {
@@ -458,7 +472,7 @@ impl App {
         let state = first_selected(items.len());
         self.popup = Some(Popup {
             title,
-            base: self.current_path(),
+            base: self.fs_path(),
             items,
             state,
         });
@@ -806,6 +820,12 @@ mod tests {
         assert_eq!(node.files(), 1);
         let excluded = scan_excluding(&root, true, &Progress::default(), Some(&weird)).unwrap();
         assert_eq!((excluded.files(), excluded.errors()), (0, 0));
+        // TUI paths for filesystem operations resolve the raw name.
+        let mut app = App::new(full(&root), root.clone(), Duration::ZERO, 0);
+        app.go_to(&[app.root.children()[0].name.clone()]);
+        assert_eq!(app.fs_path(), weird);
+        assert_ne!(app.current_path(), weird);
+        assert!(crate::scan::is_real_dir(&app.fs_path()));
     }
 
     #[test]
