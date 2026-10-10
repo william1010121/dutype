@@ -6,6 +6,8 @@
 #
 # Fields:
 #   name        label shown in the UI
+#   icon        emoji shown with `icons = "emoji"` (default)
+#   nerd_icon   Nerd Font glyph shown with `icons = "nerd"`
 #   color       256-color index (0-255) or "#rrggbb"
 #   extensions  file extensions, case-insensitive, without the dot
 #   dirs        directory names; everything below counts toward the category.
@@ -14,6 +16,9 @@
 #               "dirname/marker" only matches directories called `dirname`.
 #   weak        a more specific category found inside overrides this one
 #
+# Top-level `icons` picks the icon set: "emoji" (default), "nerd" (needs a
+# Nerd Font, https://www.nerdfonts.com) or "none". `--icons` overrides it.
+#
 # Directory rules beat extensions: a .js file inside node_modules counts as
 # node_modules, a .pdf inside .Trash counts as Trash.
 
@@ -21,17 +26,23 @@
 
 [[category]]
 name = "node_modules"
+icon = "📦"
+nerd_icon = "\uE718"
 color = 203
 dirs = ["node_modules", "bower_components", "jspm_packages"]
 
 [[category]]
 name = "Python env"
+icon = "🐍"
+nerd_icon = "\uE73C"
 color = 214
 dirs = ["__pypackages__", ".tox", ".nox"]
 markers = ["pyvenv.cfg", "conda-meta"]
 
 [[category]]
 name = "Python cache"
+icon = "🧹"
+nerd_icon = "\uF12D"
 color = 180
 dirs = [
   "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".ipynb_checkpoints",
@@ -40,6 +51,8 @@ dirs = [
 
 [[category]]
 name = "ML cache"
+icon = "🧠"
+nerd_icon = "\uF0E7"
 color = 205
 dirs = [
   "huggingface", "kagglehub", ".cache/torch", ".cache/whisper", ".keras", ".ollama/models",
@@ -48,11 +61,15 @@ dirs = [
 
 [[category]]
 name = ".git / VCS"
+icon = "🌿"
+nerd_icon = "\uF1D3"
 color = 166
 dirs = [".git", ".hg", ".svn", ".jj", ".bzr"]
 
 [[category]]
 name = "Build output"
+icon = "🔨"
+nerd_icon = "\uF0AD"
 color = 170
 dirs = [
   ".next", ".nuxt", ".turbo", ".parcel-cache", ".svelte-kit", ".angular", ".dart_tool",
@@ -64,6 +81,8 @@ markers = ["target/CACHEDIR.TAG"]
 
 [[category]]
 name = "Package cache"
+icon = "📥"
+nerd_icon = "\uF019"
 color = 137
 dirs = [
   ".npm", ".pnpm-store", ".yarn/cache", ".bun/install", ".gradle", ".m2", ".nuget", ".ivy2",
@@ -74,6 +93,8 @@ dirs = [
 
 [[category]]
 name = "Cache"
+icon = "💾"
+nerd_icon = "\uF1DA"
 color = 139
 weak = true
 dirs = [".cache", "Caches", "Cache", "CachedData", "GPUCache", "Code Cache", "ShaderCache"]
@@ -81,6 +102,8 @@ markers = ["CACHEDIR.TAG"]
 
 [[category]]
 name = "Trash"
+icon = "🚮"
+nerd_icon = "\uF1F8"
 color = 240
 dirs = [".Trash", ".Trashes", "$RECYCLE.BIN", "share/Trash"]
 
@@ -88,6 +111,8 @@ dirs = [".Trash", ".Trashes", "$RECYCLE.BIN", "share/Trash"]
 
 [[category]]
 name = "Video"
+icon = "🎬"
+nerd_icon = "\uF1C8"
 color = 39
 extensions = [
   "mp4", "mkv", "mov", "avi", "wmv", "flv", "webm", "m4v", "mpg", "mpeg", "3gp", "mts",
@@ -96,6 +121,8 @@ extensions = [
 
 [[category]]
 name = "Image"
+icon = "🎨"
+nerd_icon = "\uF1C5"
 color = 42
 extensions = [
   "jpg", "jpeg", "jfif", "png", "gif", "bmp", "tif", "tiff", "webp", "heic", "heif", "avif",
@@ -106,6 +133,8 @@ extensions = [
 
 [[category]]
 name = "Audio"
+icon = "🎵"
+nerd_icon = "\uF1C7"
 color = 51
 extensions = [
   "mp3", "wav", "flac", "aac", "ogg", "oga", "m4a", "wma", "aif", "aiff", "opus", "mid",
@@ -114,11 +143,15 @@ extensions = [
 
 [[category]]
 name = "PDF"
+icon = "📕"
+nerd_icon = "\uF1C1"
 color = 227
 extensions = ["pdf"]
 
 [[category]]
 name = "Document"
+icon = "📝"
+nerd_icon = "\uF0F6"
 color = 229
 extensions = [
   "doc", "docx", "dotx", "rtf", "odt", "pages", "xls", "xlsx", "xlsm", "xlsb", "ods",
@@ -128,6 +161,8 @@ extensions = [
 
 [[category]]
 name = "Archive"
+icon = "🧳"
+nerd_icon = "\uF1C6"
 color = 141
 extensions = [
   "zip", "tar", "gz", "tgz", "bz2", "tbz", "tbz2", "xz", "txz", "zst", "lz4", "lz", "lzma",
@@ -136,6 +171,8 @@ extensions = [
 
 [[category]]
 name = "Installer/disk"
+icon = "💿"
+nerd_icon = "\uF0A0"
 color = 99
 extensions = [
   "dmg", "iso", "img", "pkg", "mpkg", "msi", "msix", "exe", "deb", "rpm", "apk", "aab",
@@ -145,6 +182,8 @@ extensions = [
 
 [[category]]
 name = "ML model"
+icon = "🤖"
+nerd_icon = "\uF2DB"
 color = 201
 extensions = [
   "pt", "pth", "ckpt", "safetensors", "onnx", "h5", "keras", "pb", "tflite", "gguf", "ggml",
@@ -153,6 +192,8 @@ extensions = [
 
 [[category]]
 name = "Data"
+icon = "📊"
+nerd_icon = "\uF1C0"
 color = 117
 extensions = [
   "csv", "tsv", "json", "jsonl", "ndjson", "xml", "parquet", "orc", "avro", "feather",
@@ -162,21 +203,29 @@ extensions = [
 
 [[category]]
 name = "Font"
+icon = "🔤"
+nerd_icon = "\uF031"
 color = 179
 extensions = ["ttf", "otf", "ttc", "woff", "woff2", "eot", "fon", "pfb"]
 
 [[category]]
 name = "Log"
+icon = "📜"
+nerd_icon = "\uF022"
 color = 102
 extensions = ["log", "trace", "dmp", "crash", "ips"]
 
 [[category]]
 name = "Temp/backup"
+icon = "⏳"
+nerd_icon = "\uF017"
 color = 95
 extensions = ["tmp", "temp", "bak", "old", "orig", "swp", "swo", "part", "crdownload", "download"]
 
 [[category]]
 name = "Binary"
+icon = "🧩"
+nerd_icon = "\uF1B2"
 color = 66
 extensions = [
   "o", "obj", "a", "lib", "so", "dylib", "dll", "rlib", "rmeta", "class", "pyc", "pyo",
@@ -185,6 +234,8 @@ extensions = [
 
 [[category]]
 name = "Code"
+icon = "💻"
+nerd_icon = "\uF1C9"
 color = 120
 extensions = [
   "rs", "py", "pyi", "js", "mjs", "cjs", "ts", "mts", "cts", "tsx", "jsx", "go", "c", "h",
@@ -198,4 +249,6 @@ extensions = [
 
 [[category]]
 name = "Other"
+icon = "📄"
+nerd_icon = "\uF016"
 color = 245

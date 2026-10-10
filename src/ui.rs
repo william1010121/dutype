@@ -1,5 +1,5 @@
 use crate::app::{App, Focus, Mode, node_at};
-use crate::category::{Category, by_size, dominant};
+use crate::category::{Category, by_size, dominant, folder_icon};
 use crate::scan::Node;
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Flex, Layout, Rect};
@@ -121,8 +121,33 @@ fn panel_title(text: &str, focused: bool) -> Line<'static> {
     Line::from(Span::styled(format!(" {text} "), style))
 }
 
+/// Approximate perceived brightness (0-255) of a palette color.
+fn luminance(c: Color) -> u32 {
+    const LEVELS: [u32; 6] = [0, 95, 135, 175, 215, 255];
+    let (r, g, b) = match c {
+        Color::Rgb(r, g, b) => (r as u32, g as u32, b as u32),
+        Color::Indexed(n @ 16..=231) => {
+            let n = n as u32 - 16;
+            (LEVELS[(n / 36) as usize], LEVELS[(n / 6 % 6) as usize], LEVELS[(n % 6) as usize])
+        }
+        Color::Indexed(n @ 232..=255) => {
+            let v = 8 + 10 * (n as u32 - 232);
+            (v, v, v)
+        }
+        _ => (200, 200, 200),
+    };
+    (299 * r + 587 * g + 114 * b) / 1000
+}
+
+/// Icon (or a colored dot with `icons = "none"`) plus a space. Nerd Font glyphs
+/// take the color; emoji keep their own.
+fn icon_span(icon: Option<&'static str>, color: Color) -> Span<'static> {
+    Span::styled(format!("{} ", icon.unwrap_or("●")), Style::new().fg(color))
+}
+
 fn chip(label: &str, bg: Color) -> Span<'static> {
-    Span::styled(format!(" {label} "), Style::new().fg(Color::Black).bg(bg).bold())
+    let fg = if luminance(bg) < 120 { Color::Indexed(255) } else { Color::Black };
+    Span::styled(format!(" {label} "), Style::new().fg(fg).bg(bg).bold())
 }
 
 fn highlight() -> Style {
@@ -143,7 +168,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Layout::vertical([Constraint::Length(5), Constraint::Min(0), Constraint::Length(1)]).areas(f.area());
     let [left, right] =
         Layout::horizontal([Constraint::Percentage(58), Constraint::Percentage(42)]).areas(body);
-    let [breakdown, details] = Layout::vertical([Constraint::Min(6), Constraint::Length(10)]).areas(right);
+    let [breakdown, details] = Layout::vertical([Constraint::Min(6), Constraint::Length(11)]).areas(right);
 
     draw_header(f, app, header);
     draw_entries(f, app, left);
@@ -171,7 +196,23 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 }
 
 /// `a › b › c`, dropping leading segments with `…` when it does not fit.
+fn home_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(Into::into)
+}
+
+/// The path with the home directory shown as `~`.
+pub fn display_path(path: &Path) -> String {
+    match home_dir().and_then(|h| path.strip_prefix(h).ok().map(Path::to_path_buf)) {
+        Some(rest) if rest.as_os_str().is_empty() => "~".into(),
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
+    }
+}
+
 fn breadcrumb(path: &Path, width: usize) -> Line<'static> {
+    let home_rest = home_dir().and_then(|h| path.strip_prefix(h).ok().map(Path::to_path_buf));
+    let root = if home_rest.is_some() { "~" } else { "/" };
+    let path = home_rest.as_deref().unwrap_or(path);
     let segs: Vec<String> = path
         .components()
         .filter_map(|c| match c {
@@ -181,7 +222,7 @@ fn breadcrumb(path: &Path, width: usize) -> Line<'static> {
         .collect();
     let sep = || Span::styled(" › ", Style::new().fg(DIM));
     let build = |from: usize| {
-        let mut spans = vec![Span::styled(if from > 0 { "…" } else { "/" }, Style::new().fg(MUTED))];
+        let mut spans = vec![Span::styled(if from > 0 { "…" } else { root }, Style::new().fg(MUTED))];
         for (i, s) in segs.iter().enumerate().skip(from) {
             spans.push(sep());
             let style = if i + 1 == segs.len() { Style::new().fg(ACCENT).bold() } else { Style::new().fg(MUTED) };
@@ -239,7 +280,11 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
 
 fn entry_name(c: &Node) -> Line<'static> {
     let cats = c.cats();
-    let dot = Span::styled("● ", Style::new().fg(dominant(&cats).color()));
+    let dot = if c.is_dir() && !c.special {
+        icon_span(folder_icon(), dominant(&cats).color())
+    } else {
+        icon_span(c.cat.icon(), c.cat.color())
+    };
     if c.is_dir() {
         let mut spans = vec![
             dot,
@@ -317,10 +362,10 @@ fn draw_breakdown(f: &mut Frame, app: &mut App, area: Rect) {
     let rows = app.breakdown.iter().map(|b| {
         let mut cells = vec![
             Cell::from(Line::from(vec![
-                Span::styled("● ", Style::new().fg(b.color)),
+                icon_span(b.cat.icon(), b.cat.color()),
                 Span::styled(b.label.clone(), Style::new().fg(TEXT)),
             ])),
-            Cell::from(Span::styled(smooth_bar(ratio(b.size, max), BREAKDOWN_BAR), Style::new().fg(b.color))),
+            Cell::from(Span::styled(smooth_bar(ratio(b.size, max), BREAKDOWN_BAR), Style::new().fg(b.cat.color()))),
             Cell::from(Span::styled(pct(b.size, total), Style::new().fg(MUTED))),
             Cell::from(Line::from(Span::styled(human(b.size), size_style(b.size))).right_aligned()),
         ];
@@ -382,15 +427,19 @@ fn draw_details(f: &mut Frame, app: &App, area: Rect) {
 
     let items = by_size(&cats);
     let rows_left = (inner.height as usize).saturating_sub(lines.len());
-    let col = (inner.width as usize / 2).max(1);
-    for pair in items.chunks(2).take(rows_left) {
-        let mut spans = Vec::new();
-        for c in pair {
-            let text = format!("{} {} {}", c.label(), human(cats[c.index()]), pct(cats[c.index()], node.size).trim());
-            spans.push(Span::styled("● ", Style::new().fg(c.color())));
-            spans.push(Span::styled(format!("{text:<w$}", w = col.saturating_sub(2)), Style::new().fg(MUTED)));
-        }
-        lines.push(Line::from(spans));
+    let top = items.first().map_or(1, |c| cats[c.index()]);
+    for c in items.iter().take(rows_left) {
+        let v = cats[c.index()];
+        let icon = icon_span(c.icon(), c.color());
+        // icon + label (15) + bar + size (11) + pct (7)
+        let bar_w = inner.width.saturating_sub(icon.width() as u16 + 15 + 11 + 7).max(4);
+        lines.push(Line::from(vec![
+            icon,
+            Span::styled(format!("{:<15}", c.label()), Style::new().fg(TEXT)),
+            Span::styled(format!("{:<w$}", smooth_bar(ratio(v, top), bar_w), w = bar_w as usize), Style::new().fg(c.color())),
+            Span::styled(format!("{:>11}", human(v)), size_style(v)),
+            Span::styled(format!("{:>7}", pct(v, node.size)), Style::new().fg(MUTED)),
+        ]));
     }
     f.render_widget(Paragraph::new(lines), inner);
 }
@@ -466,7 +515,7 @@ pub fn draw_scanning(f: &mut Frame, path: &Path, files: u64, bytes: u64, elapsed
         Line::from(vec![
             Span::styled(format!("{frame} "), Style::new().fg(ACCENT).bold()),
             Span::styled("Scanning ", Style::new().fg(TEXT).bold()),
-            Span::styled(path.display().to_string(), Style::new().fg(ACCENT)),
+            Span::styled(display_path(path), Style::new().fg(ACCENT)),
         ]),
         Line::default(),
         stat("files", format!("{}  ({}/s)", thousands(files), thousands((files as f64 / secs) as u64))),

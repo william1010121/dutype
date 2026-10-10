@@ -10,9 +10,21 @@ pub const DEFAULT_CONFIG: &str = include_str!("default_config.toml");
 #[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
 pub struct Category(u8);
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, clap::ValueEnum, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IconMode {
+    #[default]
+    Emoji,
+    /// Nerd Font glyphs (needs a patched font)
+    Nerd,
+    None,
+}
+
 pub struct CategoryDef {
     pub name: String,
     pub color: Color,
+    pub icon: Option<String>,
+    pub nerd_icon: Option<String>,
     /// Has directory rules: its popup lists matching directories, not files.
     pub dir_kind: bool,
     pub weak: bool,
@@ -30,6 +42,7 @@ pub struct Registry {
     /// this check runs for every directory entry.
     marker_lens: u64,
     other: Category,
+    pub icons: IconMode,
 }
 
 #[derive(Default)]
@@ -43,6 +56,7 @@ struct MarkerRule {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ConfigFile {
+    icons: Option<IconMode>,
     #[serde(default)]
     category: Vec<CategoryConfig>,
 }
@@ -52,6 +66,8 @@ struct ConfigFile {
 struct CategoryConfig {
     name: String,
     color: Option<ColorConfig>,
+    icon: Option<String>,
+    nerd_icon: Option<String>,
     #[serde(default)]
     extensions: Vec<String>,
     #[serde(default)]
@@ -91,7 +107,7 @@ pub fn reg() -> &'static Registry {
 
 /// Load built-in rules plus the user config (explicit path, or the default
 /// location if it exists). Returns the user config path that was applied.
-pub fn init(explicit: Option<&Path>) -> Result<Option<PathBuf>, String> {
+pub fn init(explicit: Option<&Path>, icons: Option<IconMode>) -> Result<Option<PathBuf>, String> {
     let path = match explicit {
         Some(p) => Some(p.to_path_buf()),
         None => default_config_path().filter(|p| p.exists()),
@@ -102,8 +118,11 @@ pub fn init(explicit: Option<&Path>) -> Result<Option<PathBuf>, String> {
     };
     let mut sources = vec![DEFAULT_CONFIG];
     sources.extend(user.as_deref());
-    let registry = Registry::from_sources(&sources)
+    let mut registry = Registry::from_sources(&sources)
         .map_err(|e| format!("{}: {e}", path.as_deref().unwrap_or(Path::new("config")).display()))?;
+    if let Some(mode) = icons {
+        registry.icons = mode;
+    }
     let _ = REGISTRY.set(registry);
     Ok(path)
 }
@@ -127,12 +146,22 @@ impl Registry {
         let mut r = Registry::default();
         for src in sources {
             let cfg: ConfigFile = toml::from_str(src).map_err(|e| e.to_string())?;
+            if let Some(mode) = cfg.icons {
+                r.icons = mode;
+            }
             for c in cfg.category {
                 r.apply(c)?;
             }
         }
         r.other = r.find("Other").unwrap_or_else(|| {
-            r.defs.push(CategoryDef { name: "Other".into(), color: Color::Indexed(245), dir_kind: false, weak: false });
+            r.defs.push(CategoryDef {
+                name: "Other".into(),
+                color: Color::Indexed(245),
+                icon: None,
+                nerd_icon: None,
+                dir_kind: false,
+                weak: false,
+            });
             Category(r.defs.len() as u8 - 1)
         });
         Ok(r)
@@ -155,6 +184,8 @@ impl Registry {
                 self.defs.insert(at, CategoryDef {
                     name: c.name.clone(),
                     color: Color::Indexed(250),
+                    icon: None,
+                    nerd_icon: None,
                     dir_kind: false,
                     weak: false,
                 });
@@ -164,6 +195,12 @@ impl Registry {
         let def = &mut self.defs[id.0 as usize];
         if let Some(color) = &c.color {
             def.color = color.to_color()?;
+        }
+        if c.icon.is_some() {
+            def.icon = c.icon;
+        }
+        if c.nerd_icon.is_some() {
+            def.nerd_icon = c.nerd_icon;
         }
         if let Some(w) = c.weak {
             def.weak = w;
@@ -298,6 +335,15 @@ impl Category {
         self.def().dir_kind
     }
 
+    /// Icon for the active icon mode, if any.
+    pub fn icon(self) -> Option<&'static str> {
+        match reg().icons {
+            IconMode::Emoji => Some(self.def().icon.as_deref().unwrap_or("📄")),
+            IconMode::Nerd => Some(self.def().nerd_icon.as_deref().unwrap_or("\u{f016}")),
+            IconMode::None => None,
+        }
+    }
+
     pub fn is_weak(self) -> bool {
         self.def().weak
     }
@@ -312,6 +358,15 @@ pub fn by_size(cats: &[u64]) -> Vec<Category> {
 
 pub fn dominant(cats: &[u64]) -> Category {
     reg().all().max_by_key(|c| cats[c.index()]).unwrap_or(reg().other())
+}
+
+/// Icon for a plain (non-special) directory in the active icon mode.
+pub fn folder_icon() -> Option<&'static str> {
+    match reg().icons {
+        IconMode::Emoji => Some("📁"),
+        IconMode::Nerd => Some("\u{f07b}"),
+        IconMode::None => None,
+    }
 }
 
 pub fn ext_of(name: &str) -> Option<&str> {

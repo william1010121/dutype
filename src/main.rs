@@ -43,6 +43,9 @@ struct Args {
     /// Category config file [default: ~/.config/dutype/config.toml]
     #[arg(long, value_name = "FILE")]
     config: Option<PathBuf>,
+    /// Icon set for categories [default: emoji, or `icons` in the config]
+    #[arg(long, value_enum, value_name = "SET")]
+    icons: Option<category::IconMode>,
     /// Print the built-in category rules (a config template) and exit
     #[arg(long)]
     dump_config: bool,
@@ -72,7 +75,7 @@ fn run(args: Args) -> Result<(), String> {
         print(category::DEFAULT_CONFIG);
         return Ok(());
     }
-    category::init(args.config.as_deref())?;
+    category::init(args.config.as_deref(), args.icons)?;
     if args.mcp {
         return mcp::serve();
     }

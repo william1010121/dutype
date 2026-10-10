@@ -1,7 +1,6 @@
 use crate::category::{self, Category, by_size, reg};
 use crate::scan::{Node, TopN, walk};
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
-use ratatui::style::Color;
 use ratatui::widgets::TableState;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -31,7 +30,8 @@ pub enum Key {
 pub struct BreakdownItem {
     pub key: Key,
     pub label: String,
-    pub color: Color,
+    /// Category used for color and icon (for extensions: what they classify as).
+    pub cat: Category,
     pub size: u64,
     pub count: Option<u64>,
 }
@@ -118,7 +118,7 @@ impl App {
                     .map(|c| BreakdownItem {
                         key: Key::Cat(c),
                         label: c.label().to_string(),
-                        color: c.color(),
+                        cat: c,
                         size: cats[c.index()],
                         count: None,
                     })
@@ -294,7 +294,7 @@ fn ext_breakdown(cur: &Node) -> Vec<BreakdownItem> {
         .map(|(ext, (size, count, cat))| BreakdownItem {
             label: if ext == "(none)" { ext.clone() } else { format!(".{ext}") },
             key: Key::Ext(ext),
-            color: cat.color(),
+            cat,
             size,
             count: Some(count),
         })

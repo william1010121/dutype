@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-label="dutype logo">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1b2230"/>
+      <stop offset="1" stop-color="#0e1219"/>
+    </linearGradient>
+    <clipPath id="r1"><rect x="44" y="76" width="168" height="28" rx="7"/></clipPath>
+    <clipPath id="r2"><rect x="44" y="118" width="126" height="28" rx="7"/></clipPath>
+    <clipPath id="r3"><rect x="44" y="160" width="80" height="28" rx="7"/></clipPath>
+  </defs>
+  <rect width="256" height="256" rx="56" fill="url(#bg)"/>
+  <rect x="1.5" y="1.5" width="253" height="253" rx="54.5" fill="none" stroke="#5fafff" stroke-opacity=".35" stroke-width="3"/>
+  <!-- terminal dots -->
+  <circle cx="52" cy="46" r="7" fill="#ff5f5f"/>
+  <circle cx="74" cy="46" r="7" fill="#ffaf00"/>
+  <circle cx="96" cy="46" r="7" fill="#00d787"/>
+  <!-- tracks -->
+  <rect x="44" y="76" width="168" height="28" rx="7" fill="#232b38"/>
+  <rect x="44" y="118" width="168" height="28" rx="7" fill="#232b38"/>
+  <rect x="44" y="160" width="168" height="28" rx="7" fill="#232b38"/>
+  <!-- stacked bars, colored by category -->
+  <g clip-path="url(#r1)">
+    <rect x="44" y="76" width="64" height="28" fill="#ff00ff"/>
+    <rect x="108" y="76" width="48" height="28" fill="#ffaf00"/>
+    <rect x="156" y="76" width="34" height="28" fill="#00afff"/>
+    <rect x="190" y="76" width="22" height="28" fill="#00d787"/>
+  </g>
+  <g clip-path="url(#r2)">
+    <rect x="44" y="118" width="58" height="28" fill="#ff5f5f"/>
+    <rect x="102" y="118" width="40" height="28" fill="#d75fd7"/>
+    <rect x="142" y="118" width="28" height="28" fill="#d75f00"/>
+  </g>
+  <g clip-path="url(#r3)">
+    <rect x="44" y="160" width="44" height="28" fill="#ffff5f"/>
+    <rect x="88" y="160" width="36" height="28" fill="#af87ff"/>
+  </g>
+  <!-- prompt cursor -->
+  <rect x="44" y="204" width="22" height="6" rx="3" fill="#5fafff"/>
+</svg>
