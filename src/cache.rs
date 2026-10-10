@@ -48,16 +48,32 @@ fn file_for(root: &Path, one_fs: bool) -> Option<PathBuf> {
     Some(dir()?.join(format!("{h:016x}-{}.bin", if one_fs { "x" } else { "all" })))
 }
 
+/// Whether `root` is the cache directory or inside it. Such scans are never
+/// cached: saving would change the tree that was just measured.
+fn inside_cache_dir(root: &Path) -> bool {
+    dir()
+        .and_then(|d| fs::canonicalize(d).ok())
+        .is_some_and(|d| root.starts_with(d))
+}
+
 /// The cached scan of `root`, if there is a valid one.
 pub fn load(root: &Path, one_fs: bool) -> Option<Snapshot> {
+    if inside_cache_dir(root) {
+        return None;
+    }
     read_from(&file_for(root, one_fs)?, root)
 }
 
-pub fn save(root_path: &Path, one_fs: bool, snap: &Snapshot) -> io::Result<PathBuf> {
+/// Save a scan. Returns `Ok(None)` without writing when `root_path` is the
+/// cache directory or inside it.
+pub fn save(root_path: &Path, one_fs: bool, snap: &Snapshot) -> io::Result<Option<PathBuf>> {
+    if inside_cache_dir(root_path) {
+        return Ok(None);
+    }
     let file = file_for(root_path, one_fs).ok_or_else(|| io::Error::other("no cache directory"))?;
     fs::create_dir_all(file.parent().unwrap())?;
     write_to(&file, root_path, snap)?;
-    Ok(file)
+    Ok(Some(file))
 }
 
 fn write_to(file: &Path, root_path: &Path, snap: &Snapshot) -> io::Result<()> {
@@ -188,19 +204,25 @@ impl Reader<'_> {
             // Every node takes at least 4 bytes; bounds a corrupt count.
             let mut children = Vec::with_capacity(count.min((self.data.len() - self.pos) / 4));
             let mut cats = vec![0u64; reg().len()].into_boxed_slice();
-            let (mut files, mut child_bytes) = (0, 0u64);
+            // Checked arithmetic throughout: a damaged file is a miss, never
+            // a panic or a wrapped (wrong) total.
+            let (mut files, mut child_bytes) = (0u64, 0u64);
             for _ in 0..count {
                 let c = self.node(depth + 1)?;
-                child_bytes += c.size;
-                files += c.files();
+                child_bytes = child_bytes.checked_add(c.size)?;
+                files = files.checked_add(c.files())?;
                 match &c.dir {
-                    Some(d) => cats.iter_mut().zip(d.cats.iter()).for_each(|(a, b)| *a += b),
-                    None => cats[c.cat.index()] += c.size,
+                    Some(d) => {
+                        for (a, b) in cats.iter_mut().zip(d.cats.iter()) {
+                            *a = a.checked_add(*b)?;
+                        }
+                    }
+                    None => cats[c.cat.index()] = cats[c.cat.index()].checked_add(c.size)?,
                 }
                 children.push(c);
             }
             // The directory's own blocks, as in `scan_dir`.
-            cats[cat.index()] += size.checked_sub(child_bytes)?;
+            cats[cat.index()] = cats[cat.index()].checked_add(size.checked_sub(child_bytes)?)?;
             Some(Box::new(DirInfo { cats, files, children }))
         } else {
             None
@@ -287,6 +309,24 @@ mod tests {
         same(&snap.root, &back.root);
         assert_eq!((back.scan_time, back.errors), (snap.scan_time, 3));
         assert!(back.cached_at.is_some());
+
+        // Child sizes whose sum overflows u64 are a miss, not a panic or a
+        // wrapped total: root dir (size 5) with two files of u64::MAX bytes.
+        let mut over = Vec::from(&MAGIC[..]);
+        over.extend(reg().fingerprint.to_le_bytes());
+        over.extend([0, 0, 0]); // cached_at, scan_time, errors
+        let path = src.as_os_str().as_encoded_bytes();
+        Writer(&mut over).bytes(path).unwrap();
+        let max = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01];
+        over.extend([1, b'r', 5, 0, 1, 2]); // name "r", size 5, cat 0, dir, 2 children
+        for _ in 0..2 {
+            over.extend([1, b'f']);
+            over.extend(max);
+            over.extend([0, 0]); // cat 0, file
+        }
+        let over_file = temp("over").join("c.bin");
+        fs::write(&over_file, &over).unwrap();
+        assert!(read_from(&over_file, &src).is_none());
 
         // A corrupt timestamp is a miss, not a panic.
         let mut bad = Vec::from(&MAGIC[..]);
