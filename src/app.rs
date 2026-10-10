@@ -183,6 +183,22 @@ impl App {
         Some(p)
     }
 
+    /// Like [`Self::fs_path`], but `None` unless every folder from the root
+    /// down is still a real directory: a component replaced by a symlink
+    /// would make a subtree scan follow it, unlike a full scan.
+    pub fn fs_path_checked(&self) -> Option<PathBuf> {
+        let mut p = self.root_path.clone();
+        let mut n = &self.root;
+        for &i in &self.stack {
+            n = &n.children()[i];
+            p = crate::scan::resolve_child(&p, n)?;
+            if !crate::scan::is_real_dir(&p) {
+                return None;
+            }
+        }
+        Some(p)
+    }
+
     /// Real path of child `i` of the current folder.
     fn child_fs_path(&self, i: usize) -> Option<PathBuf> {
         crate::scan::resolve_child(&self.fs_path()?, &self.current().children()[i])
@@ -936,6 +952,23 @@ mod tests {
         app.open_popup();
         let popup = app.popup.as_ref().unwrap();
         assert_eq!(popup.items[0].2, Some(weird.join("f.bin")));
+    }
+
+    /// An ancestor replaced by a symlink makes the checked path unavailable,
+    /// so `r` falls back to a full rescan.
+    #[cfg(unix)]
+    #[test]
+    fn ancestor_symlink_blocks_subtree_rescan() {
+        let root = temp("ancestor");
+        fs::create_dir_all(root.join("a/b")).unwrap();
+        fs::create_dir_all(root.join("elsewhere/b")).unwrap();
+        let mut app = App::new(full(&root), root.clone(), Duration::ZERO, 0);
+        app.go_to(&["a".into(), "b".into()]);
+        assert_eq!(app.fs_path_checked(), Some(root.join("a/b")));
+        fs::rename(root.join("a"), root.join("a-old")).unwrap();
+        std::os::unix::fs::symlink(root.join("elsewhere"), root.join("a")).unwrap();
+        assert!(crate::scan::is_real_dir(&root.join("a/b"))); // the leaf alone looks fine
+        assert_eq!(app.fs_path_checked(), None);
     }
 
     #[test]

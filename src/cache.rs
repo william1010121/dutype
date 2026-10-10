@@ -84,15 +84,32 @@ mod platform {
         o.open(path)
     }
 
-    /// The cache directory must belong to the user who owns `own_file` (just
-    /// created by us); a directory owned by someone else is refused. Our own
-    /// directory is tightened to 0700 if group or others have access (e.g.
-    /// created under umask 002), so nobody else can read or plant entries.
+    /// Owned by the current user and not writable by group or others, so
+    /// nobody else could have written it. A missing path is not private.
     #[cfg(unix)]
-    pub fn check_private_dir(dir: &Path, own_file: &Path) -> io::Result<()> {
+    pub fn is_private(path: &Path) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let me = unsafe { libc::geteuid() };
+        std::fs::symlink_metadata(path).is_ok_and(|m| m.uid() == me && m.mode() & 0o022 == 0)
+    }
+
+    #[cfg(not(unix))]
+    pub fn is_private(path: &Path) -> bool {
+        path.exists()
+    }
+
+    /// Before writing: the cache directory must belong to the current user;
+    /// one owned by someone else is refused. Our own directory is tightened
+    /// to 0700 if group or others have access (e.g. created under umask 002),
+    /// so nobody else can read or plant entries.
+    #[cfg(unix)]
+    pub fn check_private_dir(dir: &Path, _own_file: &Path) -> io::Result<()> {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        let (d, f) = (std::fs::symlink_metadata(dir)?, std::fs::symlink_metadata(own_file)?);
-        if !d.is_dir() || d.uid() != f.uid() {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let me = unsafe { libc::geteuid() };
+        let d = std::fs::symlink_metadata(dir)?;
+        if !d.is_dir() || d.uid() != me {
             return Err(io::Error::other(format!(
                 "refusing cache directory {}: not a directory owned by you",
                 dir.display()
@@ -128,7 +145,13 @@ pub fn load(root: &Path, one_fs: bool) -> Option<Snapshot> {
     if inside_cache_dir(root) {
         return None;
     }
-    read_from(&file_for(root, one_fs)?, root).filter(|snap| same_device(snap, root))
+    let file = file_for(root, one_fs)?;
+    // Only trust snapshots nobody else could have written (read-only check:
+    // permissions are tightened on the next save, not here).
+    if !platform::is_private(file.parent()?) || !platform::is_private(&file) {
+        return None;
+    }
+    read_from(&file, root).filter(|snap| same_device(snap, root))
 }
 
 /// The snapshot's root is still on the device it was scanned on (a root
@@ -174,7 +197,10 @@ fn write_to(file: &Path, root_path: &Path, snap: &Snapshot) -> io::Result<()> {
         w.0.into_inner().map_err(|e| e.into_error())?.sync_all()
     })();
     match result {
-        Ok(()) => fs::rename(&tmp, file),
+        Ok(()) => fs::rename(&tmp, file).inspect_err(|_| {
+            // Each attempt uses a new temp name; never leave a full copy behind.
+            let _ = fs::remove_file(&tmp);
+        }),
         Err(e) => {
             let _ = fs::remove_file(&tmp);
             Err(e)
@@ -442,6 +468,24 @@ mod tests {
             errors: 0,
             root_dev: None,
         };
+        // Snapshots in a directory others can write are not trusted on read.
+        fs::write(dir.join("probe"), "x").unwrap();
+        fs::set_permissions(dir.join("probe"), fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(platform::is_private(&dir) && platform::is_private(&dir.join("probe")));
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(!platform::is_private(&dir));
+        fs::set_permissions(dir.join("probe"), fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(!platform::is_private(&dir.join("probe")));
+
+        // A failed rename (the target is a directory) leaves no temp file.
+        let blocked = dir.join("blocked.bin");
+        fs::create_dir_all(blocked.join("inside")).unwrap();
+        let count = || fs::read_dir(&dir).unwrap().count();
+        let before = count();
+        assert!(write_to(&blocked, &src, &snap).is_err());
+        assert_eq!(count(), before);
+
         // Our own directory open to others is tightened before writing.
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o777)).unwrap();
         write_to(&dir.join("c.bin"), &src, &snap).unwrap();

@@ -297,12 +297,13 @@ fn rescan_current(
         app.status = Some("hard links here: rescanning everything".into());
     };
     // A non-UTF-8 folder name on the way may collide with a sibling's name.
-    let target = match app.fs_path() {
+    // Every folder on the way must still be a real directory (not a symlink).
+    let target = match app.fs_path_checked() {
         Some(t) if !app.path_has_lossy_name() => t,
         _ => {
             app.rescan = Some(Rescan::All);
             app.quit = true;
-            app.status = Some("non-UTF-8 name on this path: rescanning everything".into());
+            app.status = Some("path changed or has a non-UTF-8 name: rescanning everything".into());
             return Ok(());
         }
     };
