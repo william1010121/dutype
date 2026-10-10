@@ -99,12 +99,15 @@ npx dutype --report ~      # plain-text report
 Coming soon: `cargo install dutype` (crates.io), `pip install dutype` / `uv tool install dutype` (PyPI) and `brew install william1010121/tap/dutype`.
 
 **Kaggle / Colab / Jupyter**: notebooks have no TTY, so use the report modes.
-Notebook images ship Node.js, so `npx` works as is:
+The shell installer only needs `curl` and puts the binary in `~/.cargo/bin`:
 
 ```python
-!npx -y dutype --report --top 10 /kaggle/working
-!npx -y dutype --report --category "ML model" /kaggle/input
+!curl -LsSf https://github.com/william1010121/dutype/releases/latest/download/dutype-installer.sh | sh
+!~/.cargo/bin/dutype --report --top 10 /kaggle/working
+!~/.cargo/bin/dutype --report --category "ML model" /kaggle/input
 ```
+
+If the notebook has Node.js, `!npx -y dutype --report /kaggle/working` works too.
 
 ## Usage
 
