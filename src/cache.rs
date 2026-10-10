@@ -294,6 +294,11 @@ impl Reader<'_> {
         for shift in (0..64).step_by(7) {
             let b = *self.data.get(self.pos)?;
             self.pos += 1;
+            // The 10th byte holds only bit 63: anything more would be silently
+            // truncated, turning a damaged size into a plausible wrong one.
+            if shift == 63 && b > 1 {
+                return None;
+            }
             v |= ((b & 0x7f) as u64) << shift;
             if b & 0x80 == 0 {
                 return Some(v);
@@ -561,6 +566,18 @@ mod tests {
         let chain_file = temp("chain").join("c.bin");
         fs::write(&chain_file, &chain).unwrap();
         assert!(read_from(&chain_file, &src).is_none());
+
+        // An overlong varint (10th byte > 1) is rejected, not truncated.
+        let mut r = Reader {
+            data: &[0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02],
+            pos: 0,
+        };
+        assert_eq!(r.varint(), None);
+        let mut r = Reader {
+            data: &[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01],
+            pos: 0,
+        };
+        assert_eq!(r.varint(), Some(u64::MAX));
 
         // A corrupt timestamp is a miss, not a panic.
         let mut bad = Vec::from(&MAGIC[..]);
