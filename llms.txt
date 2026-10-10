@@ -2,7 +2,7 @@
 
 > Parallel disk usage analyzer that breaks a directory down by kind: file types (video, PDF, archives, ML models, data, code, ...) and special directories (node_modules, Python envs, .git, build output, package caches, ML caches). Interactive TUI for humans; JSON output and an MCP server for scripts and LLM agents. Written in Rust.
 
-Agent usage: always pass `--json` or `--report`; plain `dutype PATH` opens an interactive TUI.
+Agent usage: always pass `--json` or `--report`; plain `dutype PATH` opens an interactive TUI. Without an install, prefix commands with `npx -y` (e.g. `npx -y dutype --json PATH`).
 
 - `dutype --json PATH`: totals, per-category shares, biggest children, biggest special dirs (cleanup candidates), biggest files. Paths are absolute, sizes are bytes allocated on disk (`size_bytes`) plus a human string (`size`).
 - `dutype --json --category NAME PATH`: largest items of one category, e.g. `node_modules`, `Python env`, `Build output`, `Video`, `PDF`. Directory categories return directories, file categories return files.
