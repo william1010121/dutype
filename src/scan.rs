@@ -133,13 +133,26 @@ impl Ctx<'_> {
 }
 
 /// The on-disk path of `node` inside `base`. A valid UTF-8 name is joined
-/// as is. A lossy name is matched against `base`'s non-UTF-8 entries only
+/// as is; an escaped non-UTF-8 name (unix) is decoded to its exact bytes.
+/// Elsewhere a lossy name is matched against `base`'s non-UTF-8 entries only
 /// (never a UTF-8 sibling that renders the same); `None` unless exactly one
 /// matches.
 pub fn resolve_child(base: &Path, node: &Node) -> Option<PathBuf> {
     if !node.lossy {
         return Some(base.join(&*node.name));
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let raw = unescape(&node.name)?;
+        Some(base.join(std::ffi::OsStr::from_bytes(&raw)))
+    }
+    #[cfg(not(unix))]
+    resolve_lossy(base, node)
+}
+
+#[cfg(not(unix))]
+fn resolve_lossy(base: &Path, node: &Node) -> Option<PathBuf> {
     let mut matches = fs::read_dir(base)
         .ok()?
         .flatten()
@@ -160,13 +173,66 @@ pub fn resolve_chain(base: &Path, ancestors: &[&Node], node: &Node) -> Option<Pa
         .try_fold(base.to_path_buf(), |p, n| resolve_child(&p, n))
 }
 
-/// Name for display and classification, and whether it is lossy (not valid
-/// UTF-8). No copy when it is valid UTF-8.
+/// Name for display and classification, and whether it is not valid UTF-8.
+/// No copy when it is valid UTF-8. On unix an invalid name is escaped like
+/// `ls -b` (`\xff` for bad bytes, `\\` for backslashes): distinct raw names
+/// stay distinct and [`unescape`] recovers the exact bytes.
 fn display_name(n: OsString) -> (Box<str>, bool) {
     match n.into_string() {
         Ok(s) => (s.into(), false),
+        #[cfg(unix)]
+        Err(n) => (
+            escape(std::os::unix::ffi::OsStrExt::as_bytes(n.as_os_str())).into(),
+            true,
+        ),
+        #[cfg(not(unix))]
         Err(n) => (n.to_string_lossy().into_owned().into(), true),
     }
+}
+
+#[cfg(unix)]
+fn escape(raw: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(raw.len() + 8);
+    for chunk in raw.utf8_chunks() {
+        for c in chunk.valid().chars() {
+            match c {
+                '\\' => out.push_str("\\\\"),
+                c => out.push(c),
+            }
+        }
+        for b in chunk.invalid() {
+            let _ = write!(out, "\\x{b:02x}");
+        }
+    }
+    out
+}
+
+/// Inverse of [`escape`]; `None` for a string it could not have produced.
+#[cfg(unix)]
+fn unescape(name: &str) -> Option<Vec<u8>> {
+    let b = name.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match (b[i], b.get(i + 1)) {
+            (b'\\', Some(b'\\')) => {
+                out.push(b'\\');
+                i += 2;
+            }
+            (b'\\', Some(b'x')) => {
+                let hex = std::str::from_utf8(b.get(i + 2..i + 4)?).ok()?;
+                out.push(u8::from_str_radix(hex, 16).ok()?);
+                i += 4;
+            }
+            (b'\\', _) => return None,
+            (c, _) => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    Some(out)
 }
 
 fn file_name_of(p: &Path) -> String {
@@ -451,5 +517,20 @@ impl<T: Ord> TopN<T> {
         let mut v: Vec<T> = self.heap.into_iter().map(|Reverse(t)| t).collect();
         v.sort_by(|a, b| b.cmp(a));
         v
+    }
+}
+
+#[cfg(all(test, unix))]
+mod escape_tests {
+    use super::{escape, unescape};
+
+    #[test]
+    fn round_trips_and_stays_distinct() {
+        for raw in [&b"d\xffir"[..], b"d\xfeir", b"a\\b\xff", b"\\x41", b"ok", b"\xc3"] {
+            assert_eq!(unescape(&escape(raw)).unwrap(), raw, "{raw:?}");
+        }
+        assert_ne!(escape(b"d\xffir"), escape(b"d\xfeir"));
+        assert_eq!(escape(b"d\xffir"), "d\\xffir");
+        assert!(unescape("bad\\q").is_none());
     }
 }

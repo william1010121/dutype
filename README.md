@@ -126,7 +126,9 @@ With `--cache`, scans are saved in `~/.cache/dutype` (`$XDG_CACHE_HOME/dutype`,
 `%LOCALAPPDATA%\dutype\cache` on Windows, or `$DUTYPE_CACHE_DIR`). A cache is
 reused until you rescan (`r` for the current folder, `R` for everything) or pass `--refresh`; it is ignored automatically
 after a dutype upgrade or a category rule change. dutype never counts its own
-cache directory, so totals are the same with or without `--cache`. `--json` reports `cached_at`
+cache directory, so totals are the same with or without `--cache`. Snapshots
+list every file name, so they are private: the cache directory must belong to
+you and is set to mode 0700, snapshots to 0600. `--json` reports `cached_at`
 (unix time) when the result came from the cache.
 
 | Key | Action |

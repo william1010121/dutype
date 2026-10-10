@@ -74,12 +74,39 @@ mod platform {
         b.create(dir)
     }
 
+    /// Create a new file exclusively: fails if anything (including a
+    /// symlink planted by someone else) already exists at `path`.
     pub fn create_private_file(path: &Path) -> io::Result<File> {
         let mut o = OpenOptions::new();
-        o.write(true).create(true).truncate(true);
+        o.write(true).create_new(true);
         #[cfg(unix)]
         std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
         o.open(path)
+    }
+
+    /// The cache directory must belong to the user who owns `own_file` (just
+    /// created by us); a directory owned by someone else is refused. Our own
+    /// directory is tightened to 0700 if group or others have access (e.g.
+    /// created under umask 002), so nobody else can read or plant entries.
+    #[cfg(unix)]
+    pub fn check_private_dir(dir: &Path, own_file: &Path) -> io::Result<()> {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let (d, f) = (std::fs::symlink_metadata(dir)?, std::fs::symlink_metadata(own_file)?);
+        if !d.is_dir() || d.uid() != f.uid() {
+            return Err(io::Error::other(format!(
+                "refusing cache directory {}: not a directory owned by you",
+                dir.display()
+            )));
+        }
+        if d.mode() & 0o077 != 0 {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    pub fn check_private_dir(_: &Path, _: &Path) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -124,9 +151,16 @@ pub fn save(root_path: &Path, one_fs: bool, snap: &Snapshot) -> io::Result<Optio
 
 fn write_to(file: &Path, root_path: &Path, snap: &Snapshot) -> io::Result<()> {
     // Write a sibling and rename, so readers never see a half-written file.
-    let tmp = file.with_extension(format!("tmp{}", std::process::id()));
+    // The temp name is unpredictable and created exclusively (never through
+    // an existing file or symlink), and the directory must be private.
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64);
+    let tmp = file.with_extension(format!("tmp{}-{nonce:x}", std::process::id()));
+    let out = platform::create_private_file(&tmp)?;
     let result = (|| {
-        let mut w = Writer(BufWriter::with_capacity(1 << 20, platform::create_private_file(&tmp)?));
+        platform::check_private_dir(file.parent().unwrap_or(Path::new(".")), &tmp)?;
+        let mut w = Writer(BufWriter::with_capacity(1 << 20, out));
         w.0.write_all(MAGIC)?;
         w.0.write_all(&reg().fingerprint.to_le_bytes())?;
         let at = snap.cached_at.unwrap_or_else(SystemTime::now);
@@ -384,6 +418,34 @@ mod tests {
         let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&file), 0o600);
         assert_eq!(mode(file.parent().unwrap()), 0o700);
+    }
+
+    /// A planted file or symlink at the temp path is never written through,
+    /// and our cache directory is made private before writing.
+    #[cfg(unix)]
+    #[test]
+    fn temp_files_are_exclusive_and_dir_must_be_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp("excl-dir");
+        let victim = dir.join("victim.txt");
+        fs::write(&victim, "keep").unwrap();
+        let link = dir.join("planted.tmp");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+        assert!(platform::create_private_file(&link).is_err());
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "keep");
+
+        let src = fs::canonicalize(temp("excl-src")).unwrap();
+        let snap = Snapshot {
+            root: scan(&src, true, &Progress::default()).unwrap(),
+            cached_at: None,
+            scan_time: Duration::ZERO,
+            errors: 0,
+            root_dev: None,
+        };
+        // Our own directory open to others is tightened before writing.
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o777)).unwrap();
+        write_to(&dir.join("c.bin"), &src, &snap).unwrap();
+        assert_eq!(fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
     }
 
     #[test]

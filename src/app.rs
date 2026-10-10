@@ -45,10 +45,10 @@ pub enum Rescan {
     All,
 }
 
-/// One folder of a location. The name alone is not an identity: a lossy
-/// (non-UTF-8) name can render like a sibling's real name, so lossiness is
-/// part of the match. Two lossy names with the same rendering stay
-/// indistinguishable, as the tree does not keep raw names.
+/// One folder of a location. The name alone is not an identity: an escaped
+/// non-UTF-8 name (e.g. `d\xffir`) can be spelled exactly like a sibling's
+/// real UTF-8 name, so lossiness is part of the match. On unix escapes are
+/// reversible, so two different non-UTF-8 names never share a Step.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Step {
     pub name: Box<str>,
@@ -886,12 +886,20 @@ mod tests {
         assert_ne!(app.current_path(), weird);
         assert!(app.path_has_lossy_name());
 
-        // A UTF-8 sibling equal to the lossy rendering must not be picked.
-        let twin = root.join("d\u{fffd}ir");
+        // A UTF-8 sibling spelled like the escaped rendering must not be
+        // picked, nor a second invalid name (distinct escapes).
+        let twin = root.join("d\\xffir");
+        let other = root.join(OsStr::from_bytes(b"d\xfeir"));
+        fs::create_dir_all(&other).unwrap();
         fs::create_dir_all(&twin).unwrap();
         let app = {
             let mut app = App::new(full(&root), root.clone(), Duration::ZERO, 0);
-            let i = app.root.children().iter().position(|c| c.lossy).unwrap();
+            let i = app
+                .root
+                .children()
+                .iter()
+                .position(|c| c.lossy && &*c.name == "d\\xffir")
+                .unwrap();
             let name = app.root.children()[i].name.clone();
             assert!(app.root.children().iter().any(|c| !c.lossy && c.name == name));
             app.states[0].select(Some(i));
@@ -904,13 +912,23 @@ mod tests {
         // in either direction.
         let mut app = App::new(full(&root), root.clone(), Duration::ZERO, 0);
         let utf8 = app.root.children().iter().find(|c| !c.lossy && c.is_dir()).unwrap();
-        let lossy = app.root.children().iter().find(|c| c.lossy).unwrap();
-        let (to_utf8, to_lossy) = ([Step::of(utf8)], [Step::of(lossy)]);
+        let to = |name: &str| {
+            let n = app
+                .root
+                .children()
+                .iter()
+                .find(|c| c.lossy && &*c.name == name)
+                .unwrap();
+            [Step::of(n)]
+        };
+        let (to_utf8, to_ff, to_fe) = ([Step::of(utf8)], to("d\\xffir"), to("d\\xfeir"));
         app.go_to(&to_utf8);
         assert_eq!(app.fs_path(), Some(twin.clone()));
-        let mut app = App::new(full(&root), root.clone(), Duration::ZERO, 0);
-        app.go_to(&to_lossy);
-        assert_eq!(app.fs_path(), Some(weird.clone()));
+        for (steps, want) in [(&to_ff, &weird), (&to_fe, &other)] {
+            let mut app = App::new(full(&root), root.clone(), Duration::ZERO, 0);
+            app.go_to(steps);
+            assert_eq!(app.fs_path().as_ref(), Some(want));
+        }
 
         // Popup results keep the raw path too (the twin is empty, so the
         // only file in the biggest category is the one in the raw dir).
