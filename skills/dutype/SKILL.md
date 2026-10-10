@@ -24,8 +24,8 @@ dutype --dump-config                      # list all categories and rules
 Never run plain `dutype PATH` from an agent: without `--json` / `--report` it
 opens an interactive TUI and waits for keyboard input.
 
-Install if missing: `cargo install dutype`, `npm i -g dutype`, `pip install dutype`
-or `brew install william1010121/tap/dutype`.
+If `dutype` is not installed, run it through npx with the same arguments:
+`npx -y dutype --json PATH` (or install with `npm i -g dutype`).
 
 ## JSON report fields
 
@@ -54,4 +54,4 @@ or `brew install william1010121/tap/dutype`.
 
 `dutype --mcp` is an MCP server on stdio with two read-only tools,
 `disk_usage(path, top?, cross_fs?)` and `find_by_category(path, category, top?)`.
-Claude Code: `claude mcp add dutype -- dutype --mcp`.
+Claude Code: `claude mcp add dutype -- npx -y dutype --mcp`.

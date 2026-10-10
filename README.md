@@ -7,11 +7,16 @@
 **Disk usage by kind.**<br>
 `du` tells you *where* your space went. dutype tells you *what* it is.
 
-[![crates.io](https://img.shields.io/crates/v/dutype?logo=rust&color=e67e22)](https://crates.io/crates/dutype)
 [![npm](https://img.shields.io/npm/v/dutype?logo=npm&color=cb3837)](https://www.npmjs.com/package/dutype)
-[![PyPI](https://img.shields.io/pypi/v/dutype?logo=pypi&logoColor=white&color=3775a9)](https://pypi.org/project/dutype/)
+[![GitHub release](https://img.shields.io/github/v/release/william1010121/dutype?logo=github)](https://github.com/william1010121/dutype/releases/latest)
 [![CI](https://github.com/william1010121/dutype/actions/workflows/ci.yml/badge.svg)](https://github.com/william1010121/dutype/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+
+**Try it now, nothing to install:**
+
+```bash
+npx dutype
+```
 
 <img src="https://raw.githubusercontent.com/william1010121/dutype/main/assets/demo.gif" alt="dutype demo" width="900">
 
@@ -73,28 +78,41 @@ syscalls.
 
 ## Install
 
-| Package manager | Command |
+**Run without installing** (needs Node.js 16+; downloads a native binary, nothing runs in Node):
+
+```bash
+npx dutype                 # current directory
+npx dutype ~/Projects      # any directory
+npx dutype --report ~      # plain-text report
+```
+
+**Install:**
+
+| Method | Command |
 |:---|:---|
-| Cargo | `cargo install dutype` &nbsp;·&nbsp; prebuilt: `cargo binstall dutype` |
-| npm | `npm install -g dutype` &nbsp;·&nbsp; or run once: `npx dutype` |
-| pip / uv / pipx | `pip install dutype` &nbsp;·&nbsp; `uv tool install dutype` &nbsp;·&nbsp; `pipx install dutype` |
-| Homebrew | `brew install william1010121/tap/dutype` |
+| npm | `npm install -g dutype` |
 | Shell (macOS, Linux) | `curl -LsSf https://github.com/william1010121/dutype/releases/latest/download/dutype-installer.sh \| sh` |
 | PowerShell (Windows) | `irm https://github.com/william1010121/dutype/releases/latest/download/dutype-installer.ps1 \| iex` |
-| Binaries | [GitHub Releases](https://github.com/william1010121/dutype/releases) for macOS (arm64, x64), Linux (x64, arm64, static musl) and Windows |
+| Binaries | [GitHub Releases](https://github.com/william1010121/dutype/releases/latest): macOS (arm64, x64), Linux (x64, arm64, static musl), Windows (x64) |
+| From source | `cargo install --git https://github.com/william1010121/dutype` |
 
-**Kaggle / Colab / Jupyter**: `pip install` gives you a native binary, no
-Rust needed. Notebooks have no TTY, so use the report modes:
+Coming soon: `cargo install dutype` (crates.io), `pip install dutype` / `uv tool install dutype` (PyPI) and `brew install william1010121/tap/dutype`.
+
+**Kaggle / Colab / Jupyter**: notebooks have no TTY, so use the report modes.
+The shell installer only needs `curl` and puts the binary in `~/.cargo/bin`:
 
 ```python
-!pip install -q dutype
-!dutype --report --top 10 /kaggle/working
-!dutype --report --category "ML model" /kaggle/input
+!curl -LsSf https://github.com/william1010121/dutype/releases/latest/download/dutype-installer.sh | sh
+!~/.cargo/bin/dutype --report --top 10 /kaggle/working
+!~/.cargo/bin/dutype --report --category "ML model" /kaggle/input
 ```
+
+If the notebook has Node.js, `!npx -y dutype --report /kaggle/working` works too.
 
 ## Usage
 
 ```bash
+npx dutype             # try it without installing
 dutype                 # current directory, interactive
 dutype ~/Projects      # any directory
 dutype --report ~      # plain-text report
@@ -198,15 +216,16 @@ candidates) and the biggest files, with absolute paths and byte sizes:
 `disk_usage(path, top?, cross_fs?)` and `find_by_category(path, category, top?)`:
 
 ```bash
-claude mcp add dutype -- dutype --mcp      # Claude Code
-codex mcp add dutype -- dutype --mcp       # Codex CLI
+claude mcp add dutype -- npx -y dutype --mcp      # Claude Code
+codex mcp add dutype -- npx -y dutype --mcp       # Codex CLI
 ```
 
 ```json
-{ "mcpServers": { "dutype": { "command": "dutype", "args": ["--mcp"] } } }
+{ "mcpServers": { "dutype": { "command": "npx", "args": ["-y", "dutype", "--mcp"] } } }
 ```
 
-(Claude Desktop, Cursor and other MCP clients.)
+(Claude Desktop, Cursor and other MCP clients.) With dutype installed, use
+`dutype --mcp` as the command instead of `npx -y dutype --mcp`.
 
 **Agent skill** — [`skills/dutype/SKILL.md`](skills/dutype/SKILL.md) teaches an
 agent the "my disk is full" workflow. For Claude Code:
