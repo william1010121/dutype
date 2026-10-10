@@ -45,6 +45,38 @@ pub enum Rescan {
     All,
 }
 
+/// One folder of a location. The name alone is not an identity: a lossy
+/// (non-UTF-8) name can render like a sibling's real name, so lossiness is
+/// part of the match. Two lossy names with the same rendering stay
+/// indistinguishable, as the tree does not keep raw names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Step {
+    pub name: Box<str>,
+    pub lossy: bool,
+}
+
+impl Step {
+    fn of(n: &Node) -> Self {
+        Step {
+            name: n.name.clone(),
+            lossy: n.lossy,
+        }
+    }
+
+    fn matches(&self, n: &Node) -> bool {
+        n.lossy == self.lossy && n.name == self.name
+    }
+}
+
+impl From<&str> for Step {
+    fn from(name: &str) -> Self {
+        Step {
+            name: name.into(),
+            lossy: false,
+        }
+    }
+}
+
 pub struct Popup {
     pub title: String,
     /// (path relative to the folder the popup was opened in, for display;
@@ -166,26 +198,26 @@ impl App {
         })
     }
 
-    /// Names from the root to the current directory.
-    pub fn location(&self) -> Vec<Box<str>> {
+    /// Folders from the root to the current directory.
+    pub fn location(&self) -> Vec<Step> {
         let mut n = &self.root;
         self.stack
             .iter()
             .map(|&i| {
                 n = &n.children()[i];
-                n.name.clone()
+                Step::of(n)
             })
             .collect()
     }
 
-    /// Descend into the directories named by `location` (as far as they exist).
-    pub fn go_to(&mut self, location: &[Box<str>]) {
-        for name in location {
+    /// Descend into the directories of `location` (as far as they exist).
+    pub fn go_to(&mut self, location: &[Step]) {
+        for step in location {
             let Some(i) = self
                 .current()
                 .children()
                 .iter()
-                .position(|c| c.name == *name && c.is_dir())
+                .position(|c| c.is_dir() && step.matches(c))
             else {
                 break;
             };
@@ -210,13 +242,13 @@ impl App {
     pub fn replace_current(&mut self, mut fresh: Node) {
         let location = self.location();
         // Selected entry name at every level, to restore after re-sorting.
-        let selected: Vec<Option<Box<str>>> = (0..=self.stack.len())
+        let selected: Vec<Option<Step>> = (0..=self.stack.len())
             .map(|k| {
                 let node = node_at(&self.root, &self.stack[..k]);
                 self.states[k]
                     .selected()
                     .and_then(|i| node.children().get(i))
-                    .map(|c| c.name.clone())
+                    .map(Step::of)
             })
             .collect();
 
@@ -257,7 +289,7 @@ impl App {
             let node = node_at(&self.root, &self.stack[..k]);
             let pos = name
                 .as_ref()
-                .and_then(|n| node.children().iter().position(|c| c.name == *n));
+                .and_then(|step| node.children().iter().position(|c| step.matches(c)));
             self.states[k].select(pos.or(if node.children().is_empty() { None } else { Some(0) }));
         }
         self.popup = None;
@@ -668,7 +700,7 @@ mod tests {
 
         let mut app = App::new(full(&root), root.clone(), Duration::ZERO, 0);
         app.go_to(&["small".into(), "inner".into()]);
-        assert_eq!(app.location(), vec![Box::from("small"), Box::from("inner")]);
+        assert_eq!(app.location(), vec![Step::from("small"), Step::from("inner")]);
 
         // "small" grows past "big", so the root's order has to change.
         fs::write(root.join("small/inner/c.zip"), vec![0u8; 900_000]).unwrap();
@@ -683,7 +715,7 @@ mod tests {
         app.replace_current(fresh);
 
         same(&app.root, &full(&root));
-        assert_eq!(app.location(), vec![Box::from("small"), Box::from("inner")]);
+        assert_eq!(app.location(), vec![Step::from("small"), Step::from("inner")]);
         assert_eq!(app.root.children()[app.stack[0]].name.as_ref(), "small");
     }
 
@@ -848,7 +880,8 @@ mod tests {
         assert_eq!((excluded.files(), excluded.errors()), (0, 0));
         // TUI paths for filesystem operations resolve the raw name.
         let mut app = App::new(full(&root), root.clone(), Duration::ZERO, 0);
-        app.go_to(&[app.root.children()[0].name.clone()]);
+        let lossy = app.root.children().iter().find(|c| c.lossy).unwrap();
+        app.go_to(&[Step::of(lossy)]);
         assert_eq!(app.fs_path(), Some(weird.clone()));
         assert_ne!(app.current_path(), weird);
         assert!(app.path_has_lossy_name());
@@ -865,6 +898,18 @@ mod tests {
             app.enter();
             app
         };
+        assert_eq!(app.fs_path(), Some(weird.clone()));
+
+        // Going back to a location picks the sibling with the same lossiness,
+        // in either direction.
+        let mut app = App::new(full(&root), root.clone(), Duration::ZERO, 0);
+        let utf8 = app.root.children().iter().find(|c| !c.lossy && c.is_dir()).unwrap();
+        let lossy = app.root.children().iter().find(|c| c.lossy).unwrap();
+        let (to_utf8, to_lossy) = ([Step::of(utf8)], [Step::of(lossy)]);
+        app.go_to(&to_utf8);
+        assert_eq!(app.fs_path(), Some(twin.clone()));
+        let mut app = App::new(full(&root), root.clone(), Duration::ZERO, 0);
+        app.go_to(&to_lossy);
         assert_eq!(app.fs_path(), Some(weird.clone()));
 
         // Popup results keep the raw path too (the twin is empty, so the
