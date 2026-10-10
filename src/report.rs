@@ -78,7 +78,12 @@ fn shares(cats: &[u64], total: u64, limit: usize) -> Vec<CategoryShare> {
 }
 
 fn entry(root: &Path, rel: PathBuf, size: u64, cat: Category) -> Entry {
-    Entry { path: root.join(rel).display().to_string(), category: cat.label(), size_bytes: size, size: human(size) }
+    Entry {
+        path: root.join(rel).display().to_string(),
+        category: cat.label(),
+        size_bytes: size,
+        size: human(size),
+    }
 }
 
 pub fn build(root: &Node, root_path: &Path, elapsed: Duration, unreadable: u64, top: usize) -> Report {
@@ -142,7 +147,11 @@ pub fn build(root: &Node, root_path: &Path, elapsed: Duration, unreadable: u64, 
 pub fn to_text(r: &Report, root: &Node) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
-    let _ = writeln!(out, "{}  —  {}  ·  {} files  ·  {:.2}s", r.path, r.size, r.files, r.scan_seconds);
+    let _ = writeln!(
+        out,
+        "{}  —  {}  ·  {} files  ·  {:.2}s",
+        r.path, r.size, r.files, r.scan_seconds
+    );
     if r.unreadable > 0 {
         let _ = writeln!(out, "({} entries unreadable)", r.unreadable);
     }
@@ -153,7 +162,14 @@ pub fn to_text(r: &Report, root: &Node) -> String {
     let _ = writeln!(out, "\nLargest entries:");
     for (c, node) in r.children.iter().zip(root.children()) {
         let suffix = if node.is_dir() { "/" } else { "" };
-        let _ = writeln!(out, "  {:>10}  {:<14} {}{}", c.size, dominant(&node.cats()).label(), c.name, suffix);
+        let _ = writeln!(
+            out,
+            "  {:>10}  {:<14} {}{}",
+            c.size,
+            dominant(&node.cats()).label(),
+            c.name,
+            suffix
+        );
     }
     if !r.special_dirs.is_empty() {
         let _ = writeln!(out, "\nLargest special directories:");
@@ -174,19 +190,31 @@ pub fn find(root: &Node, root_path: &Path, cat: Category, top: usize) -> Vec<Ent
     let mut list = TopN::new(top);
     let want_dirs = cat.is_dir_kind();
     walk(root, &mut PathBuf::new(), &mut |n, p| {
-        let hit = if want_dirs { n.special && n.cat == cat } else { !n.is_dir() && n.cat == cat };
+        let hit = if want_dirs {
+            n.special && n.cat == cat
+        } else {
+            !n.is_dir() && n.cat == cat
+        };
         if hit && list.accepts(|min: &(u64, PathBuf)| n.size > min.0) {
             list.push((n.size, p.to_path_buf()));
         }
         !(hit && want_dirs)
     });
-    list.into_sorted().into_iter().map(|(s, p)| entry(root_path, p, s, cat)).collect()
+    list.into_sorted()
+        .into_iter()
+        .map(|(s, p)| entry(root_path, p, s, cat))
+        .collect()
 }
 
 pub fn find_to_text(cat: Category, items: &[Entry]) -> String {
     use std::fmt::Write as _;
     let total: u64 = items.iter().map(|e| e.size_bytes).sum();
-    let mut out = format!("Largest {} ({} shown, {} total):\n", cat.label(), items.len(), human(total));
+    let mut out = format!(
+        "Largest {} ({} shown, {} total):\n",
+        cat.label(),
+        items.len(),
+        human(total)
+    );
     for e in items {
         let _ = writeln!(out, "  {:>10}  {}", e.size, e.path);
     }

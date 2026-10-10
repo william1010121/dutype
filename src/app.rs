@@ -262,7 +262,12 @@ impl App {
         }
         let items: Vec<_> = top.into_sorted().into_iter().map(|(s, p)| (p, s)).collect();
         let state = first_selected(items.len());
-        self.popup = Some(Popup { title, base: self.current_path(), items, state });
+        self.popup = Some(Popup {
+            title,
+            base: self.current_path(),
+            items,
+            state,
+        });
     }
 }
 
@@ -283,7 +288,9 @@ fn ext_breakdown(cur: &Node) -> Vec<BreakdownItem> {
     let mut map: HashMap<String, (u64, u64, Category)> = HashMap::new();
     walk(cur, &mut PathBuf::new(), &mut |n, _| {
         if !n.is_dir() {
-            let e = map.entry(ext_key(&n.name)).or_insert((0, 0, reg().classify_file(&n.name)));
+            let e = map
+                .entry(ext_key(&n.name))
+                .or_insert((0, 0, reg().classify_file(&n.name)));
             e.0 += n.size;
             e.1 += 1;
         }
@@ -292,7 +299,11 @@ fn ext_breakdown(cur: &Node) -> Vec<BreakdownItem> {
     let mut items: Vec<_> = map
         .into_iter()
         .map(|(ext, (size, count, cat))| BreakdownItem {
-            label: if ext == "(none)" { ext.clone() } else { format!(".{ext}") },
+            label: if ext == "(none)" {
+                ext.clone()
+            } else {
+                format!(".{ext}")
+            },
             key: Key::Ext(ext),
             cat,
             size,
@@ -320,5 +331,9 @@ fn reveal(path: &Path) {
         c.arg(path.parent().unwrap_or(path));
         c
     };
-    let _ = cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
+    let _ = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
 }

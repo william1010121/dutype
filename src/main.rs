@@ -98,7 +98,10 @@ fn run(args: Args) -> Result<(), String> {
         std::thread::spawn(move || scan::scan(&path, one_fs, &progress))
     };
     let finish = |handle: std::thread::JoinHandle<std::io::Result<scan::Node>>| {
-        handle.join().expect("scan thread panicked").map_err(|e| format!("{}: {e}", path.display()))
+        handle
+            .join()
+            .expect("scan thread panicked")
+            .map_err(|e| format!("{}: {e}", path.display()))
     };
 
     if args.report || args.json {
@@ -107,7 +110,8 @@ fn run(args: Args) -> Result<(), String> {
         if let Some(cat) = only {
             let items = report::find(&root, &path, cat, args.top);
             if args.json {
-                let doc = serde_json::json!({"path": path.display().to_string(), "category": cat.label(), "items": items});
+                let doc =
+                    serde_json::json!({"path": path.display().to_string(), "category": cat.label(), "items": items});
                 print(&serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?);
                 print("\n");
             } else {
@@ -152,7 +156,12 @@ fn run(args: Args) -> Result<(), String> {
             }
         }
         let root = finish(handle)?;
-        let mut app = App::new(root, path.clone(), started.elapsed(), progress.errors.load(Ordering::Relaxed));
+        let mut app = App::new(
+            root,
+            path.clone(),
+            started.elapsed(),
+            progress.errors.load(Ordering::Relaxed),
+        );
         while !app.quit {
             terminal.draw(|f| ui::draw(f, &mut app)).map_err(io)?;
             if let Event::Key(k) = event::read().map_err(io)?

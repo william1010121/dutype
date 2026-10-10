@@ -114,7 +114,9 @@ impl Ctx<'_> {
 }
 
 fn file_name_of(p: &Path) -> String {
-    p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+    p.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 pub fn scan(root: &Path, one_fs: bool, progress: &Progress) -> std::io::Result<Node> {
@@ -128,7 +130,13 @@ pub fn scan(root: &Path, one_fs: bool, progress: &Progress) -> std::io::Result<N
     let name: Box<str> = root.display().to_string().into();
     if !meta.is_dir() {
         let cat = reg().classify_file(&name);
-        return Ok(Node { name, size: ctx.alloc_size(&meta), cat, special: false, dir: None });
+        return Ok(Node {
+            name,
+            size: ctx.alloc_size(&meta),
+            cat,
+            special: false,
+            dir: None,
+        });
     }
     let parent = root.parent().map(file_name_of).unwrap_or_default();
     let mut node = scan_dir(root, file_name_of(root).into(), &parent, None, &meta, &ctx);
@@ -184,7 +192,13 @@ fn scan_dir(
         let size = ctx.alloc_size(&m);
         file_bytes += size;
         let cat = effective.unwrap_or_else(|| reg.classify_file(&n));
-        children.push(Node { name: n.into(), size, cat, special: false, dir: None });
+        children.push(Node {
+            name: n.into(),
+            size,
+            cat,
+            special: false,
+            dir: None,
+        });
     }
     ctx.progress.files.fetch_add(file_entries, Ordering::Relaxed);
     ctx.progress.bytes.fetch_add(file_bytes, Ordering::Relaxed);
@@ -209,7 +223,11 @@ fn scan_dir(
         size,
         cat: effective.unwrap_or(reg.other()),
         special: own.is_some(),
-        dir: Some(Box::new(DirInfo { cats, files: file_count, children })),
+        dir: Some(Box::new(DirInfo {
+            cats,
+            files: file_count,
+            children,
+        })),
     }
 }
 
@@ -232,7 +250,10 @@ pub struct TopN<T: Ord> {
 
 impl<T: Ord> TopN<T> {
     pub fn new(n: usize) -> Self {
-        TopN { n, heap: BinaryHeap::with_capacity(n + 1) }
+        TopN {
+            n,
+            heap: BinaryHeap::with_capacity(n + 1),
+        }
     }
 
     pub fn push(&mut self, item: T) {

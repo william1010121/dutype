@@ -168,7 +168,10 @@ impl Registry {
     }
 
     fn find(&self, name: &str) -> Option<Category> {
-        self.defs.iter().position(|d| d.name.eq_ignore_ascii_case(name)).map(|i| Category(i as u8))
+        self.defs
+            .iter()
+            .position(|d| d.name.eq_ignore_ascii_case(name))
+            .map(|i| Category(i as u8))
     }
 
     fn apply(&mut self, c: CategoryConfig) -> Result<(), String> {
@@ -181,14 +184,17 @@ impl Registry {
                 // New categories go before "Other" so it stays last.
                 let at = self.find("Other").map_or(self.defs.len(), |o| o.0 as usize);
                 self.shift_from(at);
-                self.defs.insert(at, CategoryDef {
-                    name: c.name.clone(),
-                    color: Color::Indexed(250),
-                    icon: None,
-                    nerd_icon: None,
-                    dir_kind: false,
-                    weak: false,
-                });
+                self.defs.insert(
+                    at,
+                    CategoryDef {
+                        name: c.name.clone(),
+                        color: Color::Indexed(250),
+                        icon: None,
+                        nerd_icon: None,
+                        dir_kind: false,
+                        weak: false,
+                    },
+                );
                 Category(at as u8)
             }
         };
@@ -273,14 +279,25 @@ impl Registry {
         let Some(ext) = ext_of(name) else { return self.other };
         // Lowercase into a stack buffer: this runs once per file.
         let mut buf = [0u8; 16];
-        let Some(dst) = buf.get_mut(..ext.len()) else { return self.other };
+        let Some(dst) = buf.get_mut(..ext.len()) else {
+            return self.other;
+        };
         dst.copy_from_slice(ext.as_bytes());
         dst.make_ascii_lowercase();
-        std::str::from_utf8(dst).ok().and_then(|e| self.ext.get(e)).copied().unwrap_or(self.other)
+        std::str::from_utf8(dst)
+            .ok()
+            .and_then(|e| self.ext.get(e))
+            .copied()
+            .unwrap_or(self.other)
     }
 
     /// Classify a directory from its name, its parent's name and its entries.
-    pub fn special_dir<'a>(&self, name: &str, parent: &str, entries: impl Iterator<Item = &'a str>) -> Option<Category> {
+    pub fn special_dir<'a>(
+        &self,
+        name: &str,
+        parent: &str,
+        entries: impl Iterator<Item = &'a str>,
+    ) -> Option<Category> {
         if let Some(c) = self.parent_dirs.get(name).and_then(|l| lookup(l, parent)) {
             return Some(c);
         }
@@ -404,7 +421,8 @@ mod tests {
     #[test]
     fn special_dirs() {
         let r = builtin();
-        let s = |name, parent, entries: &[&'static str]| label(&r, r.special_dir(name, parent, entries.iter().copied()));
+        let s =
+            |name, parent, entries: &[&'static str]| label(&r, r.special_dir(name, parent, entries.iter().copied()));
         assert_eq!(s("node_modules", "app", &[]), Some("node_modules"));
         assert_eq!(s("myenv", "x", &["bin", "pyvenv.cfg"]), Some("Python env"));
         assert_eq!(s("target", "proj", &["CACHEDIR.TAG"]), Some("Build output"));
@@ -432,12 +450,18 @@ mod tests {
         assert_eq!(l("clip.xyz"), "Video");
         assert_eq!(l("pack.unitypackage"), "Unity");
         assert_eq!(l("doc.pdf"), "Unity");
-        assert_eq!(label(&r, r.special_dir("Library", "game", [].into_iter())), Some("Unity"));
+        assert_eq!(
+            label(&r, r.special_dir("Library", "game", [].into_iter())),
+            Some("Unity")
+        );
         // Inserting before Other must not break existing rules.
         assert_eq!(l("a.mp4"), "Video");
         assert_eq!(l("Makefile"), "Other");
         assert_eq!(r.defs.last().unwrap().name, "Other");
-        assert_eq!(label(&r, r.special_dir("node_modules", "x", [].into_iter())), Some("node_modules"));
+        assert_eq!(
+            label(&r, r.special_dir("node_modules", "x", [].into_iter())),
+            Some("node_modules")
+        );
     }
 
     #[test]

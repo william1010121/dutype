@@ -60,7 +60,9 @@ fn tools() -> Value {
 fn expand(path: &str) -> PathBuf {
     match path.strip_prefix("~") {
         Some(rest) if rest.is_empty() || rest.starts_with('/') => {
-            let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).unwrap_or_default();
+            let home = std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .unwrap_or_default();
             PathBuf::from(home).join(rest.trim_start_matches('/'))
         }
         _ => PathBuf::from(path),
@@ -68,13 +70,22 @@ fn expand(path: &str) -> PathBuf {
 }
 
 fn call_tool(name: &str, args: &Value) -> Result<Value, String> {
-    let path = args.get("path").and_then(Value::as_str).ok_or("missing required argument: path")?;
-    let top = args.get("top").and_then(Value::as_u64).map(|t| t.clamp(1, 500) as usize);
+    let path = args
+        .get("path")
+        .and_then(Value::as_str)
+        .ok_or("missing required argument: path")?;
+    let top = args
+        .get("top")
+        .and_then(Value::as_u64)
+        .map(|t| t.clamp(1, 500) as usize);
     let cross_fs = args.get("cross_fs").and_then(Value::as_bool).unwrap_or(false);
     let category = match name {
         "disk_usage" => None,
         "find_by_category" => {
-            let c = args.get("category").and_then(Value::as_str).ok_or("missing required argument: category")?;
+            let c = args
+                .get("category")
+                .and_then(Value::as_str)
+                .ok_or("missing required argument: category")?;
             Some(reg().find_by_name(c).ok_or_else(|| format!("unknown category {c:?}"))?)
         }
         _ => return Err(format!("unknown tool {name:?}")),
@@ -87,7 +98,13 @@ fn call_tool(name: &str, args: &Value) -> Result<Value, String> {
     let value = match category {
         None => {
             let errors = progress.errors.load(Ordering::Relaxed);
-            serde_json::to_value(report::build(&root, &path, started.elapsed(), errors, top.unwrap_or(20)))
+            serde_json::to_value(report::build(
+                &root,
+                &path,
+                started.elapsed(),
+                errors,
+                top.unwrap_or(20),
+            ))
         }
         Some(c) => serde_json::to_value(json!({
             "path": path.display().to_string(),
@@ -148,7 +165,9 @@ pub fn serve() -> Result<(), String> {
             Err(e) => Some(json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32700, "message": e.to_string()}})),
         };
         if let Some(r) = response {
-            writeln!(stdout, "{r}").and_then(|_| stdout.flush()).map_err(|e| e.to_string())?;
+            writeln!(stdout, "{r}")
+                .and_then(|_| stdout.flush())
+                .map_err(|e| e.to_string())?;
         }
     }
     Ok(())

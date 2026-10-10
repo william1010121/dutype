@@ -2,6 +2,15 @@
 name = "dutype"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
+description = "Disk usage by kind: a fast parallel TUI that shows how much of a folder is video, PDFs, node_modules, Python envs, caches, ML models, ..."
+license = "MIT"
+repository = "https://github.com/william1010121/dutype"
+homepage = "https://github.com/william1010121/dutype"
+readme = "README.md"
+keywords = ["disk-usage", "tui", "du", "cli", "mcp"]
+categories = ["command-line-utilities", "filesystem"]
+exclude = ["assets/", "bench/", ".github/", "pyproject.toml"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
@@ -15,3 +24,7 @@ toml = "0.9"
 [profile.release]
 lto = true
 codegen-units = 1
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"

@@ -30,7 +30,11 @@ pub fn human(bytes: u64) -> String {
         v /= 1024.0;
         u += 1;
     }
-    if u == 0 { format!("{bytes} B") } else { format!("{v:.1} {}", UNITS[u]) }
+    if u == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{v:.1} {}", UNITS[u])
+    }
 }
 
 pub fn thousands(n: u64) -> String {
@@ -117,7 +121,11 @@ fn panel(title: Line<'static>, focused: bool) -> Block<'static> {
 }
 
 fn panel_title(text: &str, focused: bool) -> Line<'static> {
-    let style = if focused { Style::new().fg(ACCENT).bold() } else { Style::new().fg(MUTED).bold() };
+    let style = if focused {
+        Style::new().fg(ACCENT).bold()
+    } else {
+        Style::new().fg(MUTED).bold()
+    };
     Line::from(Span::styled(format!(" {text} "), style))
 }
 
@@ -128,7 +136,11 @@ fn luminance(c: Color) -> u32 {
         Color::Rgb(r, g, b) => (r as u32, g as u32, b as u32),
         Color::Indexed(n @ 16..=231) => {
             let n = n as u32 - 16;
-            (LEVELS[(n / 36) as usize], LEVELS[(n / 6 % 6) as usize], LEVELS[(n % 6) as usize])
+            (
+                LEVELS[(n / 36) as usize],
+                LEVELS[(n / 6 % 6) as usize],
+                LEVELS[(n % 6) as usize],
+            )
         }
         Color::Indexed(n @ 232..=255) => {
             let v = 8 + 10 * (n as u32 - 232);
@@ -146,7 +158,11 @@ fn icon_span(icon: Option<&'static str>, color: Color) -> Span<'static> {
 }
 
 fn chip(label: &str, bg: Color) -> Span<'static> {
-    let fg = if luminance(bg) < 120 { Color::Indexed(255) } else { Color::Black };
+    let fg = if luminance(bg) < 120 {
+        Color::Indexed(255)
+    } else {
+        Color::Black
+    };
     Span::styled(format!(" {label} "), Style::new().fg(fg).bg(bg).bold())
 }
 
@@ -166,8 +182,7 @@ fn keycaps(keys: &[(&str, &str)]) -> Line<'static> {
 pub fn draw(f: &mut Frame, app: &mut App) {
     let [header, body, footer] =
         Layout::vertical([Constraint::Length(5), Constraint::Min(0), Constraint::Length(1)]).areas(f.area());
-    let [left, right] =
-        Layout::horizontal([Constraint::Percentage(58), Constraint::Percentage(42)]).areas(body);
+    let [left, right] = Layout::horizontal([Constraint::Percentage(58), Constraint::Percentage(42)]).areas(body);
     let [breakdown, details] = Layout::vertical([Constraint::Min(6), Constraint::Length(11)]).areas(right);
 
     draw_header(f, app, header);
@@ -197,7 +212,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
 /// `a › b › c`, dropping leading segments with `…` when it does not fit.
 fn home_dir() -> Option<std::path::PathBuf> {
-    std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(Into::into)
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(Into::into)
 }
 
 /// The path with the home directory shown as `~`.
@@ -225,7 +242,11 @@ fn breadcrumb(path: &Path, width: usize) -> Line<'static> {
         let mut spans = vec![Span::styled(if from > 0 { "…" } else { root }, Style::new().fg(MUTED))];
         for (i, s) in segs.iter().enumerate().skip(from) {
             spans.push(sep());
-            let style = if i + 1 == segs.len() { Style::new().fg(ACCENT).bold() } else { Style::new().fg(MUTED) };
+            let style = if i + 1 == segs.len() {
+                Style::new().fg(ACCENT).bold()
+            } else {
+                Style::new().fg(MUTED)
+            };
             spans.push(Span::styled(s.clone(), style));
         }
         Line::from(spans)
@@ -241,13 +262,28 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(BORDER))
-        .title(Line::from(vec![Span::raw(" "), chip("◆ dutype", ACCENT), Span::raw(" ")]))
+        .title(Line::from(vec![
+            Span::raw(" "),
+            chip("◆ dutype", ACCENT),
+            Span::raw(" "),
+        ]))
         .title(
             Line::from(vec![
                 Span::styled(human(cur.size), size_style(cur.size)),
-                Span::styled(format!("  ·  {} files  ·  scanned in {:.2}s", thousands(cur.files()), app.scan_time.as_secs_f64()), Style::new().fg(MUTED)),
                 Span::styled(
-                    if app.errors > 0 { format!("  ·  {} unreadable ", thousands(app.errors)) } else { " ".into() },
+                    format!(
+                        "  ·  {} files  ·  scanned in {:.2}s",
+                        thousands(cur.files()),
+                        app.scan_time.as_secs_f64()
+                    ),
+                    Style::new().fg(MUTED),
+                ),
+                Span::styled(
+                    if app.errors > 0 {
+                        format!("  ·  {} unreadable ", thousands(app.errors))
+                    } else {
+                        " ".into()
+                    },
                     Style::new().fg(Color::Indexed(203)),
                 ),
             ])
@@ -297,24 +333,41 @@ fn entry_name(c: &Node) -> Line<'static> {
         }
         Line::from(spans)
     } else {
-        Line::from(vec![dot, Span::styled(c.name.to_string(), Style::new().fg(Color::Indexed(250)))])
+        Line::from(vec![
+            dot,
+            Span::styled(c.name.to_string(), Style::new().fg(Color::Indexed(250))),
+        ])
     }
 }
 
 fn draw_entries(f: &mut Frame, app: &mut App, area: Rect) {
-    let App { root, stack, states, focus, .. } = app;
+    let App {
+        root,
+        stack,
+        states,
+        focus,
+        ..
+    } = app;
     let cur = node_at(root, stack);
     let focused = *focus == Focus::Entries;
     let block = panel(panel_title("Entries", focused), focused).title(
-        Line::from(Span::styled(format!(" {} items ", thousands(cur.children().len() as u64)), Style::new().fg(MUTED)))
-            .right_aligned(),
+        Line::from(Span::styled(
+            format!(" {} items ", thousands(cur.children().len() as u64)),
+            Style::new().fg(MUTED),
+        ))
+        .right_aligned(),
     );
 
     if cur.children().is_empty() {
         let inner = block.inner(area);
         f.render_widget(block, area);
-        let [mid] = Layout::vertical([Constraint::Length(1)]).flex(Flex::Center).areas(inner);
-        f.render_widget(Paragraph::new("empty directory").fg(MUTED).alignment(Alignment::Center), mid);
+        let [mid] = Layout::vertical([Constraint::Length(1)])
+            .flex(Flex::Center)
+            .areas(inner);
+        f.render_widget(
+            Paragraph::new("empty directory").fg(MUTED).alignment(Alignment::Center),
+            mid,
+        );
         return;
     }
 
@@ -329,7 +382,12 @@ fn draw_entries(f: &mut Frame, app: &mut App, area: Rect) {
     });
     let table = Table::new(
         rows,
-        [Constraint::Length(10), Constraint::Length(6), Constraint::Length(ENTRY_BAR), Constraint::Fill(1)],
+        [
+            Constraint::Length(10),
+            Constraint::Length(6),
+            Constraint::Length(ENTRY_BAR),
+            Constraint::Fill(1),
+        ],
     )
     .column_spacing(2)
     .block(block)
@@ -346,7 +404,13 @@ fn draw_breakdown(f: &mut Frame, app: &mut App, area: Rect) {
 
     let tab = |label: &str, active: bool| {
         if active {
-            Span::styled(format!(" {label} "), Style::new().fg(Color::Black).bg(if focused { ACCENT } else { MUTED }).bold())
+            Span::styled(
+                format!(" {label} "),
+                Style::new()
+                    .fg(Color::Black)
+                    .bg(if focused { ACCENT } else { MUTED })
+                    .bold(),
+            )
         } else {
             Span::styled(format!(" {label} "), Style::new().fg(MUTED))
         }
@@ -365,7 +429,10 @@ fn draw_breakdown(f: &mut Frame, app: &mut App, area: Rect) {
                 icon_span(b.cat.icon(), b.cat.color()),
                 Span::styled(b.label.clone(), Style::new().fg(TEXT)),
             ])),
-            Cell::from(Span::styled(smooth_bar(ratio(b.size, max), BREAKDOWN_BAR), Style::new().fg(b.cat.color()))),
+            Cell::from(Span::styled(
+                smooth_bar(ratio(b.size, max), BREAKDOWN_BAR),
+                Style::new().fg(b.cat.color()),
+            )),
             Cell::from(Span::styled(pct(b.size, total), Style::new().fg(MUTED))),
             Cell::from(Line::from(Span::styled(human(b.size), size_style(b.size))).right_aligned()),
         ];
@@ -386,9 +453,15 @@ fn draw_breakdown(f: &mut Frame, app: &mut App, area: Rect) {
         widths.push(Constraint::Length(8));
     }
     let table = Table::new(rows, widths)
-        .block(panel(title, focused).title(
-            Line::from(Span::styled(" ⏎ list files ", Style::new().fg(if focused { MUTED } else { DIM }))).right_aligned(),
-        ))
+        .block(
+            panel(title, focused).title(
+                Line::from(Span::styled(
+                    " ⏎ list files ",
+                    Style::new().fg(if focused { MUTED } else { DIM }),
+                ))
+                .right_aligned(),
+            ),
+        )
         .row_highlight_style(highlight())
         .highlight_symbol(Text::from(Span::styled("▌", Style::new().fg(ACCENT))));
     f.render_stateful_widget(table, area, &mut app.breakdown_state);
@@ -400,7 +473,12 @@ fn draw_details(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(block, area);
 
     let cur = app.current();
-    let Some(node) = app.states.last().and_then(|s| s.selected()).and_then(|i| cur.children().get(i)) else {
+    let Some(node) = app
+        .states
+        .last()
+        .and_then(|s| s.selected())
+        .and_then(|i| cur.children().get(i))
+    else {
         f.render_widget(Paragraph::new("nothing selected").fg(MUTED), inner);
         return;
     };
@@ -412,11 +490,17 @@ fn draw_details(f: &mut Frame, app: &App, area: Rect) {
         Line::from(vec![
             label("size"),
             Span::styled(human(node.size), size_style(node.size)),
-            Span::styled(format!("   {} of parent", pct(node.size, cur.size).trim()), Style::new().fg(MUTED)),
+            Span::styled(
+                format!("   {} of parent", pct(node.size, cur.size).trim()),
+                Style::new().fg(MUTED),
+            ),
         ]),
     ];
     if node.is_dir() {
-        lines.push(Line::from(vec![label("files"), Span::styled(thousands(node.files()), Style::new().fg(TEXT))]));
+        lines.push(Line::from(vec![
+            label("files"),
+            Span::styled(thousands(node.files()), Style::new().fg(TEXT)),
+        ]));
     } else {
         lines.push(Line::from(vec![
             label("type"),
@@ -436,7 +520,10 @@ fn draw_details(f: &mut Frame, app: &App, area: Rect) {
         lines.push(Line::from(vec![
             icon,
             Span::styled(format!("{:<15}", c.label()), Style::new().fg(TEXT)),
-            Span::styled(format!("{:<w$}", smooth_bar(ratio(v, top), bar_w), w = bar_w as usize), Style::new().fg(c.color())),
+            Span::styled(
+                format!("{:<w$}", smooth_bar(ratio(v, top), bar_w), w = bar_w as usize),
+                Style::new().fg(c.color()),
+            ),
             Span::styled(format!("{:>11}", human(v)), size_style(v)),
             Span::styled(format!("{:>7}", pct(v, node.size)), Style::new().fg(MUTED)),
         ]));
@@ -446,15 +533,22 @@ fn draw_details(f: &mut Frame, app: &App, area: Rect) {
 
 fn draw_popup(f: &mut Frame, app: &mut App) {
     let popup = app.popup.as_mut().unwrap();
-    let [area] = Layout::horizontal([Constraint::Percentage(86)]).flex(Flex::Center).areas(f.area());
-    let [area] = Layout::vertical([Constraint::Percentage(82)]).flex(Flex::Center).areas(area);
+    let [area] = Layout::horizontal([Constraint::Percentage(86)])
+        .flex(Flex::Center)
+        .areas(f.area());
+    let [area] = Layout::vertical([Constraint::Percentage(82)])
+        .flex(Flex::Center)
+        .areas(area);
     f.render_widget(Clear, area);
 
     let total: u64 = popup.items.iter().map(|i| i.1).sum();
     let max = popup.items.first().map_or(1, |i| i.1);
     let rows = popup.items.iter().enumerate().map(|(i, (p, s))| {
         let parent = p.parent().map(|d| d.display().to_string()).filter(|d| !d.is_empty());
-        let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let name = p
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
         let mut path = Vec::new();
         if let Some(d) = parent {
             path.push(Span::styled(format!("{d}/"), Style::new().fg(MUTED)));
@@ -470,7 +564,11 @@ fn draw_popup(f: &mut Frame, app: &mut App) {
     let block = Block::bordered()
         .border_type(BorderType::Double)
         .border_style(Style::new().fg(ACCENT))
-        .title(Line::from(vec![Span::raw(" "), chip(&popup.title, ACCENT), Span::raw(" ")]))
+        .title(Line::from(vec![
+            Span::raw(" "),
+            chip(&popup.title, ACCENT),
+            Span::raw(" "),
+        ]))
         .title(
             Line::from(Span::styled(
                 format!(" top {} · {} ", thousands(popup.items.len() as u64), human(total)),
@@ -482,7 +580,12 @@ fn draw_popup(f: &mut Frame, app: &mut App) {
         .padding(Padding::new(1, 1, 1, 0));
     let table = Table::new(
         rows,
-        [Constraint::Length(4), Constraint::Length(10), Constraint::Length(12), Constraint::Fill(1)],
+        [
+            Constraint::Length(4),
+            Constraint::Length(10),
+            Constraint::Length(12),
+            Constraint::Fill(1),
+        ],
     )
     .column_spacing(2)
     .block(block)
@@ -492,14 +595,20 @@ fn draw_popup(f: &mut Frame, app: &mut App) {
 }
 
 pub fn draw_scanning(f: &mut Frame, path: &Path, files: u64, bytes: u64, elapsed: Duration) {
-    let [area] = Layout::horizontal([Constraint::Length(64)]).flex(Flex::Center).areas(f.area());
+    let [area] = Layout::horizontal([Constraint::Length(64)])
+        .flex(Flex::Center)
+        .areas(f.area());
     let [area] = Layout::vertical([Constraint::Length(9)]).flex(Flex::Center).areas(area);
     let frame = SPINNER[(elapsed.as_millis() / 80) as usize % SPINNER.len()];
     let secs = elapsed.as_secs_f64().max(0.001);
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(ACCENT))
-        .title(Line::from(vec![Span::raw(" "), chip("◆ dutype", ACCENT), Span::raw(" ")]))
+        .title(Line::from(vec![
+            Span::raw(" "),
+            chip("◆ dutype", ACCENT),
+            Span::raw(" "),
+        ]))
         .title_bottom(keycaps(&[("q", "abort")]).right_aligned())
         .padding(Padding::new(2, 2, 1, 0));
     let inner = block.inner(area);
@@ -518,7 +627,10 @@ pub fn draw_scanning(f: &mut Frame, path: &Path, files: u64, bytes: u64, elapsed
             Span::styled(display_path(path), Style::new().fg(ACCENT)),
         ]),
         Line::default(),
-        stat("files", format!("{}  ({}/s)", thousands(files), thousands((files as f64 / secs) as u64))),
+        stat(
+            "files",
+            format!("{}  ({}/s)", thousands(files), thousands((files as f64 / secs) as u64)),
+        ),
         stat("size", human(bytes)),
         stat("elapsed", format!("{secs:.1}s")),
     ];

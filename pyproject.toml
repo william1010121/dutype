@@ -1,0 +1,33 @@
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[project]
+name = "dutype"
+description = "Disk usage by kind: a fast parallel TUI that shows how much of a folder is video, PDFs, node_modules, Python envs, caches, ML models, ..."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.8"
+keywords = ["disk-usage", "du", "tui", "cli", "mcp"]
+classifiers = [
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Operating System :: Microsoft :: Windows",
+  "Programming Language :: Rust",
+  "Topic :: System :: Filesystems",
+  "Topic :: Utilities",
+]
+dynamic = ["version"]
+
+[project.urls]
+Homepage = "https://github.com/william1010121/dutype"
+Repository = "https://github.com/william1010121/dutype"
+Issues = "https://github.com/william1010121/dutype/issues"
+
+[tool.maturin]
+# Ship the Rust binary itself as a wheel (no Python bindings).
+bindings = "bin"
+strip = true
