@@ -162,12 +162,15 @@ impl App {
         }
     }
 
-    /// Special category the current folder inherits from its parent, for
-    /// [`crate::scan::scan_subtree`].
+    /// Special category the current folder inherits, for
+    /// [`crate::scan::scan_subtree`]: that of the nearest special ancestor.
+    /// (A dir's `cat` cannot tell "inherits Other" from "inherits nothing".)
     pub fn inherited_category(&self) -> Option<Category> {
-        let (_, parent) = self.stack.split_last()?;
-        let cat = node_at(&self.root, parent).cat;
-        (cat != reg().other()).then_some(cat)
+        (0..self.stack.len())
+            .rev()
+            .map(|k| node_at(&self.root, &self.stack[..k]))
+            .find(|n| n.special)
+            .map(|n| n.cat)
     }
 
     /// Replace the current folder with a fresh scan of it, update every
@@ -635,8 +638,7 @@ mod tests {
             &Progress::default(),
             app.inherited_category(),
         )
-        .unwrap()
-        .node;
+        .unwrap();
         app.replace_current(fresh);
 
         same(&app.root, &full(&root));
@@ -658,8 +660,7 @@ mod tests {
             &Progress::default(),
             app.inherited_category(),
         )
-        .unwrap()
-        .node;
+        .unwrap();
         app.replace_current(fresh);
         same(&app.root, &full(&root));
     }
@@ -688,7 +689,6 @@ mod tests {
                 app.inherited_category(),
             )
             .unwrap()
-            .node
         };
         for _ in 0..3 {
             let fresh = rescan(&app);
@@ -710,9 +710,14 @@ mod tests {
         fs::create_dir_all(root.join("b")).unwrap();
         fs::write(root.join("a/f.bin"), vec![0u8; 50_000]).unwrap();
         let sub = |p: &str| scan_subtree(&root.join(p), true, &Progress::default(), None).unwrap();
-        assert!(!sub("a").has_hardlinks);
+        assert!(!sub("a").hardlink);
         fs::hard_link(root.join("a/f.bin"), root.join("b/f.bin")).unwrap();
-        assert!(sub("b").has_hardlinks);
+        assert!(sub("b").hardlink);
+        // The old tree remembers hard links, so deleting the local link
+        // before `r` still forces a full rescan.
+        let app = App::new(full(&root), root.clone(), Duration::ZERO, 0);
+        let a = app.root.children().iter().find(|c| &*c.name == "a").unwrap();
+        assert!(a.hardlink && app.root.hardlink);
     }
 
     /// A cancelled scan stops descending right away.
@@ -725,6 +730,30 @@ mod tests {
         progress.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
         let node = scan_excluding(&root, true, &progress, None).unwrap();
         assert!(node.children().is_empty());
+    }
+
+    /// Directories inside a special dir of category Other (user rule) keep
+    /// inheriting Other after `r`, like in a full scan.
+    #[test]
+    fn rescan_inherits_from_nearest_special_ancestor() {
+        let root = temp("inherit");
+        fs::create_dir_all(root.join("node_modules/pkg/lib")).unwrap();
+        fs::write(root.join("node_modules/pkg/lib/x.mp4"), "x").unwrap();
+        let mut app = App::new(full(&root), root.clone(), Duration::ZERO, 0);
+        app.go_to(&["node_modules".into(), "pkg".into(), "lib".into()]);
+        let nm = app
+            .root
+            .children()
+            .iter()
+            .find(|c| &*c.name == "node_modules")
+            .unwrap()
+            .cat;
+        assert_eq!(app.inherited_category(), Some(nm));
+        // At the root, or in node_modules itself, nothing is inherited.
+        let mut app = App::new(full(&root), root.clone(), Duration::ZERO, 0);
+        assert_eq!(app.inherited_category(), None);
+        app.go_to(&["node_modules".into()]);
+        assert_eq!(app.inherited_category(), None);
     }
 
     #[test]

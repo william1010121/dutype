@@ -276,24 +276,33 @@ fn rescan_current(
     one_fs: bool,
     use_cache: bool,
 ) -> Result<(), String> {
+    // Hard links (in the old subtree or the new one) may be counted elsewhere
+    // in the tree; only a full rescan deduplicates them correctly.
+    let full_rescan = |app: &mut App| {
+        app.rescan = Some(Rescan::All);
+        app.quit = true;
+        app.status = Some("hard links here: rescanning everything".into());
+    };
+    if app.current().hardlink {
+        full_rescan(app);
+        return Ok(());
+    }
     let target = app.current_path();
     let inherited = app.inherited_category();
     let t = target.clone();
     let scanned = scan_with_progress(terminal, &target, move |pr| {
         scan::scan_subtree(&t, one_fs, pr, inherited)
     });
+    if let Ok(Some((sub, _, _))) = &scanned
+        && sub.hardlink
+    {
+        full_rescan(app);
+        return Ok(());
+    }
     app.status = Some(match scanned {
-        // Hard links may already be counted elsewhere in the tree; only a full
-        // rescan deduplicates them correctly.
-        Ok(Some((sub, _, _))) if sub.has_hardlinks => {
-            drop(sub);
-            app.rescan = Some(Rescan::All);
-            app.quit = true;
-            "hard links here: rescanning everything".into()
-        }
         Ok(Some((sub, took, _))) => {
             // replace_current swaps in the subtree's own error count.
-            app.replace_current(sub.node);
+            app.replace_current(sub);
             app.cached_at = None;
             let saved = use_cache.then(|| save_tree(app, one_fs)).flatten();
             match saved {
@@ -314,6 +323,7 @@ fn save_tree(app: &mut App, one_fs: bool) -> Option<std::io::Error> {
         size: 0,
         cat: category::reg().other(),
         special: false,
+        hardlink: false,
         dir: None,
     };
     let snap = Snapshot {

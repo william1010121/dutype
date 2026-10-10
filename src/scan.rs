@@ -16,6 +16,9 @@ pub struct Node {
     pub cat: Category,
     /// Dir itself is the root of a special dir (node_modules, .venv, ...).
     pub special: bool,
+    /// File: it has more than one link. Dir: some file below it has. Such
+    /// subtrees cannot be rescanned alone without risking double counting.
+    pub hardlink: bool,
     pub dir: Option<Box<DirInfo>>,
 }
 
@@ -107,8 +110,6 @@ struct Ctx<'a> {
     seen_inodes: Mutex<FxHashSet<(u64, u64)>>,
     /// A directory never to descend into (dutype's own cache), as (name, full path).
     exclude: Option<(String, PathBuf)>,
-    /// A file with more than one link was seen.
-    saw_hardlink: AtomicBool,
 }
 
 impl Ctx<'_> {
@@ -118,11 +119,10 @@ impl Ctx<'_> {
 
     /// Allocated size, counting each hard-linked inode only once.
     fn alloc_size(&self, m: &Metadata) -> u64 {
-        if let Some(id) = platform::hardlink_id(m) {
-            self.saw_hardlink.store(true, Ordering::Relaxed);
-            if !self.seen_inodes.lock().unwrap().insert(id) {
-                return 0;
-            }
+        if let Some(id) = platform::hardlink_id(m)
+            && !self.seen_inodes.lock().unwrap().insert(id)
+        {
+            return 0;
         }
         platform::allocated(m)
     }
@@ -142,15 +142,7 @@ pub fn scan(root: &Path, one_fs: bool, progress: &Progress) -> std::io::Result<N
 }
 
 pub fn scan_excluding(root: &Path, one_fs: bool, progress: &Progress, exclude: Option<&Path>) -> std::io::Result<Node> {
-    scan_root(root, one_fs, progress, exclude, None).map(|(node, _)| node)
-}
-
-/// Result of rescanning one directory of an existing tree.
-pub struct Subtree {
-    pub node: Node,
-    /// The subtree has hard-linked files. Their blocks may already be counted
-    /// elsewhere in the tree, so splicing could double count: rescan all.
-    pub has_hardlinks: bool,
+    scan_root(root, one_fs, progress, exclude, None)
 }
 
 /// Rescan one directory of an existing tree. `inherited` is the special
@@ -161,10 +153,9 @@ pub fn scan_subtree(
     one_fs: bool,
     progress: &Progress,
     inherited: Option<Category>,
-) -> std::io::Result<Subtree> {
+) -> std::io::Result<Node> {
     let cache_dir = crate::cache::dir().and_then(|d| fs::canonicalize(d).ok());
-    let (node, has_hardlinks) = scan_root(path, one_fs, progress, cache_dir.as_deref(), inherited)?;
-    Ok(Subtree { node, has_hardlinks })
+    scan_root(path, one_fs, progress, cache_dir.as_deref(), inherited)
 }
 
 fn scan_root(
@@ -173,7 +164,7 @@ fn scan_root(
     progress: &Progress,
     exclude: Option<&Path>,
     inherited: Option<Category>,
-) -> std::io::Result<(Node, bool)> {
+) -> std::io::Result<Node> {
     let meta = fs::metadata(root)?;
     let ctx = Ctx {
         progress,
@@ -181,24 +172,23 @@ fn scan_root(
         one_fs,
         seen_inodes: Mutex::new(FxHashSet::default()),
         exclude: exclude.and_then(|p| Some((p.file_name()?.to_string_lossy().into_owned(), p.to_path_buf()))),
-        saw_hardlink: AtomicBool::new(false),
     };
     let name: Box<str> = root.display().to_string().into();
     if !meta.is_dir() {
         let cat = reg().classify_file(&name);
-        let node = Node {
+        return Ok(Node {
             name,
             size: ctx.alloc_size(&meta),
             cat,
             special: false,
+            hardlink: platform::hardlink_id(&meta).is_some(),
             dir: None,
-        };
-        return Ok((node, ctx.saw_hardlink.into_inner()));
+        });
     }
     let parent = root.parent().map(file_name_of).unwrap_or_default();
     let mut node = scan_dir(root, file_name_of(root).into(), &parent, inherited, &meta, &ctx);
     node.name = name;
-    Ok((node, ctx.saw_hardlink.into_inner()))
+    Ok(node)
 }
 
 fn scan_dir(
@@ -219,7 +209,11 @@ fn scan_dir(
     };
     match read {
         Ok(Some(rd)) => {
-            for e in rd {
+            for (i, e) in rd.enumerate() {
+                // Huge flat directories: notice a cancel without reading them all.
+                if i % 256 == 255 && ctx.progress.cancel.load(Ordering::Relaxed) {
+                    break;
+                }
                 // DirEntry::metadata does not follow symlinks.
                 match e.and_then(|e| Ok((e.file_name(), e.metadata()?))) {
                     Ok((n, m)) => entries.push((n.to_string_lossy().into_owned(), m)),
@@ -264,7 +258,11 @@ fn scan_dir(
 
     // Progress is updated once per directory to keep atomics off the hot path.
     let (file_entries, mut file_bytes) = (files.len() as u64, 0);
-    for (n, m) in files {
+    for (i, (n, m)) in files.into_iter().enumerate() {
+        if i % 256 == 255 && ctx.progress.cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        let hardlink = platform::hardlink_id(&m).is_some();
         let size = ctx.alloc_size(&m);
         file_bytes += size;
         let cat = effective.unwrap_or_else(|| reg.classify_file(&n));
@@ -273,6 +271,7 @@ fn scan_dir(
             size,
             cat,
             special: false,
+            hardlink,
             dir: None,
         });
     }
@@ -284,9 +283,11 @@ fn scan_dir(
     cats[effective.unwrap_or(reg.other()).index()] += own_size;
     let mut size = own_size;
     let mut file_count = 0;
+    let mut hardlink = false;
     for c in &children {
         size += c.size;
         file_count += c.files();
+        hardlink |= c.hardlink;
         match &c.dir {
             Some(d) => {
                 cats.iter_mut().zip(d.cats.iter()).for_each(|(a, b)| *a += b);
@@ -302,6 +303,7 @@ fn scan_dir(
         size,
         cat: effective.unwrap_or(reg.other()),
         special: own.is_some(),
+        hardlink,
         dir: Some(Box::new(DirInfo {
             cats,
             files: file_count,

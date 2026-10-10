@@ -9,8 +9,9 @@ use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-// v2: directories also store their own unreadable-entry count.
-const MAGIC: &[u8; 8] = b"DUTYPE\0\x02";
+// v3: directories store their own unreadable-entry count; flag bit 2 marks
+// hard-linked files.
+const MAGIC: &[u8; 8] = b"DUTYPE\0\x03";
 
 pub struct Snapshot {
     pub root: Node,
@@ -152,7 +153,8 @@ impl<W: Write> Writer<W> {
         self.bytes(n.name.as_bytes())?;
         self.varint(n.size)?;
         self.varint(n.cat.index() as u64)?;
-        self.0.write_all(&[n.is_dir() as u8 | (n.special as u8) << 1])?;
+        self.0
+            .write_all(&[n.is_dir() as u8 | (n.special as u8) << 1 | (n.hardlink as u8) << 2])?;
         if let Some(d) = &n.dir {
             self.varint(d.children.len() as u64)?;
             for c in &d.children {
@@ -203,6 +205,7 @@ impl Reader<'_> {
         let size = self.varint()?;
         let cat = Category::from_index(usize::try_from(self.varint()?).ok()?)?;
         let flags = *self.take(1)?.first()?;
+        let mut hardlink_flag = flags & 4 != 0;
         let dir = if flags & 1 != 0 {
             let count = usize::try_from(self.varint()?).ok()?;
             // Every node takes at least 4 bytes; bounds a corrupt count.
@@ -211,11 +214,13 @@ impl Reader<'_> {
             // Checked arithmetic throughout: a damaged file is a miss, never
             // a panic or a wrapped (wrong) total.
             let (mut files, mut child_bytes, mut errors) = (0u64, 0u64, 0u64);
+            let mut hardlink = false;
             for _ in 0..count {
                 let c = self.node(depth + 1)?;
                 child_bytes = child_bytes.checked_add(c.size)?;
                 files = files.checked_add(c.files())?;
                 errors = errors.checked_add(c.errors())?;
+                hardlink |= c.hardlink;
                 match &c.dir {
                     Some(d) => {
                         for (a, b) in cats.iter_mut().zip(d.cats.iter()) {
@@ -229,6 +234,7 @@ impl Reader<'_> {
             // The directory's own blocks, as in `scan_dir`.
             cats[cat.index()] = cats[cat.index()].checked_add(size.checked_sub(child_bytes)?)?;
             let errors = errors.checked_add(self.varint()?)?;
+            hardlink_flag = hardlink;
             Some(Box::new(DirInfo {
                 cats,
                 files,
@@ -243,6 +249,7 @@ impl Reader<'_> {
             size,
             cat,
             special: flags & 2 != 0,
+            hardlink: hardlink_flag,
             dir,
         })
     }
