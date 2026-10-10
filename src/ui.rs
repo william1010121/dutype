@@ -598,7 +598,7 @@ fn draw_popup(f: &mut Frame, app: &mut App) {
 
     let total: u64 = popup.items.iter().map(|i| i.1).sum();
     let max = popup.items.first().map_or(1, |i| i.1);
-    let rows = popup.items.iter().enumerate().map(|(i, (p, s))| {
+    let rows = popup.items.iter().enumerate().map(|(i, (p, s, _))| {
         let parent = p.parent().map(|d| d.display().to_string()).filter(|d| !d.is_empty());
         let name = p
             .file_name()

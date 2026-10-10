@@ -1,5 +1,5 @@
 use crate::category::{self, Category, by_size, reg};
-use crate::scan::{Node, TopN, walk};
+use crate::scan::{Node, TopN, walk, walk_with_ancestors};
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::widgets::TableState;
 use std::collections::HashMap;
@@ -47,9 +47,9 @@ pub enum Rescan {
 
 pub struct Popup {
     pub title: String,
-    /// Paths relative to the directory the popup was opened in.
-    pub base: PathBuf,
-    pub items: Vec<(PathBuf, u64)>,
+    /// (path relative to the folder the popup was opened in, for display;
+    /// size; real path on disk, `None` if a non-UTF-8 name is ambiguous).
+    pub items: Vec<(PathBuf, u64, Option<PathBuf>)>,
     pub state: TableState,
 }
 
@@ -400,15 +400,12 @@ impl App {
             KeyCode::Down | KeyCode::Char('j') => step(&mut popup.state, len, 1),
             KeyCode::PageUp => step(&mut popup.state, len, -15),
             KeyCode::PageDown => step(&mut popup.state, len, 15),
-            KeyCode::Char('o') | KeyCode::Enter => {
-                if let Some(i) = popup.state.selected() {
-                    reveal(&crate::scan::resolve_relative(&popup.base, &popup.items[i].0));
-                }
-            }
-            KeyCode::Char('y') => {
-                if let Some(i) = popup.state.selected() {
-                    let path = popup.base.join(&popup.items[i].0);
-                    self.copy(&path);
+            KeyCode::Char('o') | KeyCode::Enter | KeyCode::Char('y') => {
+                let Some(i) = popup.state.selected() else { return };
+                match popup.items[i].2.clone() {
+                    Some(path) if key.code == KeyCode::Char('y') => self.copy(&path),
+                    Some(path) => reveal(&path),
+                    None => self.status = Some("cannot resolve this non-UTF-8 name".into()),
                 }
             }
             _ => {}
@@ -448,11 +445,17 @@ impl App {
         let Some(item) = self.breakdown_state.selected().and_then(|i| self.breakdown.get(i)) else {
             return;
         };
+        let base = self.fs_path();
         let cur = self.current();
         let mut top = TopN::new(POPUP_LIMIT);
-        let mut push = |size: u64, path: &Path| {
-            if top.accepts(|min: &(u64, PathBuf)| size > min.0) {
-                top.push((size, path.to_path_buf()));
+        // The real path is resolved through the node chain (raw-name aware)
+        // only for items that make the cut.
+        let mut push = |n: &Node, path: &Path, ancestors: &[&Node]| {
+            if top.accepts(|min: &(u64, PathBuf, Option<PathBuf>)| n.size > min.0) {
+                let fs = base
+                    .as_deref()
+                    .and_then(|b| crate::scan::resolve_chain(b, ancestors, n));
+                top.push((n.size, path.to_path_buf(), fs));
             }
         };
         let title;
@@ -460,9 +463,9 @@ impl App {
             // For directory kinds, list the special directories themselves.
             Key::Cat(c) if c.is_dir_kind() => {
                 title = format!("{} directories", c.label());
-                walk(cur, &mut PathBuf::new(), &mut |n, p| {
+                walk_with_ancestors(cur, &mut PathBuf::new(), &mut Vec::new(), &mut |n, p, a| {
                     if n.special && n.cat == *c {
-                        push(n.size, p);
+                        push(n, p, a);
                         return false;
                     }
                     true
@@ -470,31 +473,26 @@ impl App {
             }
             Key::Cat(c) => {
                 title = format!("{} files", c.label());
-                walk(cur, &mut PathBuf::new(), &mut |n, p| {
+                walk_with_ancestors(cur, &mut PathBuf::new(), &mut Vec::new(), &mut |n, p, a| {
                     if !n.is_dir() && n.cat == *c {
-                        push(n.size, p);
+                        push(n, p, a);
                     }
                     true
                 });
             }
             Key::Ext(e) => {
                 title = format!("*.{e} files");
-                walk(cur, &mut PathBuf::new(), &mut |n, p| {
+                walk_with_ancestors(cur, &mut PathBuf::new(), &mut Vec::new(), &mut |n, p, a| {
                     if !n.is_dir() && ext_key(&n.name) == *e {
-                        push(n.size, p);
+                        push(n, p, a);
                     }
                     true
                 });
             }
         }
-        let items: Vec<_> = top.into_sorted().into_iter().map(|(s, p)| (p, s)).collect();
+        let items: Vec<_> = top.into_sorted().into_iter().map(|(s, p, fs)| (p, s, fs)).collect();
         let state = first_selected(items.len());
-        self.popup = Some(Popup {
-            title,
-            base: self.fs_path().unwrap_or_else(|| self.current_path()),
-            items,
-            state,
-        });
+        self.popup = Some(Popup { title, items, state });
     }
 }
 
@@ -858,7 +856,14 @@ mod tests {
             app.enter();
             app
         };
-        assert_eq!(app.fs_path(), Some(weird));
+        assert_eq!(app.fs_path(), Some(weird.clone()));
+
+        // Popup results keep the raw path too (the twin is empty, so the
+        // only file in the biggest category is the one in the raw dir).
+        let mut app = App::new(full(&root), root.clone(), Duration::ZERO, 0);
+        app.open_popup();
+        let popup = app.popup.as_ref().unwrap();
+        assert_eq!(popup.items[0].2, Some(weird.join("f.bin")));
     }
 
     #[test]

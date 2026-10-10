@@ -151,26 +151,13 @@ pub fn resolve_child(base: &Path, node: &Node) -> Option<PathBuf> {
     }
 }
 
-/// Best effort for a relative path of display names (popup entries): each
-/// component is joined as is if that exists, else matched like a lossy name.
-pub fn resolve_relative(base: &Path, rel: &Path) -> PathBuf {
-    rel.components().fold(base.to_path_buf(), |p, c| {
-        let name = c.as_os_str().to_string_lossy();
-        let plain = p.join(&*name);
-        if fs::symlink_metadata(&plain).is_ok() {
-            return plain;
-        }
-        let probe = Node {
-            name: name.as_ref().into(),
-            size: 0,
-            cat: reg().other(),
-            special: false,
-            hardlink: false,
-            lossy: true,
-            dir: None,
-        };
-        resolve_child(&p, &probe).unwrap_or(plain)
-    })
+/// The on-disk path of `node`, found below `base` through `ancestors`
+/// (outermost first). No I/O unless a name on the way is lossy.
+pub fn resolve_chain(base: &Path, ancestors: &[&Node], node: &Node) -> Option<PathBuf> {
+    ancestors
+        .iter()
+        .chain(std::iter::once(&node))
+        .try_fold(base.to_path_buf(), |p, n| resolve_child(&p, n))
 }
 
 /// Name for display and classification, and whether it is lossy (not valid
@@ -397,6 +384,25 @@ fn scan_dir(
             errors,
             children,
         })),
+    }
+}
+
+/// Like [`walk`], but `f` also gets the nodes between `node` and the visited
+/// one (outermost first), e.g. to resolve real paths.
+pub fn walk_with_ancestors<'a>(
+    node: &'a Node,
+    rel: &mut PathBuf,
+    ancestors: &mut Vec<&'a Node>,
+    f: &mut impl FnMut(&'a Node, &Path, &[&'a Node]) -> bool,
+) {
+    for c in node.children() {
+        rel.push(&*c.name);
+        if f(c, rel, ancestors) && c.is_dir() {
+            ancestors.push(c);
+            walk_with_ancestors(c, rel, ancestors, f);
+            ancestors.pop();
+        }
+        rel.pop();
     }
 }
 
