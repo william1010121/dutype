@@ -283,6 +283,11 @@ jobs:
       - plan
       - host
     runs-on: "ubuntu-22.04"
+    # Hand-edited (dist allow-dirty = ["ci"]): npm trusted publishing via OIDC,
+    # no NPM_TOKEN. Keep these changes if the workflow is regenerated.
+    permissions:
+      contents: read
+      id-token: write
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       PLAN: ${{ needs.plan.outputs.val }}
@@ -294,17 +299,17 @@ jobs:
           pattern: artifacts-*
           path: npm/
           merge-multiple: true
+      # Trusted publishing needs Node >= 22.14 and npm >= 11.5.1.
       - uses: actions/setup-node@v6
         with:
-          node-version: '20.x'
+          node-version: '24.x'
           registry-url: 'https://registry.npmjs.org'
+      - run: npm install -g npm@latest && npm --version
       - run: |
           for release in $(echo "$PLAN" | jq --compact-output '.releases[] | select([.artifacts[] | endswith("-npm-package.tar.gz")] | any)'); do
             pkg=$(echo "$release" | jq '.artifacts[] | select(endswith("-npm-package.tar.gz"))' --raw-output)
-            npm publish --access public "./npm/${pkg}"
+            npm publish --access public --provenance "./npm/${pkg}"
           done
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   announce:
     needs:

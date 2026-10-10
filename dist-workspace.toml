@@ -30,6 +30,8 @@ install-path = "CARGO_HOME"
 install-updater = false
 # Which actions to run on pull requests
 pr-run-mode = "plan"
+# release.yml is hand-edited for npm trusted publishing (see publish-npm)
+allow-dirty = ["ci"]
 
 [dist.github-custom-runners]
 aarch64-unknown-linux-gnu = "ubuntu-24.04-arm"

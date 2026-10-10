@@ -25,6 +25,14 @@ cargo test
 CI runs these on Linux, macOS and Windows. On this macOS machine the default
 `cc` is GCC from Nix; build with `CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=/usr/bin/clang`.
 
+## Releases
+
+Push a `vX.Y.Z` tag matching `Cargo.toml`; `.github/workflows/release.yml`
+(cargo-dist) builds every target, creates the GitHub Release and publishes to
+npm with trusted publishing (OIDC, no token). The `publish-npm` job is
+hand-edited (`allow-dirty = ["ci"]`): if you run `dist generate`, keep its
+`id-token: write` permission, Node 24 / latest npm and `--provenance`.
+
 ## Code Review Rules
 
 ### Scan performance
