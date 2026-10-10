@@ -9,9 +9,9 @@ use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-// v3: directories store their own unreadable-entry count; flag bit 2 marks
-// hard-linked files.
-const MAGIC: &[u8; 8] = b"DUTYPE\0\x03";
+// v4: directories store their own unreadable-entry count; flag bit 2 marks
+// hard-linked files, bit 3 lossy (non-UTF-8) names.
+const MAGIC: &[u8; 8] = b"DUTYPE\0\x04";
 
 pub struct Snapshot {
     pub root: Node,
@@ -188,7 +188,7 @@ impl<W: Write> Writer<W> {
         self.varint(n.size)?;
         self.varint(n.cat.index() as u64)?;
         self.0
-            .write_all(&[n.is_dir() as u8 | (n.special as u8) << 1 | (n.hardlink as u8) << 2])?;
+            .write_all(&[n.is_dir() as u8 | (n.special as u8) << 1 | (n.hardlink as u8) << 2 | (n.lossy as u8) << 3])?;
         if let Some(d) = &n.dir {
             self.varint(d.children.len() as u64)?;
             for c in &d.children {
@@ -242,8 +242,9 @@ impl Reader<'_> {
         let mut hardlink_flag = flags & 4 != 0;
         let dir = if flags & 1 != 0 {
             let count = usize::try_from(self.varint()?).ok()?;
-            // Every node takes at least 4 bytes; bounds a corrupt count.
-            let mut children = Vec::with_capacity(count.min((self.data.len() - self.pos) / 4));
+            // `count` is untrusted: never reserve more than a bounded amount up
+            // front; a corrupt count then fails on missing data, not on OOM.
+            let mut children = Vec::with_capacity(count.min(4096));
             let mut cats = vec![0u64; reg().len()].into_boxed_slice();
             // Checked arithmetic throughout: a damaged file is a miss, never
             // a panic or a wrapped (wrong) total.
@@ -284,6 +285,7 @@ impl Reader<'_> {
             cat,
             special: flags & 2 != 0,
             hardlink: hardlink_flag,
+            lossy: flags & 8 != 0,
             dir,
         })
     }
@@ -398,6 +400,17 @@ mod tests {
         let over_file = temp("over").join("c.bin");
         fs::write(&over_file, &over).unwrap();
         assert!(read_from(&over_file, &src).is_none());
+
+        // A huge corrupt child count is a miss, not a huge allocation.
+        let mut huge = Vec::from(&MAGIC[..]);
+        huge.extend(reg().fingerprint.to_le_bytes());
+        huge.extend([0, 0, 0]);
+        Writer(&mut huge).bytes(src.as_os_str().as_encoded_bytes()).unwrap();
+        huge.extend([1, b'r', 5, 0, 1]); // dir "r"
+        Writer(&mut huge).varint(u64::from(u32::MAX) * 1000).unwrap(); // children
+        let huge_file = temp("huge").join("c.bin");
+        fs::write(&huge_file, &huge).unwrap();
+        assert!(read_from(&huge_file, &src).is_none());
 
         // A corrupt timestamp is a miss, not a panic.
         let mut bad = Vec::from(&MAGIC[..]);

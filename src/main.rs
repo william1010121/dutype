@@ -288,7 +288,16 @@ fn rescan_current(
         app.quit = true;
         app.status = Some("hard links here: rescanning everything".into());
     };
-    let target = app.fs_path();
+    // A non-UTF-8 folder name on the way may collide with a sibling's name.
+    let target = match app.fs_path() {
+        Some(t) if !app.path_has_lossy_name() => t,
+        _ => {
+            app.rescan = Some(Rescan::All);
+            app.quit = true;
+            app.status = Some("non-UTF-8 name on this path: rescanning everything".into());
+            return Ok(());
+        }
+    };
     if app.current().hardlink {
         full_rescan(app);
         return Ok(());
@@ -339,6 +348,7 @@ fn save_tree(app: &mut App, one_fs: bool) -> Option<std::io::Error> {
         cat: category::reg().other(),
         special: false,
         hardlink: false,
+        lossy: false,
         dir: None,
     };
     let snap = Snapshot {

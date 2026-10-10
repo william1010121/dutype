@@ -20,6 +20,9 @@ pub struct Node {
     /// File: it has more than one link. Dir: some file below it has. Such
     /// subtrees cannot be rescanned alone without risking double counting.
     pub hardlink: bool,
+    /// The name on disk is not valid UTF-8; `name` is a lossy rendering
+    /// (which may even collide with a sibling's real name).
+    pub lossy: bool,
     pub dir: Option<Box<DirInfo>>,
 }
 
@@ -129,39 +132,54 @@ impl Ctx<'_> {
     }
 }
 
-/// `base/name` on disk, where `name` is a node's display name. Names that
-/// were not valid UTF-8 are stored lossily, so if the plain join does not
-/// exist, look for the one entry of `base` whose lossy name matches.
-pub fn resolve_child(base: &Path, name: &str) -> PathBuf {
-    let plain = base.join(name);
-    if fs::symlink_metadata(&plain).is_ok() {
-        return plain;
+/// The on-disk path of `node` inside `base`. A valid UTF-8 name is joined
+/// as is. A lossy name is matched against `base`'s non-UTF-8 entries only
+/// (never a UTF-8 sibling that renders the same); `None` unless exactly one
+/// matches.
+pub fn resolve_child(base: &Path, node: &Node) -> Option<PathBuf> {
+    if !node.lossy {
+        return Some(base.join(&*node.name));
     }
     let mut matches = fs::read_dir(base)
-        .into_iter()
-        .flatten()
+        .ok()?
         .flatten()
         .map(|e| e.file_name())
-        .filter(|n| n.to_str().is_none() && n.to_string_lossy() == name);
+        .filter(|n| n.to_str().is_none() && n.to_string_lossy() == *node.name);
     match (matches.next(), matches.next()) {
-        (Some(raw), None) => base.join(raw),
-        _ => plain,
+        (Some(raw), None) => Some(base.join(raw)),
+        _ => None,
     }
 }
 
-/// `base` joined with a relative path of display names, resolved like
-/// [`resolve_child`] component by component.
+/// Best effort for a relative path of display names (popup entries): each
+/// component is joined as is if that exists, else matched like a lossy name.
 pub fn resolve_relative(base: &Path, rel: &Path) -> PathBuf {
     rel.components().fold(base.to_path_buf(), |p, c| {
-        resolve_child(&p, &c.as_os_str().to_string_lossy())
+        let name = c.as_os_str().to_string_lossy();
+        let plain = p.join(&*name);
+        if fs::symlink_metadata(&plain).is_ok() {
+            return plain;
+        }
+        let probe = Node {
+            name: name.as_ref().into(),
+            size: 0,
+            cat: reg().other(),
+            special: false,
+            hardlink: false,
+            lossy: true,
+            dir: None,
+        };
+        resolve_child(&p, &probe).unwrap_or(plain)
     })
 }
 
-/// Name for display and classification; no copy when it is valid UTF-8.
-fn display_name(n: OsString) -> Box<str> {
-    n.into_string()
-        .unwrap_or_else(|n| n.to_string_lossy().into_owned())
-        .into()
+/// Name for display and classification, and whether it is lossy (not valid
+/// UTF-8). No copy when it is valid UTF-8.
+fn display_name(n: OsString) -> (Box<str>, bool) {
+    match n.into_string() {
+        Ok(s) => (s.into(), false),
+        Err(n) => (n.to_string_lossy().into_owned().into(), true),
+    }
 }
 
 fn file_name_of(p: &Path) -> String {
@@ -241,6 +259,7 @@ fn scan_root(
             cat,
             special: false,
             hardlink: platform::hardlink_id(&meta).is_some(),
+            lossy: false,
             dir: None,
         });
     }
@@ -314,7 +333,10 @@ fn scan_dir(
         })
         .map(|(n, m)| {
             let child_path = path.join(&n);
-            scan_dir(&child_path, display_name(n), &name, effective, &m, ctx)
+            let (display, lossy) = display_name(n);
+            let mut node = scan_dir(&child_path, display, &name, effective, &m, ctx);
+            node.lossy = lossy;
+            node
         })
         .collect();
 
@@ -327,10 +349,11 @@ fn scan_dir(
         let hardlink = platform::hardlink_id(&m).is_some();
         let size = ctx.alloc_size(&m);
         file_bytes += size;
-        let name = display_name(n);
+        let (name, lossy) = display_name(n);
         let cat = effective.unwrap_or_else(|| reg.classify_file(&name));
         children.push(Node {
             name,
+            lossy,
             size,
             cat,
             special: false,
@@ -367,6 +390,7 @@ fn scan_dir(
         cat: effective.unwrap_or(reg.other()),
         special: own.is_some(),
         hardlink,
+        lossy: false,
         dir: Some(Box::new(DirInfo {
             cats,
             files: file_count,

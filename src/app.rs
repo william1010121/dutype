@@ -136,14 +136,30 @@ impl App {
 
     /// The current folder's real path on disk, for filesystem operations
     /// (rescan, copy, reveal); [`Self::current_path`] is for display.
-    pub fn fs_path(&self) -> PathBuf {
+    /// `None` if a non-UTF-8 name on the way cannot be resolved uniquely.
+    pub fn fs_path(&self) -> Option<PathBuf> {
         let mut p = self.root_path.clone();
         let mut n = &self.root;
         for &i in &self.stack {
             n = &n.children()[i];
-            p = crate::scan::resolve_child(&p, &n.name);
+            p = crate::scan::resolve_child(&p, n)?;
         }
-        p
+        Some(p)
+    }
+
+    /// Real path of child `i` of the current folder.
+    fn child_fs_path(&self, i: usize) -> Option<PathBuf> {
+        crate::scan::resolve_child(&self.fs_path()?, &self.current().children()[i])
+    }
+
+    /// Some folder from the root to here has a non-UTF-8 name. Its display
+    /// name may collide with a sibling, so `r` rescans everything instead.
+    pub fn path_has_lossy_name(&self) -> bool {
+        let mut n = &self.root;
+        self.stack.iter().any(|&i| {
+            n = &n.children()[i];
+            n.lossy
+        })
     }
 
     /// Names from the root to the current directory.
@@ -306,19 +322,22 @@ impl App {
             }
             KeyCode::Char('o') => {
                 if let Some(i) = self.selected_entry() {
-                    let path = crate::scan::resolve_child(&self.fs_path(), &self.current().children()[i].name);
-                    reveal(&path);
+                    match self.child_fs_path(i) {
+                        Some(path) => reveal(&path),
+                        None => self.status = Some("cannot resolve this non-UTF-8 name".into()),
+                    }
                 }
             }
             KeyCode::Char('y') => {
                 // The selected entry, or the current folder from the breakdown pane.
                 let path = match (self.focus, self.selected_entry()) {
-                    (Focus::Entries, Some(i)) => {
-                        crate::scan::resolve_child(&self.fs_path(), &self.current().children()[i].name)
-                    }
+                    (Focus::Entries, Some(i)) => self.child_fs_path(i),
                     _ => self.fs_path(),
                 };
-                self.copy(&path);
+                match path {
+                    Some(path) => self.copy(&path),
+                    None => self.status = Some("cannot resolve this non-UTF-8 name".into()),
+                }
             }
             // At the root, rescanning "here" is a full rescan.
             KeyCode::Char('r') if !self.stack.is_empty() => self.rescan = Some(Rescan::Current),
@@ -472,7 +491,7 @@ impl App {
         let state = first_selected(items.len());
         self.popup = Some(Popup {
             title,
-            base: self.fs_path(),
+            base: self.fs_path().unwrap_or_else(|| self.current_path()),
             items,
             state,
         });
@@ -823,9 +842,23 @@ mod tests {
         // TUI paths for filesystem operations resolve the raw name.
         let mut app = App::new(full(&root), root.clone(), Duration::ZERO, 0);
         app.go_to(&[app.root.children()[0].name.clone()]);
-        assert_eq!(app.fs_path(), weird);
+        assert_eq!(app.fs_path(), Some(weird.clone()));
         assert_ne!(app.current_path(), weird);
-        assert!(crate::scan::is_real_dir(&app.fs_path()));
+        assert!(app.path_has_lossy_name());
+
+        // A UTF-8 sibling equal to the lossy rendering must not be picked.
+        let twin = root.join("d\u{fffd}ir");
+        fs::create_dir_all(&twin).unwrap();
+        let app = {
+            let mut app = App::new(full(&root), root.clone(), Duration::ZERO, 0);
+            let i = app.root.children().iter().position(|c| c.lossy).unwrap();
+            let name = app.root.children()[i].name.clone();
+            assert!(app.root.children().iter().any(|c| !c.lossy && c.name == name));
+            app.states[0].select(Some(i));
+            app.enter();
+            app
+        };
+        assert_eq!(app.fs_path(), Some(weird));
     }
 
     #[test]
