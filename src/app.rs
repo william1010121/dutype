@@ -637,6 +637,7 @@ mod tests {
             true,
             &Progress::default(),
             app.inherited_category(),
+            None,
         )
         .unwrap();
         app.replace_current(fresh);
@@ -659,6 +660,7 @@ mod tests {
             true,
             &Progress::default(),
             app.inherited_category(),
+            None,
         )
         .unwrap();
         app.replace_current(fresh);
@@ -687,6 +689,7 @@ mod tests {
                 true,
                 &Progress::default(),
                 app.inherited_category(),
+                None,
             )
             .unwrap()
         };
@@ -709,7 +712,7 @@ mod tests {
         fs::create_dir_all(root.join("a")).unwrap();
         fs::create_dir_all(root.join("b")).unwrap();
         fs::write(root.join("a/f.bin"), vec![0u8; 50_000]).unwrap();
-        let sub = |p: &str| scan_subtree(&root.join(p), true, &Progress::default(), None).unwrap();
+        let sub = |p: &str| scan_subtree(&root.join(p), true, &Progress::default(), None, None).unwrap();
         assert!(!sub("a").hardlink);
         fs::hard_link(root.join("a/f.bin"), root.join("b/f.bin")).unwrap();
         assert!(sub("b").hardlink);
@@ -765,11 +768,26 @@ mod tests {
         fs::create_dir_all(root.join("d")).unwrap();
         std::os::unix::fs::symlink(root.join("target"), root.join("link")).unwrap();
         fs::write(root.join("f.txt"), "x").unwrap();
-        let sub = |p: &str| scan_subtree(&root.join(p), true, &Progress::default(), None);
+        let sub = |p: &str| scan_subtree(&root.join(p), true, &Progress::default(), None, None);
         assert!(sub("d").is_ok());
         assert!(sub("link").is_err());
         assert!(sub("f.txt").is_err());
         assert!(!crate::scan::is_real_dir(&root.join("link")));
+    }
+
+    /// With one_fs, a folder now on another device than the scan root is
+    /// refused (simulated with a wrong root device id).
+    #[cfg(unix)]
+    #[test]
+    fn subtree_rejects_other_filesystem() {
+        let root = temp("mount");
+        fs::create_dir_all(root.join("d")).unwrap();
+        let dev = crate::scan::device_of(&root).unwrap();
+        let sub = |dev| scan_subtree(&root.join("d"), true, &Progress::default(), None, Some(dev));
+        assert!(sub(dev).is_ok());
+        assert!(sub(dev.wrapping_add(1)).is_err());
+        // --cross-fs: no device check.
+        assert!(scan_subtree(&root.join("d"), false, &Progress::default(), None, Some(dev + 1)).is_ok());
     }
 
     #[test]

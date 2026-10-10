@@ -288,9 +288,11 @@ fn rescan_current(
         full_rescan(app);
         return Ok(());
     }
-    // Replaced by a symlink or a file since the scan: a full rescan treats it
-    // exactly like the original scan did.
-    if !scan::is_real_dir(&target) {
+    // Replaced by a symlink or a file, or something got mounted on it, since
+    // the scan: a full rescan treats it exactly like the original scan did.
+    let root_dev = scan::device_of(&app.root_path).ok();
+    let moved_fs = one_fs && root_dev.is_some_and(|dev| scan::device_of(&target).ok() != Some(dev));
+    if !scan::is_real_dir(&target) || moved_fs {
         app.rescan = Some(Rescan::All);
         app.quit = true;
         app.status = Some(format!("{} changed: rescanning everything", ui::display_path(&target)));
@@ -299,7 +301,7 @@ fn rescan_current(
     let inherited = app.inherited_category();
     let t = target.clone();
     let scanned = scan_with_progress(terminal, &target, move |pr| {
-        scan::scan_subtree(&t, one_fs, pr, inherited)
+        scan::scan_subtree(&t, one_fs, pr, inherited, root_dev)
     });
     if let Ok(Some((sub, _, _))) = &scanned
         && sub.hardlink

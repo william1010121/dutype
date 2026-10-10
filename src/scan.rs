@@ -142,25 +142,37 @@ pub fn scan(root: &Path, one_fs: bool, progress: &Progress) -> std::io::Result<N
 }
 
 pub fn scan_excluding(root: &Path, one_fs: bool, progress: &Progress, exclude: Option<&Path>) -> std::io::Result<Node> {
-    scan_root(root, one_fs, progress, exclude, None)
+    scan_root(root, one_fs, progress, exclude, None, None)
 }
 
 /// Rescan one directory of an existing tree. `inherited` is the special
 /// category of its parent (e.g. node_modules), so files keep the category a
-/// full scan would give them. Fails if `path` is no longer a real directory
-/// (e.g. replaced by a symlink or a file): only a full scan handles that the
-/// way the original scan did.
+/// full scan would give them. `root_dev` is the device of the original scan's
+/// root: with `one_fs`, mounts are judged against it as in a full scan.
+///
+/// Fails if `path` is no longer a real directory (replaced by a symlink or a
+/// file) or, with `one_fs`, now lies on another filesystem (something was
+/// mounted on it): only a full scan treats those like the original scan did.
 pub fn scan_subtree(
     path: &Path,
     one_fs: bool,
     progress: &Progress,
     inherited: Option<Category>,
+    root_dev: Option<u64>,
 ) -> std::io::Result<Node> {
     if !is_real_dir(path) {
         return Err(std::io::Error::other("no longer a directory"));
     }
+    if one_fs && root_dev.is_some_and(|dev| device_of(path).ok() != Some(dev)) {
+        return Err(std::io::Error::other("now on another filesystem"));
+    }
     let cache_dir = crate::cache::dir().and_then(|d| fs::canonicalize(d).ok());
-    scan_root(path, one_fs, progress, cache_dir.as_deref(), inherited)
+    scan_root(path, one_fs, progress, cache_dir.as_deref(), inherited, root_dev)
+}
+
+/// Device id of `path` (0 where the platform has none).
+pub fn device_of(path: &Path) -> std::io::Result<u64> {
+    fs::metadata(path).map(|m| platform::device(&m))
 }
 
 /// A directory, not a symlink to one (matching how scans treat entries).
@@ -174,11 +186,12 @@ fn scan_root(
     progress: &Progress,
     exclude: Option<&Path>,
     inherited: Option<Category>,
+    root_dev: Option<u64>,
 ) -> std::io::Result<Node> {
     let meta = fs::metadata(root)?;
     let ctx = Ctx {
         progress,
-        root_dev: platform::device(&meta),
+        root_dev: root_dev.unwrap_or_else(|| platform::device(&meta)),
         one_fs,
         seen_inodes: Mutex::new(FxHashSet::default()),
         exclude: exclude.and_then(|p| Some((p.file_name()?.to_string_lossy().into_owned(), p.to_path_buf()))),
