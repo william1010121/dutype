@@ -9,7 +9,8 @@ use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const MAGIC: &[u8; 8] = b"DUTYPE\0\x01";
+// v2: directories also store their own unreadable-entry count.
+const MAGIC: &[u8; 8] = b"DUTYPE\0\x02";
 
 pub struct Snapshot {
     pub root: Node,
@@ -144,8 +145,9 @@ impl<W: Write> Writer<W> {
         self.0.write_all(b)
     }
 
-    /// Pre-order: name, size, category, flags, then children for dirs. Per-dir
-    /// category totals and file counts are derived again on load.
+    /// Pre-order: name, size, category, flags, then for dirs the children and
+    /// the dir's own error count. Per-dir category totals, file counts and
+    /// error totals are derived again on load.
     fn node(&mut self, n: &Node) -> io::Result<()> {
         self.bytes(n.name.as_bytes())?;
         self.varint(n.size)?;
@@ -156,6 +158,8 @@ impl<W: Write> Writer<W> {
             for c in &d.children {
                 self.node(c)?;
             }
+            let child_errors: u64 = d.children.iter().map(Node::errors).sum();
+            self.varint(d.errors.saturating_sub(child_errors))?;
         }
         Ok(())
     }
@@ -206,11 +210,12 @@ impl Reader<'_> {
             let mut cats = vec![0u64; reg().len()].into_boxed_slice();
             // Checked arithmetic throughout: a damaged file is a miss, never
             // a panic or a wrapped (wrong) total.
-            let (mut files, mut child_bytes) = (0u64, 0u64);
+            let (mut files, mut child_bytes, mut errors) = (0u64, 0u64, 0u64);
             for _ in 0..count {
                 let c = self.node(depth + 1)?;
                 child_bytes = child_bytes.checked_add(c.size)?;
                 files = files.checked_add(c.files())?;
+                errors = errors.checked_add(c.errors())?;
                 match &c.dir {
                     Some(d) => {
                         for (a, b) in cats.iter_mut().zip(d.cats.iter()) {
@@ -223,7 +228,13 @@ impl Reader<'_> {
             }
             // The directory's own blocks, as in `scan_dir`.
             cats[cat.index()] = cats[cat.index()].checked_add(size.checked_sub(child_bytes)?)?;
-            Some(Box::new(DirInfo { cats, files, children }))
+            let errors = errors.checked_add(self.varint()?)?;
+            Some(Box::new(DirInfo {
+                cats,
+                files,
+                errors,
+                children,
+            }))
         } else {
             None
         };

@@ -167,6 +167,8 @@ fn run(args: Args) -> Result<(), String> {
         let io = |e: std::io::Error| e.to_string();
         let mut snap = cached();
         let mut location = Vec::new();
+        // Status to show after a full rescan (e.g. why `r` became `R`).
+        let mut carried_status: Option<String> = None;
         loop {
             let snap = match snap.take() {
                 Some(s) => s,
@@ -192,7 +194,9 @@ fn run(args: Args) -> Result<(), String> {
             app.cached_at = snap.cached_at;
             app.show_keys = args.show_keys;
             app.go_to(&location);
-            app.status = save_error.map(|e| format!("cannot write cache: {e}"));
+            app.status = save_error
+                .map(|e| format!("cannot write cache: {e}"))
+                .or(carried_status.take());
             while !app.quit {
                 terminal.draw(|f| ui::draw(f, &mut app)).map_err(io)?;
                 if let Event::Key(k) = event::read().map_err(io)?
@@ -210,6 +214,7 @@ fn run(args: Args) -> Result<(), String> {
                 return Ok(());
             }
             location = app.location();
+            carried_status = app.status.take();
             // Free the old tree off the UI thread; it can take a while.
             std::thread::spawn(move || drop(app));
         }
@@ -220,11 +225,11 @@ fn run(args: Args) -> Result<(), String> {
 
 /// Run `scan` on a thread while drawing the progress screen. `Ok(None)` when
 /// the user aborts with q / Esc.
-fn scan_with_progress(
+fn scan_with_progress<T: Send + 'static>(
     terminal: &mut ratatui::DefaultTerminal,
     path: &Path,
-    scan: impl FnOnce(&Progress) -> std::io::Result<scan::Node> + Send + 'static,
-) -> Result<Option<(scan::Node, Duration, u64)>, String> {
+    scan: impl FnOnce(&Progress) -> std::io::Result<T> + Send + 'static,
+) -> Result<Option<(T, Duration, u64)>, String> {
     let io = |e: std::io::Error| e.to_string();
     let progress = Arc::new(Progress::default());
     let started = Instant::now();
@@ -249,6 +254,10 @@ fn scan_with_progress(
             && k.kind == KeyEventKind::Press
             && matches!(k.code, KeyCode::Char('q') | KeyCode::Esc)
         {
+            // Stop the worker (it checks the flag per directory) and wait for
+            // it, so a cancelled scan never keeps walking in the background.
+            progress.cancel.store(true, Ordering::Relaxed);
+            let _ = handle.join();
             return Ok(None);
         }
     }
@@ -274,9 +283,17 @@ fn rescan_current(
         scan::scan_subtree(&t, one_fs, pr, inherited)
     });
     app.status = Some(match scanned {
-        Ok(Some((node, took, errors))) => {
-            app.replace_current(node);
-            app.errors += errors;
+        // Hard links may already be counted elsewhere in the tree; only a full
+        // rescan deduplicates them correctly.
+        Ok(Some((sub, _, _))) if sub.has_hardlinks => {
+            drop(sub);
+            app.rescan = Some(Rescan::All);
+            app.quit = true;
+            "hard links here: rescanning everything".into()
+        }
+        Ok(Some((sub, took, _))) => {
+            // replace_current swaps in the subtree's own error count.
+            app.replace_current(sub.node);
             app.cached_at = None;
             let saved = use_cache.then(|| save_tree(app, one_fs)).flatten();
             match saved {

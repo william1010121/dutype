@@ -191,6 +191,7 @@ impl App {
         let new = node_at(&self.root, &self.stack);
         let size_delta = new.size as i128 - old.size as i128;
         let files_delta = new.files() as i128 - old.files() as i128;
+        let errors_delta = new.errors() as i128 - old.errors() as i128;
         let cats_delta: Vec<i128> = new
             .cats()
             .iter()
@@ -203,11 +204,14 @@ impl App {
             shift(&mut node.size, size_delta);
             if let Some(dir) = node.dir.as_mut() {
                 shift(&mut dir.files, files_delta);
+                shift(&mut dir.errors, errors_delta);
                 dir.cats.iter_mut().zip(&cats_delta).for_each(|(c, d)| shift(c, *d));
                 dir.children
                     .sort_unstable_by(|a, b| b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name)));
             }
         }
+        // The subtree's old errors were replaced, not added to.
+        self.errors = self.root.errors();
         // Free the old subtree off the UI thread; it can be large.
         std::thread::spawn(move || drop(old));
 
@@ -631,7 +635,8 @@ mod tests {
             &Progress::default(),
             app.inherited_category(),
         )
-        .unwrap();
+        .unwrap()
+        .node;
         app.replace_current(fresh);
 
         same(&app.root, &full(&root));
@@ -653,9 +658,73 @@ mod tests {
             &Progress::default(),
             app.inherited_category(),
         )
-        .unwrap();
+        .unwrap()
+        .node;
         app.replace_current(fresh);
         same(&app.root, &full(&root));
+    }
+
+    /// Errors of the rescanned folder replace its old share instead of adding up.
+    #[cfg(unix)]
+    #[test]
+    fn rescan_replaces_error_counts() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = temp("errors");
+        let locked = root.join("small/locked");
+        fs::create_dir_all(&locked).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read_dir(&locked).is_ok() {
+            return; // running as root: permissions are not enforced
+        }
+        let mut app = App::new(full(&root), root.clone(), Duration::ZERO, 0);
+        app.errors = app.root.errors();
+        assert_eq!(app.errors, 1);
+        app.go_to(&["small".into()]);
+        let rescan = |app: &App| {
+            scan_subtree(
+                &app.current_path(),
+                true,
+                &Progress::default(),
+                app.inherited_category(),
+            )
+            .unwrap()
+            .node
+        };
+        for _ in 0..3 {
+            let fresh = rescan(&app);
+            app.replace_current(fresh);
+            assert_eq!(app.errors, 1);
+        }
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        let fresh = rescan(&app);
+        app.replace_current(fresh);
+        assert_eq!(app.errors, 0);
+    }
+
+    /// A subtree with hard links is reported so the caller rescans everything.
+    #[cfg(unix)]
+    #[test]
+    fn subtree_reports_hard_links() {
+        let root = temp("hardlinks");
+        fs::create_dir_all(root.join("a")).unwrap();
+        fs::create_dir_all(root.join("b")).unwrap();
+        fs::write(root.join("a/f.bin"), vec![0u8; 50_000]).unwrap();
+        let sub = |p: &str| scan_subtree(&root.join(p), true, &Progress::default(), None).unwrap();
+        assert!(!sub("a").has_hardlinks);
+        fs::hard_link(root.join("a/f.bin"), root.join("b/f.bin")).unwrap();
+        assert!(sub("b").has_hardlinks);
+    }
+
+    /// A cancelled scan stops descending right away.
+    #[test]
+    fn cancelled_scan_stops() {
+        let root = temp("cancel");
+        fs::create_dir_all(root.join("x/y")).unwrap();
+        fs::write(root.join("x/y/z.txt"), "z").unwrap();
+        let progress = Progress::default();
+        progress.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        let node = scan_excluding(&root, true, &progress, None).unwrap();
+        assert!(node.children().is_empty());
     }
 
     #[test]

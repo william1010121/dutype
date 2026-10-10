@@ -6,7 +6,7 @@ use std::collections::BinaryHeap;
 use std::fs::{self, Metadata};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 pub struct Node {
     pub name: Box<str>,
@@ -23,6 +23,9 @@ pub struct DirInfo {
     /// Bytes per category, indexed by `Category::index`.
     pub cats: Box<[u64]>,
     pub files: u64,
+    /// Unreadable entries in this subtree, so a subtree rescan can replace
+    /// its share of the total instead of adding to it.
+    pub errors: u64,
     pub children: Vec<Node>,
 }
 
@@ -33,6 +36,11 @@ impl Node {
 
     pub fn children(&self) -> &[Node] {
         self.dir.as_ref().map_or(&[], |d| d.children.as_slice())
+    }
+
+    /// Unreadable entries in this subtree.
+    pub fn errors(&self) -> u64 {
+        self.dir.as_ref().map_or(0, |d| d.errors)
     }
 
     pub fn files(&self) -> u64 {
@@ -56,6 +64,8 @@ pub struct Progress {
     pub files: AtomicU64,
     pub bytes: AtomicU64,
     pub errors: AtomicU64,
+    /// Set to stop a running scan early (the result is then incomplete).
+    pub cancel: AtomicBool,
 }
 
 #[cfg(unix)]
@@ -97,6 +107,8 @@ struct Ctx<'a> {
     seen_inodes: Mutex<FxHashSet<(u64, u64)>>,
     /// A directory never to descend into (dutype's own cache), as (name, full path).
     exclude: Option<(String, PathBuf)>,
+    /// A file with more than one link was seen.
+    saw_hardlink: AtomicBool,
 }
 
 impl Ctx<'_> {
@@ -106,10 +118,11 @@ impl Ctx<'_> {
 
     /// Allocated size, counting each hard-linked inode only once.
     fn alloc_size(&self, m: &Metadata) -> u64 {
-        if let Some(id) = platform::hardlink_id(m)
-            && !self.seen_inodes.lock().unwrap().insert(id)
-        {
-            return 0;
+        if let Some(id) = platform::hardlink_id(m) {
+            self.saw_hardlink.store(true, Ordering::Relaxed);
+            if !self.seen_inodes.lock().unwrap().insert(id) {
+                return 0;
+            }
         }
         platform::allocated(m)
     }
@@ -129,21 +142,29 @@ pub fn scan(root: &Path, one_fs: bool, progress: &Progress) -> std::io::Result<N
 }
 
 pub fn scan_excluding(root: &Path, one_fs: bool, progress: &Progress, exclude: Option<&Path>) -> std::io::Result<Node> {
-    scan_root(root, one_fs, progress, exclude, None)
+    scan_root(root, one_fs, progress, exclude, None).map(|(node, _)| node)
+}
+
+/// Result of rescanning one directory of an existing tree.
+pub struct Subtree {
+    pub node: Node,
+    /// The subtree has hard-linked files. Their blocks may already be counted
+    /// elsewhere in the tree, so splicing could double count: rescan all.
+    pub has_hardlinks: bool,
 }
 
 /// Rescan one directory of an existing tree. `inherited` is the special
 /// category of its parent (e.g. node_modules), so files keep the category a
-/// full scan would give them. Hard links shared with the rest of the tree are
-/// counted again here, since the scan only sees this subtree.
+/// full scan would give them.
 pub fn scan_subtree(
     path: &Path,
     one_fs: bool,
     progress: &Progress,
     inherited: Option<Category>,
-) -> std::io::Result<Node> {
+) -> std::io::Result<Subtree> {
     let cache_dir = crate::cache::dir().and_then(|d| fs::canonicalize(d).ok());
-    scan_root(path, one_fs, progress, cache_dir.as_deref(), inherited)
+    let (node, has_hardlinks) = scan_root(path, one_fs, progress, cache_dir.as_deref(), inherited)?;
+    Ok(Subtree { node, has_hardlinks })
 }
 
 fn scan_root(
@@ -152,7 +173,7 @@ fn scan_root(
     progress: &Progress,
     exclude: Option<&Path>,
     inherited: Option<Category>,
-) -> std::io::Result<Node> {
+) -> std::io::Result<(Node, bool)> {
     let meta = fs::metadata(root)?;
     let ctx = Ctx {
         progress,
@@ -160,22 +181,24 @@ fn scan_root(
         one_fs,
         seen_inodes: Mutex::new(FxHashSet::default()),
         exclude: exclude.and_then(|p| Some((p.file_name()?.to_string_lossy().into_owned(), p.to_path_buf()))),
+        saw_hardlink: AtomicBool::new(false),
     };
     let name: Box<str> = root.display().to_string().into();
     if !meta.is_dir() {
         let cat = reg().classify_file(&name);
-        return Ok(Node {
+        let node = Node {
             name,
             size: ctx.alloc_size(&meta),
             cat,
             special: false,
             dir: None,
-        });
+        };
+        return Ok((node, ctx.saw_hardlink.into_inner()));
     }
     let parent = root.parent().map(file_name_of).unwrap_or_default();
     let mut node = scan_dir(root, file_name_of(root).into(), &parent, inherited, &meta, &ctx);
     node.name = name;
-    Ok(node)
+    Ok((node, ctx.saw_hardlink.into_inner()))
 }
 
 fn scan_dir(
@@ -188,17 +211,30 @@ fn scan_dir(
 ) -> Node {
     let reg = reg();
     let mut entries: Vec<(String, Metadata)> = Vec::new();
-    match fs::read_dir(path) {
-        Ok(rd) => {
+    let mut errors = 0u64;
+    // A cancelled scan stops descending; its partial result is discarded.
+    let read = match ctx.progress.cancel.load(Ordering::Relaxed) {
+        true => Ok(None),
+        false => fs::read_dir(path).map(Some),
+    };
+    match read {
+        Ok(Some(rd)) => {
             for e in rd {
                 // DirEntry::metadata does not follow symlinks.
                 match e.and_then(|e| Ok((e.file_name(), e.metadata()?))) {
                     Ok((n, m)) => entries.push((n.to_string_lossy().into_owned(), m)),
-                    Err(_) => ctx.error(),
+                    Err(_) => {
+                        ctx.error();
+                        errors += 1;
+                    }
                 }
             }
         }
-        Err(_) => ctx.error(),
+        Ok(None) => {}
+        Err(_) => {
+            ctx.error();
+            errors += 1;
+        }
     }
 
     // Inside a special dir everything inherits it, unless that category is weak
@@ -252,7 +288,10 @@ fn scan_dir(
         size += c.size;
         file_count += c.files();
         match &c.dir {
-            Some(d) => cats.iter_mut().zip(d.cats.iter()).for_each(|(a, b)| *a += b),
+            Some(d) => {
+                cats.iter_mut().zip(d.cats.iter()).for_each(|(a, b)| *a += b);
+                errors += d.errors;
+            }
             None => cats[c.cat.index()] += c.size,
         }
     }
@@ -266,6 +305,7 @@ fn scan_dir(
         dir: Some(Box::new(DirInfo {
             cats,
             files: file_count,
+            errors,
             children,
         })),
     }
