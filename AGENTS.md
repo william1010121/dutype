@@ -10,6 +10,8 @@ has a ratatui TUI, `--report` / `--json` output and an MCP server (`--mcp`).
 - `src/category.rs`: category registry built from `src/default_config.toml`
   plus the user's `~/.config/dutype/config.toml`.
 - `src/report.rs`: text and JSON reports, `find` by category.
+- `src/cache.rs`: `--cache` snapshots of a scan in `~/.cache/dutype`, keyed
+  by path and invalidated by the category rules' fingerprint.
 - `src/mcp.rs`: MCP server over stdio (JSON-RPC, one message per line).
 - `src/app.rs`, `src/ui.rs`: TUI state and rendering.
 - `bench/`: benchmark scripts and the results quoted in the README.

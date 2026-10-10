@@ -43,6 +43,9 @@ pub struct Registry {
     marker_lens: u64,
     other: Category,
     pub icons: IconMode,
+    /// Hash of the rules and the dutype version; a cached scan made with a
+    /// different fingerprint has stale categories.
+    pub fingerprint: u64,
 }
 
 #[derive(Default)]
@@ -143,8 +146,12 @@ pub fn default_config_path() -> Option<PathBuf> {
 
 impl Registry {
     fn from_sources(sources: &[&str]) -> Result<Self, String> {
-        let mut r = Registry::default();
+        let mut r = Registry {
+            fingerprint: crate::cache::fnv1a(0, env!("CARGO_PKG_VERSION").as_bytes()),
+            ..Default::default()
+        };
         for src in sources {
+            r.fingerprint = crate::cache::fnv1a(r.fingerprint, src.as_bytes());
             let cfg: ConfigFile = toml::from_str(src).map_err(|e| e.to_string())?;
             if let Some(mode) = cfg.icons {
                 r.icons = mode;
@@ -334,6 +341,11 @@ fn lookup(list: &[(String, Category)], key: &str) -> Option<Category> {
 impl Category {
     pub fn index(self) -> usize {
         self.0 as usize
+    }
+
+    /// The category at `index`, if the active registry has one.
+    pub fn from_index(index: usize) -> Option<Category> {
+        (index < reg().len()).then_some(Category(index as u8))
     }
 
     fn def(self) -> &'static CategoryDef {

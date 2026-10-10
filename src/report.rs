@@ -6,7 +6,7 @@ use crate::scan::{Node, TopN, walk};
 use crate::ui::human;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Serialize)]
 pub struct Report {
@@ -16,6 +16,8 @@ pub struct Report {
     pub size: String,
     pub files: u64,
     pub scan_seconds: f64,
+    /// Unix time of the scan when it was read from the `--cache`, else null.
+    pub cached_at: Option<u64>,
     /// Entries that could not be read (permissions, races).
     pub unreadable: u64,
     /// Every category with a non-zero size, biggest first.
@@ -86,7 +88,19 @@ fn entry(root: &Path, rel: PathBuf, size: u64, cat: Category) -> Entry {
     }
 }
 
-pub fn build(root: &Node, root_path: &Path, elapsed: Duration, unreadable: u64, top: usize) -> Report {
+/// Unix seconds, for the `cached_at` output field.
+pub fn unix_secs(t: Option<SystemTime>) -> Option<u64> {
+    t.map(|t| t.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()))
+}
+
+pub fn build(
+    root: &Node,
+    root_path: &Path,
+    elapsed: Duration,
+    cached_at: Option<SystemTime>,
+    unreadable: u64,
+    top: usize,
+) -> Report {
     let cats = root.cats();
 
     let mut special = TopN::new(top);
@@ -113,6 +127,7 @@ pub fn build(root: &Node, root_path: &Path, elapsed: Duration, unreadable: u64, 
         size: human(root.size),
         files: root.files(),
         scan_seconds: (elapsed.as_secs_f64() * 1000.0).round() / 1000.0,
+        cached_at: unix_secs(cached_at),
         unreadable,
         categories: shares(&cats, root.size, usize::MAX),
         children: root
@@ -152,6 +167,9 @@ pub fn to_text(r: &Report, root: &Node) -> String {
         "{}  —  {}  ·  {} files  ·  {:.2}s",
         r.path, r.size, r.files, r.scan_seconds
     );
+    if let Some(at) = r.cached_at {
+        let _ = writeln!(out, "(from cache, scanned {}; --refresh to rescan)", crate::ui::ago(at));
+    }
     if r.unreadable > 0 {
         let _ = writeln!(out, "({} entries unreadable)", r.unreadable);
     }

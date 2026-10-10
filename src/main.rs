@@ -1,4 +1,5 @@
 mod app;
+mod cache;
 mod category;
 mod mcp;
 mod report;
@@ -6,6 +7,7 @@ mod scan;
 mod ui;
 
 use app::App;
+use cache::Snapshot;
 use clap::Parser;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use scan::Progress;
@@ -55,6 +57,13 @@ struct Args {
     /// Run as an MCP server on stdio, for LLM agents
     #[arg(long)]
     mcp: bool,
+    /// Reuse the last scan of this path if there is one, and save new scans
+    /// (in ~/.cache/dutype, or $DUTYPE_CACHE_DIR)
+    #[arg(long)]
+    cache: bool,
+    /// Ignore a cached scan: scan again and update the cache (implies --cache)
+    #[arg(long)]
+    refresh: bool,
 }
 
 fn main() -> ExitCode {
@@ -79,8 +88,9 @@ fn run(args: Args) -> Result<(), String> {
         return Ok(());
     }
     category::init(args.config.as_deref(), args.icons)?;
+    let use_cache = args.cache || args.refresh;
     if args.mcp {
-        return mcp::serve();
+        return mcp::serve(use_cache);
     }
     let only = match &args.category {
         Some(name) => Some(category::reg().find_by_name(name).ok_or_else(|| {
@@ -94,88 +104,133 @@ fn run(args: Args) -> Result<(), String> {
     }
 
     let path = std::fs::canonicalize(&args.path).map_err(|e| format!("{}: {e}", args.path.display()))?;
-    let progress = Arc::new(Progress::default());
-    let started = Instant::now();
-    let handle = {
-        let (path, progress, one_fs) = (path.clone(), progress.clone(), !args.cross_fs);
-        std::thread::spawn(move || scan::scan(&path, one_fs, &progress))
-    };
-    let finish = |handle: std::thread::JoinHandle<std::io::Result<scan::Node>>| {
-        handle
-            .join()
-            .expect("scan thread panicked")
-            .map_err(|e| format!("{}: {e}", path.display()))
+    let one_fs = !args.cross_fs;
+    let cached = || {
+        (use_cache && !args.refresh)
+            .then(|| cache::load(&path, one_fs))
+            .flatten()
     };
 
     if args.report || args.json {
-        let root = finish(handle)?;
-        let errors = progress.errors.load(Ordering::Relaxed);
+        let snap = match cached() {
+            Some(s) => s,
+            None => {
+                let progress = Progress::default();
+                let started = Instant::now();
+                let root = scan::scan(&path, one_fs, &progress).map_err(|e| format!("{}: {e}", path.display()))?;
+                let snap = Snapshot {
+                    root,
+                    cached_at: None,
+                    scan_time: started.elapsed(),
+                    errors: progress.errors.load(Ordering::Relaxed),
+                };
+                if use_cache && let Err(e) = cache::save(&path, one_fs, &snap) {
+                    eprintln!("dutype: cannot write cache: {e}");
+                }
+                snap
+            }
+        };
+        let root = &snap.root;
         if let Some(cat) = only {
-            let items = report::find(&root, &path, cat, args.top);
+            let items = report::find(root, &path, cat, args.top);
             if args.json {
-                let doc =
-                    serde_json::json!({"path": path.display().to_string(), "category": cat.label(), "items": items});
+                let doc = serde_json::json!({
+                    "path": path.display().to_string(),
+                    "category": cat.label(),
+                    "cached_at": report::unix_secs(snap.cached_at),
+                    "items": items,
+                });
                 print(&serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?);
                 print("\n");
             } else {
                 print(&report::find_to_text(cat, &items));
             }
-            std::mem::forget(root);
-            return Ok(());
-        }
-        let r = report::build(&root, &path, started.elapsed(), errors, args.top);
-        if args.json {
-            print(&serde_json::to_string_pretty(&r).map_err(|e| e.to_string())?);
-            print("\n");
         } else {
-            print(&report::to_text(&r, &root));
+            let r = report::build(root, &path, snap.scan_time, snap.cached_at, snap.errors, args.top);
+            if args.json {
+                print(&serde_json::to_string_pretty(&r).map_err(|e| e.to_string())?);
+                print("\n");
+            } else {
+                print(&report::to_text(&r, root));
+            }
         }
         // Freeing millions of nodes one by one is slow; the OS reclaims it at exit.
-        std::mem::forget(root);
+        std::mem::forget(snap);
         return Ok(());
     }
 
     let mut terminal = ratatui::init();
     let result = (|| -> Result<(), String> {
         let io = |e: std::io::Error| e.to_string();
-        while !handle.is_finished() {
-            terminal
-                .draw(|f| {
-                    ui::draw_scanning(
-                        f,
-                        &path,
-                        progress.files.load(Ordering::Relaxed),
-                        progress.bytes.load(Ordering::Relaxed),
-                        started.elapsed(),
-                    )
-                })
-                .map_err(io)?;
-            if event::poll(Duration::from_millis(80)).map_err(io)?
-                && let Event::Key(k) = event::read().map_err(io)?
-                && k.kind == KeyEventKind::Press
-                && matches!(k.code, KeyCode::Char('q') | KeyCode::Esc)
-            {
+        let mut snap = cached();
+        let mut location = Vec::new();
+        loop {
+            let snap = match snap.take() {
+                Some(s) => s,
+                None => {
+                    let progress = Arc::new(Progress::default());
+                    let started = Instant::now();
+                    let handle = {
+                        let (path, progress) = (path.clone(), progress.clone());
+                        std::thread::spawn(move || scan::scan(&path, one_fs, &progress))
+                    };
+                    while !handle.is_finished() {
+                        terminal
+                            .draw(|f| {
+                                ui::draw_scanning(
+                                    f,
+                                    &path,
+                                    progress.files.load(Ordering::Relaxed),
+                                    progress.bytes.load(Ordering::Relaxed),
+                                    started.elapsed(),
+                                )
+                            })
+                            .map_err(io)?;
+                        if event::poll(Duration::from_millis(80)).map_err(io)?
+                            && let Event::Key(k) = event::read().map_err(io)?
+                            && k.kind == KeyEventKind::Press
+                            && matches!(k.code, KeyCode::Char('q') | KeyCode::Esc)
+                        {
+                            return Ok(());
+                        }
+                    }
+                    let root = handle
+                        .join()
+                        .expect("scan thread panicked")
+                        .map_err(|e| format!("{}: {e}", path.display()))?;
+                    Snapshot {
+                        root,
+                        cached_at: None,
+                        scan_time: started.elapsed(),
+                        errors: progress.errors.load(Ordering::Relaxed),
+                    }
+                }
+            };
+            let save_error = match use_cache && snap.cached_at.is_none() {
+                true => cache::save(&path, one_fs, &snap).err(),
+                false => None,
+            };
+            let mut app = App::new(snap.root, path.clone(), snap.scan_time, snap.errors);
+            app.cached_at = snap.cached_at;
+            app.show_keys = args.show_keys;
+            app.go_to(&location);
+            app.status = save_error.map(|e| format!("cannot write cache: {e}"));
+            while !app.quit {
+                terminal.draw(|f| ui::draw(f, &mut app)).map_err(io)?;
+                if let Event::Key(k) = event::read().map_err(io)?
+                    && k.kind == KeyEventKind::Press
+                {
+                    app.handle_key(k);
+                }
+            }
+            if !app.rescan {
+                std::mem::forget(app);
                 return Ok(());
             }
+            location = app.location();
+            // Free the old tree off the UI thread; it can take a while.
+            std::thread::spawn(move || drop(app));
         }
-        let root = finish(handle)?;
-        let mut app = App::new(
-            root,
-            path.clone(),
-            started.elapsed(),
-            progress.errors.load(Ordering::Relaxed),
-        );
-        app.show_keys = args.show_keys;
-        while !app.quit {
-            terminal.draw(|f| ui::draw(f, &mut app)).map_err(io)?;
-            if let Event::Key(k) = event::read().map_err(io)?
-                && k.kind == KeyEventKind::Press
-            {
-                app.handle_key(k);
-            }
-        }
-        std::mem::forget(app);
-        Ok(())
     })();
     ratatui::restore();
     result

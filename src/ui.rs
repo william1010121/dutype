@@ -49,6 +49,19 @@ pub fn thousands(n: u64) -> String {
     out
 }
 
+/// How long ago a unix time was, e.g. `3h ago`.
+pub fn ago(unix_secs: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    match now.saturating_sub(unix_secs) {
+        s if s < 60 => "just now".into(),
+        s if s < 3600 => format!("{}m ago", s / 60),
+        s if s < 86400 => format!("{}h ago", s / 3600),
+        s => format!("{}d ago", s / 86400),
+    }
+}
+
 fn ratio(part: u64, total: u64) -> f64 {
     part as f64 / total.max(1) as f64
 }
@@ -191,7 +204,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_details(f, app, details);
 
     let keys: &[(&str, &str)] = if app.popup.is_some() {
-        &[("↑↓", "move"), ("⏎ o", "reveal"), ("esc", "close")]
+        &[("↑↓", "move"), ("⏎ o", "reveal"), ("y", "copy path"), ("esc", "close")]
     } else {
         &[
             ("↑↓", "move"),
@@ -200,10 +213,17 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             ("tab", "pane"),
             ("m", "category/ext"),
             ("o", "reveal"),
+            ("y", "copy path"),
+            ("r", "rescan"),
             ("q", "quit"),
         ]
     };
     f.render_widget(Paragraph::new(keycaps(keys)), footer);
+    if let Some(status) = &app.status {
+        let line = Line::from(Span::styled(format!("{status} "), Style::new().fg(ACCENT).bold()));
+        f.render_widget(Clear, footer);
+        f.render_widget(Paragraph::new(line).right_aligned(), footer);
+    }
 
     if app.popup.is_some() {
         draw_popup(f, app);
@@ -302,13 +322,16 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
             Line::from(vec![
                 Span::styled(human(cur.size), size_style(cur.size)),
                 Span::styled(
-                    format!(
-                        "  ·  {} files  ·  scanned in {:.2}s",
-                        thousands(cur.files()),
-                        app.scan_time.as_secs_f64()
-                    ),
+                    format!("  ·  {} files  ·  ", thousands(cur.files())),
                     Style::new().fg(MUTED),
                 ),
+                match crate::report::unix_secs(app.cached_at) {
+                    Some(at) => Span::styled(format!("cached {}", ago(at)), Style::new().fg(Color::Indexed(222))),
+                    None => Span::styled(
+                        format!("scanned in {:.2}s", app.scan_time.as_secs_f64()),
+                        Style::new().fg(MUTED),
+                    ),
+                },
                 Span::styled(
                     if app.errors > 0 {
                         format!("  ·  {} unreadable ", thousands(app.errors))
@@ -607,7 +630,12 @@ fn draw_popup(f: &mut Frame, app: &mut App) {
             ))
             .right_aligned(),
         )
-        .title_bottom(keycaps(&[("↑↓", "move"), ("⏎ o", "reveal"), ("esc", "close")]))
+        .title_bottom(keycaps(&[
+            ("↑↓", "move"),
+            ("⏎ o", "reveal"),
+            ("y", "copy"),
+            ("esc", "close"),
+        ]))
         .padding(Padding::new(1, 1, 1, 0));
     let table = Table::new(
         rows,

@@ -3,8 +3,9 @@ use crate::scan::{Node, TopN, walk};
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::widgets::TableState;
 use std::collections::HashMap;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 const POPUP_LIMIT: usize = 500;
 const EXT_LIMIT: usize = 60;
@@ -57,8 +58,14 @@ pub struct App {
     pub breakdown_state: TableState,
     pub popup: Option<Popup>,
     pub scan_time: Duration,
+    /// When the shown scan ran, if it came from the `--cache`.
+    pub cached_at: Option<SystemTime>,
     pub errors: u64,
     pub quit: bool,
+    /// Set by `r`: the caller rescans and opens a fresh `App`.
+    pub rescan: bool,
+    /// One-shot message in the footer (e.g. after copying a path).
+    pub status: Option<String>,
     /// Screencast mode: show the last key pressed (for demos and recordings).
     pub show_keys: bool,
     pub last_key: Option<(String, &'static str)>,
@@ -86,8 +93,11 @@ impl App {
             breakdown_state: TableState::default(),
             popup: None,
             scan_time,
+            cached_at: None,
             errors,
             quit: false,
+            rescan: false,
+            status: None,
             show_keys: false,
             last_key: None,
         };
@@ -107,6 +117,34 @@ impl App {
             p.push(&*n.name);
         }
         p
+    }
+
+    /// Names from the root to the current directory.
+    pub fn location(&self) -> Vec<Box<str>> {
+        let mut n = &self.root;
+        self.stack
+            .iter()
+            .map(|&i| {
+                n = &n.children()[i];
+                n.name.clone()
+            })
+            .collect()
+    }
+
+    /// Descend into the directories named by `location` (as far as they exist).
+    pub fn go_to(&mut self, location: &[Box<str>]) {
+        for name in location {
+            let Some(i) = self
+                .current()
+                .children()
+                .iter()
+                .position(|c| c.name == *name && c.is_dir())
+            else {
+                break;
+            };
+            self.states.last_mut().unwrap().select(Some(i));
+            self.enter();
+        }
     }
 
     fn selected_entry(&self) -> Option<usize> {
@@ -138,6 +176,7 @@ impl App {
         if self.show_keys {
             self.last_key = Some(self.describe_key(key));
         }
+        self.status = None;
         if self.popup.is_some() {
             self.handle_popup_key(key);
             return;
@@ -174,8 +213,28 @@ impl App {
                     reveal(&path);
                 }
             }
+            KeyCode::Char('y') => {
+                // The selected entry, or the current folder from the breakdown pane.
+                let path = match (self.focus, self.selected_entry()) {
+                    (Focus::Entries, Some(i)) => self.current_path().join(&*self.current().children()[i].name),
+                    _ => self.current_path(),
+                };
+                self.copy(&path);
+            }
+            KeyCode::Char('r') => {
+                self.rescan = true;
+                self.quit = true;
+            }
             _ => {}
         }
+    }
+
+    fn copy(&mut self, path: &Path) {
+        let shown = crate::ui::display_path(path);
+        self.status = Some(match copy_to_clipboard(&path.display().to_string()) {
+            Ok(()) => format!("copied {shown}"),
+            Err(e) => format!("copy failed: {e}"),
+        });
     }
 
     /// Key glyph and what it does in the current state.
@@ -202,6 +261,8 @@ impl App {
             KeyCode::Tab | KeyCode::BackTab => ("⇥ Tab".to_string(), "switch pane"),
             KeyCode::Char('m') => ("m".to_string(), "category / extension"),
             KeyCode::Char('o') => ("o".to_string(), "reveal"),
+            KeyCode::Char('y') => ("y".to_string(), "copy path"),
+            KeyCode::Char('r') if !popup => ("r".to_string(), "rescan"),
             KeyCode::Char('q') => ("q".to_string(), if popup { "close" } else { "quit" }),
             KeyCode::Char(c) => (c.to_string(), ""),
             _ => ("?".to_string(), ""),
@@ -221,6 +282,12 @@ impl App {
             KeyCode::Char('o') | KeyCode::Enter => {
                 if let Some(i) = popup.state.selected() {
                     reveal(&popup.base.join(&popup.items[i].0));
+                }
+            }
+            KeyCode::Char('y') => {
+                if let Some(i) = popup.state.selected() {
+                    let path = popup.base.join(&popup.items[i].0);
+                    self.copy(&path);
                 }
             }
             _ => {}
@@ -375,4 +442,75 @@ fn reveal(path: &Path) {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn();
+}
+
+/// Copy `text` with the OS clipboard tool, or with an OSC 52 escape sequence
+/// over SSH or when no tool is found (most terminals, tmux with set-clipboard).
+fn copy_to_clipboard(text: &str) -> Result<(), String> {
+    use std::process::{Command, Stdio};
+    let var = |k| std::env::var_os(k).is_some();
+    let tools: &[&[&str]] = if var("SSH_CONNECTION") || var("SSH_TTY") {
+        &[]
+    } else if cfg!(target_os = "macos") {
+        &[&["pbcopy"]]
+    } else if cfg!(windows) {
+        &[&["clip"]]
+    } else if var("WAYLAND_DISPLAY") {
+        &[&["wl-copy"]]
+    } else {
+        &[
+            &["xclip", "-selection", "clipboard"],
+            &["xsel", "--clipboard", "--input"],
+        ]
+    };
+    for tool in tools {
+        let child = Command::new(tool[0])
+            .args(&tool[1..])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        let Ok(mut child) = child else { continue };
+        let wrote = child
+            .stdin
+            .take()
+            .is_some_and(|mut stdin| stdin.write_all(text.as_bytes()).is_ok());
+        if child.wait().is_ok_and(|s| s.success()) && wrote {
+            return Ok(());
+        }
+    }
+    let seq = format!("\x1b]52;c;{}\x07", base64(text.as_bytes()));
+    let mut out = std::io::stdout();
+    out.write_all(seq.as_bytes())
+        .and_then(|_| out.flush())
+        .map_err(|e| e.to_string())
+}
+
+fn base64(data: &[u8]) -> String {
+    const ABC: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32;
+        for i in 0..4 {
+            out.push(if i <= chunk.len() {
+                ABC[(n >> (18 - 6 * i) & 63) as usize] as char
+            } else {
+                '='
+            });
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn base64() {
+        assert_eq!(super::base64(b""), "");
+        assert_eq!(super::base64(b"f"), "Zg==");
+        assert_eq!(super::base64(b"fo"), "Zm8=");
+        assert_eq!(super::base64(b"foo"), "Zm9v");
+        assert_eq!(super::base64("/路徑".as_bytes()), "L+i3r+W+kQ==");
+    }
 }

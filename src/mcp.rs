@@ -1,6 +1,7 @@
 //! Minimal Model Context Protocol server over stdio (`dutype --mcp`), so LLM
 //! agents can call dutype as a tool. One JSON-RPC message per line.
 
+use crate::cache::{self, Snapshot};
 use crate::category::reg;
 use crate::report;
 use crate::scan::{self, Progress};
@@ -29,7 +30,8 @@ fn tools() -> Value {
                 "properties": {
                     "path": {"type": "string", "description": "Directory to scan. Absolute paths are best; ~ is expanded."},
                     "top": {"type": "integer", "minimum": 1, "maximum": 500, "default": 20, "description": "Length of each list."},
-                    "cross_fs": {"type": "boolean", "default": false, "description": "Descend into other mounted filesystems."}
+                    "cross_fs": {"type": "boolean", "default": false, "description": "Descend into other mounted filesystems."},
+                    "refresh": {"type": "boolean", "default": false, "description": "Rescan even if a cached scan exists (only matters with dutype --mcp --cache; see cached_at in the result)."}
                 },
                 "required": ["path"]
             },
@@ -48,7 +50,8 @@ fn tools() -> Value {
                     "path": {"type": "string", "description": "Directory to scan."},
                     "category": {"type": "string", "enum": categories, "description": "Category name."},
                     "top": {"type": "integer", "minimum": 1, "maximum": 500, "default": 50},
-                    "cross_fs": {"type": "boolean", "default": false}
+                    "cross_fs": {"type": "boolean", "default": false},
+                    "refresh": {"type": "boolean", "default": false}
                 },
                 "required": ["path", "category"]
             },
@@ -69,7 +72,7 @@ fn expand(path: &str) -> PathBuf {
     }
 }
 
-fn call_tool(name: &str, args: &Value) -> Result<Value, String> {
+fn call_tool(name: &str, args: &Value, use_cache: bool) -> Result<Value, String> {
     let path = args
         .get("path")
         .and_then(Value::as_str)
@@ -79,6 +82,7 @@ fn call_tool(name: &str, args: &Value) -> Result<Value, String> {
         .and_then(Value::as_u64)
         .map(|t| t.clamp(1, 500) as usize);
     let cross_fs = args.get("cross_fs").and_then(Value::as_bool).unwrap_or(false);
+    let refresh = args.get("refresh").and_then(Value::as_bool).unwrap_or(false);
     let category = match name {
         "disk_usage" => None,
         "find_by_category" => {
@@ -92,31 +96,48 @@ fn call_tool(name: &str, args: &Value) -> Result<Value, String> {
     };
 
     let path = std::fs::canonicalize(expand(path)).map_err(|e| format!("{path}: {e}"))?;
-    let progress = Progress::default();
-    let started = Instant::now();
-    let root = scan::scan(&path, !cross_fs, &progress).map_err(|e| format!("{}: {e}", path.display()))?;
-    let value = match category {
+    let one_fs = !cross_fs;
+    let snap = match (use_cache && !refresh).then(|| cache::load(&path, one_fs)).flatten() {
+        Some(s) => s,
         None => {
-            let errors = progress.errors.load(Ordering::Relaxed);
-            serde_json::to_value(report::build(
-                &root,
-                &path,
-                started.elapsed(),
-                errors,
-                top.unwrap_or(20),
-            ))
+            let progress = Progress::default();
+            let started = Instant::now();
+            let root = scan::scan(&path, one_fs, &progress).map_err(|e| format!("{}: {e}", path.display()))?;
+            let snap = Snapshot {
+                root,
+                cached_at: None,
+                scan_time: started.elapsed(),
+                errors: progress.errors.load(Ordering::Relaxed),
+            };
+            if use_cache {
+                // A failed cache write only costs speed; the scan result is still good.
+                let _ = cache::save(&path, one_fs, &snap);
+            }
+            snap
         }
+    };
+    let value = match category {
+        None => serde_json::to_value(report::build(
+            &snap.root,
+            &path,
+            snap.scan_time,
+            snap.cached_at,
+            snap.errors,
+            top.unwrap_or(20),
+        )),
         Some(c) => serde_json::to_value(json!({
             "path": path.display().to_string(),
             "category": c.label(),
-            "items": report::find(&root, &path, c, top.unwrap_or(50)),
+            "cached_at": report::unix_secs(snap.cached_at),
+            "items": report::find(&snap.root, &path, c, top.unwrap_or(50)),
         })),
     };
-    std::mem::forget(root);
+    // The server lives on, so the tree must be freed; do it off the request path.
+    std::thread::spawn(move || drop(snap));
     value.map_err(|e| e.to_string())
 }
 
-fn handle(msg: &Value) -> Option<Value> {
+fn handle(msg: &Value, use_cache: bool) -> Option<Value> {
     let id = msg.get("id")?.clone(); // notifications get no response
     let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
     let result = match method {
@@ -135,7 +156,7 @@ fn handle(msg: &Value) -> Option<Value> {
             let name = params.get("name").and_then(Value::as_str).unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
             // Tool failures are results with isError, not protocol errors.
-            Ok(match call_tool(name, &args) {
+            Ok(match call_tool(name, &args, use_cache) {
                 Ok(v) => json!({
                     "content": [{"type": "text", "text": serde_json::to_string(&v).unwrap_or_default()}],
                     "structuredContent": v,
@@ -152,7 +173,7 @@ fn handle(msg: &Value) -> Option<Value> {
     })
 }
 
-pub fn serve() -> Result<(), String> {
+pub fn serve(use_cache: bool) -> Result<(), String> {
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
     for line in stdin.lock().lines() {
@@ -161,7 +182,7 @@ pub fn serve() -> Result<(), String> {
             continue;
         }
         let response = match serde_json::from_str::<Value>(&line) {
-            Ok(msg) => handle(&msg),
+            Ok(msg) => handle(&msg, use_cache),
             Err(e) => Some(json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32700, "message": e.to_string()}})),
         };
         if let Some(r) = response {

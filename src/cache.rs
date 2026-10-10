@@ -1,0 +1,266 @@
+//! On-disk cache of scan results (`--cache`), so a big tree opens instantly
+//! the second time. One file per (path, --cross-fs) in ~/.cache/dutype.
+//! A cache is never trusted across dutype versions or category rule changes.
+
+use crate::category::{Category, reg};
+use crate::scan::{DirInfo, Node};
+use std::fs::{self, File};
+use std::io::{self, BufWriter, Write};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+const MAGIC: &[u8; 8] = b"DUTYPE\0\x01";
+
+pub struct Snapshot {
+    pub root: Node,
+    /// When the scan ran; `None` for a scan that was not loaded from the cache.
+    pub cached_at: Option<SystemTime>,
+    pub scan_time: Duration,
+    pub errors: u64,
+}
+
+pub fn fnv1a(seed: u64, bytes: &[u8]) -> u64 {
+    let mut h = if seed == 0 { 0xcbf2_9ce4_8422_2325 } else { seed };
+    for &b in bytes {
+        h = (h ^ b as u64).wrapping_mul(0x0100_0000_01b3);
+    }
+    h
+}
+
+/// `$DUTYPE_CACHE_DIR`, else the OS cache directory plus `dutype`.
+pub fn dir() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("DUTYPE_CACHE_DIR") {
+        return Some(PathBuf::from(p));
+    }
+    let env = |k| std::env::var_os(k).map(PathBuf::from);
+    // Like the config (~/.config/dutype): one global place, also on macOS.
+    if cfg!(windows) {
+        env("LOCALAPPDATA").map(|b| b.join("dutype").join("cache"))
+    } else {
+        env("XDG_CACHE_HOME")
+            .or_else(|| env("HOME").map(|h| h.join(".cache")))
+            .map(|b| b.join("dutype"))
+    }
+}
+
+fn file_for(root: &Path, one_fs: bool) -> Option<PathBuf> {
+    let h = fnv1a(0, root.as_os_str().as_encoded_bytes());
+    Some(dir()?.join(format!("{h:016x}-{}.bin", if one_fs { "x" } else { "all" })))
+}
+
+/// The cached scan of `root`, if there is a valid one.
+pub fn load(root: &Path, one_fs: bool) -> Option<Snapshot> {
+    read_from(&file_for(root, one_fs)?, root)
+}
+
+pub fn save(root_path: &Path, one_fs: bool, snap: &Snapshot) -> io::Result<PathBuf> {
+    let file = file_for(root_path, one_fs).ok_or_else(|| io::Error::other("no cache directory"))?;
+    fs::create_dir_all(file.parent().unwrap())?;
+    write_to(&file, root_path, snap)?;
+    Ok(file)
+}
+
+fn write_to(file: &Path, root_path: &Path, snap: &Snapshot) -> io::Result<()> {
+    // Write a sibling and rename, so readers never see a half-written file.
+    let tmp = file.with_extension(format!("tmp{}", std::process::id()));
+    let result = (|| {
+        let mut w = Writer(BufWriter::with_capacity(1 << 20, File::create(&tmp)?));
+        w.0.write_all(MAGIC)?;
+        w.0.write_all(&reg().fingerprint.to_le_bytes())?;
+        let at = snap.cached_at.unwrap_or_else(SystemTime::now);
+        w.varint(at.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()))?;
+        w.varint(snap.scan_time.as_millis() as u64)?;
+        w.varint(snap.errors)?;
+        w.bytes(root_path.as_os_str().as_encoded_bytes())?;
+        w.node(&snap.root)?;
+        w.0.into_inner().map_err(|e| e.into_error())?.sync_all()
+    })();
+    match result {
+        Ok(()) => fs::rename(&tmp, file),
+        Err(e) => {
+            let _ = fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+fn read_from(file: &Path, root_path: &Path) -> Option<Snapshot> {
+    let data = fs::read(file).ok()?;
+    let mut r = Reader { data: &data, pos: 0 };
+    if r.take(MAGIC.len())? != MAGIC || u64::from_le_bytes(r.take(8)?.try_into().ok()?) != reg().fingerprint {
+        return None;
+    }
+    let at = UNIX_EPOCH + Duration::from_secs(r.varint()?);
+    let scan_time = Duration::from_millis(r.varint()?);
+    let errors = r.varint()?;
+    // A hash collision between two paths must not show the wrong tree.
+    if r.bytes()? != root_path.as_os_str().as_encoded_bytes() {
+        return None;
+    }
+    let root = r.node(0)?;
+    (r.pos == data.len()).then_some(Snapshot {
+        root,
+        cached_at: Some(at),
+        scan_time,
+        errors,
+    })
+}
+
+struct Writer<W: Write>(W);
+
+impl<W: Write> Writer<W> {
+    fn varint(&mut self, mut v: u64) -> io::Result<()> {
+        let mut buf = [0u8; 10];
+        let mut n = 0;
+        loop {
+            let byte = (v & 0x7f) as u8;
+            v >>= 7;
+            buf[n] = byte | if v == 0 { 0 } else { 0x80 };
+            n += 1;
+            if v == 0 {
+                return self.0.write_all(&buf[..n]);
+            }
+        }
+    }
+
+    fn bytes(&mut self, b: &[u8]) -> io::Result<()> {
+        self.varint(b.len() as u64)?;
+        self.0.write_all(b)
+    }
+
+    /// Pre-order: name, size, category, flags, then children for dirs. Per-dir
+    /// category totals and file counts are derived again on load.
+    fn node(&mut self, n: &Node) -> io::Result<()> {
+        self.bytes(n.name.as_bytes())?;
+        self.varint(n.size)?;
+        self.varint(n.cat.index() as u64)?;
+        self.0.write_all(&[n.is_dir() as u8 | (n.special as u8) << 1])?;
+        if let Some(d) = &n.dir {
+            self.varint(d.children.len() as u64)?;
+            for c in &d.children {
+                self.node(c)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+struct Reader<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl Reader<'_> {
+    fn take(&mut self, n: usize) -> Option<&[u8]> {
+        let s = self.data.get(self.pos..self.pos.checked_add(n)?)?;
+        self.pos += n;
+        Some(s)
+    }
+
+    fn varint(&mut self) -> Option<u64> {
+        let mut v = 0u64;
+        for shift in (0..64).step_by(7) {
+            let b = *self.data.get(self.pos)?;
+            self.pos += 1;
+            v |= ((b & 0x7f) as u64) << shift;
+            if b & 0x80 == 0 {
+                return Some(v);
+            }
+        }
+        None
+    }
+
+    fn bytes(&mut self) -> Option<&[u8]> {
+        let n = self.varint()?;
+        self.take(usize::try_from(n).ok()?)
+    }
+
+    fn node(&mut self, depth: usize) -> Option<Node> {
+        if depth > 4096 {
+            return None;
+        }
+        let name: Box<str> = std::str::from_utf8(self.bytes()?).ok()?.into();
+        let size = self.varint()?;
+        let cat = Category::from_index(usize::try_from(self.varint()?).ok()?)?;
+        let flags = *self.take(1)?.first()?;
+        let dir = if flags & 1 != 0 {
+            let count = usize::try_from(self.varint()?).ok()?;
+            // Every node takes at least 4 bytes; bounds a corrupt count.
+            let mut children = Vec::with_capacity(count.min((self.data.len() - self.pos) / 4));
+            let mut cats = vec![0u64; reg().len()].into_boxed_slice();
+            let (mut files, mut child_bytes) = (0, 0u64);
+            for _ in 0..count {
+                let c = self.node(depth + 1)?;
+                child_bytes += c.size;
+                files += c.files();
+                match &c.dir {
+                    Some(d) => cats.iter_mut().zip(d.cats.iter()).for_each(|(a, b)| *a += b),
+                    None => cats[c.cat.index()] += c.size,
+                }
+                children.push(c);
+            }
+            // The directory's own blocks, as in `scan_dir`.
+            cats[cat.index()] += size.checked_sub(child_bytes)?;
+            Some(Box::new(DirInfo { cats, files, children }))
+        } else {
+            None
+        };
+        Some(Node {
+            name,
+            size,
+            cat,
+            special: flags & 2 != 0,
+            dir,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scan::{Progress, scan};
+
+    fn same(a: &Node, b: &Node) {
+        assert_eq!((&a.name, a.size, a.cat, a.special), (&b.name, b.size, b.cat, b.special));
+        assert_eq!((a.files(), a.cats()), (b.files(), b.cats()), "{}", a.name);
+        assert_eq!(a.children().len(), b.children().len());
+        a.children().iter().zip(b.children()).for_each(|(x, y)| same(x, y));
+    }
+
+    fn temp(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("dutype-cache-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn round_trip() {
+        let src = temp("src");
+        fs::create_dir_all(src.join("node_modules/pkg")).unwrap();
+        fs::write(src.join("node_modules/pkg/index.js"), "x".repeat(5000)).unwrap();
+        fs::write(src.join("movie.mp4"), vec![0u8; 20_000]).unwrap();
+        fs::write(src.join("notes.pdf"), "pdf").unwrap();
+        let src = fs::canonicalize(&src).unwrap();
+        let root = scan(&src, true, &Progress::default()).unwrap();
+        let snap = Snapshot {
+            root,
+            cached_at: None,
+            scan_time: Duration::from_millis(1234),
+            errors: 3,
+        };
+
+        let file = temp("out").join("c.bin");
+        write_to(&file, &src, &snap).unwrap();
+        let back = read_from(&file, &src).unwrap();
+        same(&snap.root, &back.root);
+        assert_eq!((back.scan_time, back.errors), (snap.scan_time, 3));
+        assert!(back.cached_at.is_some());
+
+        // Another path, or a truncated file, is a miss rather than a wrong tree.
+        assert!(read_from(&file, &src.join("node_modules")).is_none());
+        let data = fs::read(&file).unwrap();
+        fs::write(&file, &data[..data.len() - 1]).unwrap();
+        assert!(read_from(&file, &src).is_none());
+    }
+}
