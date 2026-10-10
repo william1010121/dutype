@@ -790,6 +790,24 @@ mod tests {
         assert!(scan_subtree(&root.join("d"), false, &Progress::default(), None, Some(dev + 1)).is_ok());
     }
 
+    /// Non-UTF-8 names (allowed on Linux) are scanned, not reported as
+    /// unreadable, and such a cache directory is still excluded.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn non_utf8_names_are_scanned_and_excluded() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let root = temp("nonutf8");
+        let weird = root.join(OsStr::from_bytes(b"d\xffir"));
+        fs::create_dir_all(&weird).unwrap();
+        fs::write(weird.join("f.bin"), vec![0u8; 50_000]).unwrap();
+        let node = full(&root);
+        assert_eq!(node.errors(), 0);
+        assert_eq!(node.files(), 1);
+        let excluded = scan_excluding(&root, true, &Progress::default(), Some(&weird)).unwrap();
+        assert_eq!((excluded.files(), excluded.errors()), (0, 0));
+    }
+
     #[test]
     fn base64() {
         assert_eq!(super::base64(b""), "");

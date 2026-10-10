@@ -3,6 +3,7 @@ use rayon::prelude::*;
 use rustc_hash::FxHashSet;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
+use std::ffi::OsString;
 use std::fs::{self, Metadata};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -109,7 +110,7 @@ struct Ctx<'a> {
     one_fs: bool,
     seen_inodes: Mutex<FxHashSet<(u64, u64)>>,
     /// A directory never to descend into (dutype's own cache), as (name, full path).
-    exclude: Option<(String, PathBuf)>,
+    exclude: Option<(OsString, PathBuf)>,
 }
 
 impl Ctx<'_> {
@@ -126,6 +127,13 @@ impl Ctx<'_> {
         }
         platform::allocated(m)
     }
+}
+
+/// Name for display and classification; no copy when it is valid UTF-8.
+fn display_name(n: OsString) -> Box<str> {
+    n.into_string()
+        .unwrap_or_else(|n| n.to_string_lossy().into_owned())
+        .into()
 }
 
 fn file_name_of(p: &Path) -> String {
@@ -194,7 +202,7 @@ fn scan_root(
         root_dev: root_dev.unwrap_or_else(|| platform::device(&meta)),
         one_fs,
         seen_inodes: Mutex::new(FxHashSet::default()),
-        exclude: exclude.and_then(|p| Some((p.file_name()?.to_string_lossy().into_owned(), p.to_path_buf()))),
+        exclude: exclude.and_then(|p| Some((p.file_name()?.to_os_string(), p.to_path_buf()))),
     };
     let name: Box<str> = root.display().to_string().into();
     if !meta.is_dir() {
@@ -223,7 +231,9 @@ fn scan_dir(
     ctx: &Ctx,
 ) -> Node {
     let reg = reg();
-    let mut entries: Vec<(String, Metadata)> = Vec::new();
+    // Raw names: paths must be built from them (names need not be UTF-8);
+    // only display and classification use a lossy string.
+    let mut entries: Vec<(OsString, Metadata)> = Vec::new();
     let mut errors = 0u64;
     // A cancelled scan stops descending; its partial result is discarded.
     let read = match ctx.progress.cancel.load(Ordering::Relaxed) {
@@ -239,7 +249,7 @@ fn scan_dir(
                 }
                 // DirEntry::metadata does not follow symlinks.
                 match e.and_then(|e| Ok((e.file_name(), e.metadata()?))) {
-                    Ok((n, m)) => entries.push((n.to_string_lossy().into_owned(), m)),
+                    Ok((n, m)) => entries.push((n, m)),
                     Err(_) => {
                         ctx.error();
                         errors += 1;
@@ -258,7 +268,8 @@ fn scan_dir(
     // (e.g. ~/.cache) and a more specific one (e.g. huggingface/) is found.
     let own = match inherited {
         Some(c) if !c.is_weak() => None,
-        _ => reg.special_dir(&name, parent_name, entries.iter().map(|(n, _)| n.as_str())),
+        // Rule names are UTF-8, so a non-UTF-8 entry can never match one.
+        _ => reg.special_dir(&name, parent_name, entries.iter().filter_map(|(n, _)| n.to_str())),
     };
     let effective = own.or(inherited);
 
@@ -275,7 +286,7 @@ fn scan_dir(
         })
         .map(|(n, m)| {
             let child_path = path.join(&n);
-            scan_dir(&child_path, n.into(), &name, effective, &m, ctx)
+            scan_dir(&child_path, display_name(n), &name, effective, &m, ctx)
         })
         .collect();
 
@@ -288,9 +299,10 @@ fn scan_dir(
         let hardlink = platform::hardlink_id(&m).is_some();
         let size = ctx.alloc_size(&m);
         file_bytes += size;
-        let cat = effective.unwrap_or_else(|| reg.classify_file(&n));
+        let name = display_name(n);
+        let cat = effective.unwrap_or_else(|| reg.classify_file(&name));
         children.push(Node {
-            name: n.into(),
+            name,
             size,
             cat,
             special: false,
