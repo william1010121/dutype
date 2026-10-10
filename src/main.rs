@@ -49,6 +49,9 @@ struct Args {
     /// Print the built-in category rules (a config template) and exit
     #[arg(long)]
     dump_config: bool,
+    /// Show the last key pressed in the TUI (for demos and screencasts)
+    #[arg(long, hide = true)]
+    show_keys: bool,
     /// Run as an MCP server on stdio, for LLM agents
     #[arg(long)]
     mcp: bool,
@@ -162,6 +165,7 @@ fn run(args: Args) -> Result<(), String> {
             started.elapsed(),
             progress.errors.load(Ordering::Relaxed),
         );
+        app.show_keys = args.show_keys;
         while !app.quit {
             terminal.draw(|f| ui::draw(f, &mut app)).map_err(io)?;
             if let Event::Key(k) = event::read().map_err(io)?

@@ -208,6 +208,37 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if app.popup.is_some() {
         draw_popup(f, app);
     }
+    if app.show_keys
+        && let Some((glyph, action)) = &app.last_key
+    {
+        draw_key_overlay(f, glyph, action);
+    }
+}
+
+/// Screencast overlay with the last key pressed, bottom right.
+fn draw_key_overlay(f: &mut Frame, glyph: &str, action: &str) {
+    let mut spans = vec![Span::styled(
+        format!(" {glyph} "),
+        Style::new().fg(Color::Black).bg(ACCENT).bold(),
+    )];
+    if !action.is_empty() {
+        spans.push(Span::styled(format!("  {action}"), Style::new().fg(TEXT).bold()));
+    }
+    let line = Line::from(spans);
+    let area = f.area();
+    let w = (line.width() as u16 + 4).min(area.width);
+    let h = 3.min(area.height);
+    let rect = Rect::new(
+        area.right().saturating_sub(w + 2),
+        area.bottom().saturating_sub(h + 2),
+        w,
+        h,
+    );
+    f.render_widget(Clear, rect);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(ACCENT));
+    f.render_widget(Paragraph::new(line).block(block.padding(Padding::horizontal(1))), rect);
 }
 
 /// `a › b › c`, dropping leading segments with `…` when it does not fit.

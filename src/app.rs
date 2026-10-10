@@ -59,6 +59,9 @@ pub struct App {
     pub scan_time: Duration,
     pub errors: u64,
     pub quit: bool,
+    /// Screencast mode: show the last key pressed (for demos and recordings).
+    pub show_keys: bool,
+    pub last_key: Option<(String, &'static str)>,
 }
 
 pub fn node_at<'a>(root: &'a Node, stack: &[usize]) -> &'a Node {
@@ -85,6 +88,8 @@ impl App {
             scan_time,
             errors,
             quit: false,
+            show_keys: false,
+            last_key: None,
         };
         app.refresh_breakdown();
         app
@@ -130,6 +135,9 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
+        if self.show_keys {
+            self.last_key = Some(self.describe_key(key));
+        }
         if self.popup.is_some() {
             self.handle_popup_key(key);
             return;
@@ -168,6 +176,37 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// Key glyph and what it does in the current state.
+    fn describe_key(&self, key: KeyEvent) -> (String, &'static str) {
+        let popup = self.popup.is_some();
+        let (glyph, action) = match key.code {
+            KeyCode::Up | KeyCode::Char('k') => ("↑".to_string(), "move"),
+            KeyCode::Down | KeyCode::Char('j') => ("↓".to_string(), "move"),
+            KeyCode::PageUp => ("PgUp".to_string(), "move"),
+            KeyCode::PageDown => ("PgDn".to_string(), "move"),
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                let glyph = if key.code == KeyCode::Enter { "⏎ Enter" } else { "→" };
+                let action = match (popup, self.focus) {
+                    (true, _) => "reveal",
+                    (false, Focus::Entries) => "open folder",
+                    (false, Focus::Breakdown) => "list largest",
+                };
+                (glyph.to_string(), action)
+            }
+            KeyCode::Left | KeyCode::Backspace | KeyCode::Char('h') => {
+                ("←".to_string(), if popup { "close" } else { "up" })
+            }
+            KeyCode::Esc => ("Esc".to_string(), if popup { "close" } else { "quit" }),
+            KeyCode::Tab | KeyCode::BackTab => ("⇥ Tab".to_string(), "switch pane"),
+            KeyCode::Char('m') => ("m".to_string(), "category / extension"),
+            KeyCode::Char('o') => ("o".to_string(), "reveal"),
+            KeyCode::Char('q') => ("q".to_string(), if popup { "close" } else { "quit" }),
+            KeyCode::Char(c) => (c.to_string(), ""),
+            _ => ("?".to_string(), ""),
+        };
+        (glyph, action)
     }
 
     fn handle_popup_key(&mut self, key: KeyEvent) {
@@ -310,7 +349,7 @@ fn ext_breakdown(cur: &Node) -> Vec<BreakdownItem> {
             count: Some(count),
         })
         .collect();
-    items.sort_by(|a, b| b.size.cmp(&a.size));
+    items.sort_by_key(|i| std::cmp::Reverse(i.size));
     items.truncate(EXT_LIMIT);
     items
 }
