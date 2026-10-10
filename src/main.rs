@@ -283,11 +283,19 @@ fn rescan_current(
         app.quit = true;
         app.status = Some("hard links here: rescanning everything".into());
     };
+    let target = app.current_path();
     if app.current().hardlink {
         full_rescan(app);
         return Ok(());
     }
-    let target = app.current_path();
+    // Replaced by a symlink or a file since the scan: a full rescan treats it
+    // exactly like the original scan did.
+    if !scan::is_real_dir(&target) {
+        app.rescan = Some(Rescan::All);
+        app.quit = true;
+        app.status = Some(format!("{} changed: rescanning everything", ui::display_path(&target)));
+        return Ok(());
+    }
     let inherited = app.inherited_category();
     let t = target.clone();
     let scanned = scan_with_progress(terminal, &target, move |pr| {

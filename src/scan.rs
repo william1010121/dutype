@@ -147,15 +147,25 @@ pub fn scan_excluding(root: &Path, one_fs: bool, progress: &Progress, exclude: O
 
 /// Rescan one directory of an existing tree. `inherited` is the special
 /// category of its parent (e.g. node_modules), so files keep the category a
-/// full scan would give them.
+/// full scan would give them. Fails if `path` is no longer a real directory
+/// (e.g. replaced by a symlink or a file): only a full scan handles that the
+/// way the original scan did.
 pub fn scan_subtree(
     path: &Path,
     one_fs: bool,
     progress: &Progress,
     inherited: Option<Category>,
 ) -> std::io::Result<Node> {
+    if !is_real_dir(path) {
+        return Err(std::io::Error::other("no longer a directory"));
+    }
     let cache_dir = crate::cache::dir().and_then(|d| fs::canonicalize(d).ok());
     scan_root(path, one_fs, progress, cache_dir.as_deref(), inherited)
+}
+
+/// A directory, not a symlink to one (matching how scans treat entries).
+pub fn is_real_dir(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
 }
 
 fn scan_root(

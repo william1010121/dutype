@@ -756,6 +756,22 @@ mod tests {
         assert_eq!(app.inherited_category(), None);
     }
 
+    /// A folder replaced by a symlink or a file is not rescanned alone.
+    #[cfg(unix)]
+    #[test]
+    fn subtree_rejects_non_directories() {
+        let root = temp("nondir");
+        fs::create_dir_all(root.join("target")).unwrap();
+        fs::create_dir_all(root.join("d")).unwrap();
+        std::os::unix::fs::symlink(root.join("target"), root.join("link")).unwrap();
+        fs::write(root.join("f.txt"), "x").unwrap();
+        let sub = |p: &str| scan_subtree(&root.join(p), true, &Progress::default(), None);
+        assert!(sub("d").is_ok());
+        assert!(sub("link").is_err());
+        assert!(sub("f.txt").is_err());
+        assert!(!crate::scan::is_real_dir(&root.join("link")));
+    }
+
     #[test]
     fn base64() {
         assert_eq!(super::base64(b""), "");
