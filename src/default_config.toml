@@ -1,0 +1,201 @@
+# dutype built-in categories.
+#
+# Print this file with `dutype --dump-config`. Put your own rules in
+# ~/.config/dutype/config.toml (or pass --config): a [[category]] with an
+# existing name extends it, a new name adds a category.
+#
+# Fields:
+#   name        label shown in the UI
+#   color       256-color index (0-255) or "#rrggbb"
+#   extensions  file extensions, case-insensitive, without the dot
+#   dirs        directory names; everything below counts toward the category.
+#               "parent/name" only matches `name` directly inside `parent`.
+#   markers     a directory containing this entry counts toward the category.
+#               "dirname/marker" only matches directories called `dirname`.
+#   weak        a more specific category found inside overrides this one
+#
+# Directory rules beat extensions: a .js file inside node_modules counts as
+# node_modules, a .pdf inside .Trash counts as Trash.
+
+# --- Directories -----------------------------------------------------------
+
+[[category]]
+name = "node_modules"
+color = 203
+dirs = ["node_modules", "bower_components", "jspm_packages"]
+
+[[category]]
+name = "Python env"
+color = 214
+dirs = ["__pypackages__", ".tox", ".nox"]
+markers = ["pyvenv.cfg", "conda-meta"]
+
+[[category]]
+name = "Python cache"
+color = 180
+dirs = [
+  "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".ipynb_checkpoints",
+  ".hypothesis", ".pyre", ".pytype",
+]
+
+[[category]]
+name = "ML cache"
+color = 205
+dirs = [
+  "huggingface", "kagglehub", ".cache/torch", ".cache/whisper", ".keras", ".ollama/models",
+  ".lmstudio/models", "wandb", "lightning_logs", "mlruns",
+]
+
+[[category]]
+name = ".git / VCS"
+color = 166
+dirs = [".git", ".hg", ".svn", ".jj", ".bzr"]
+
+[[category]]
+name = "Build output"
+color = 170
+dirs = [
+  ".next", ".nuxt", ".turbo", ".parcel-cache", ".svelte-kit", ".angular", ".dart_tool",
+  ".expo", ".vercel", ".docusaurus", "DerivedData", "CMakeFiles", ".build", "zig-cache",
+  ".zig-cache", "zig-out", ".nx", ".output",
+]
+# Cargo writes CACHEDIR.TAG into target/.
+markers = ["target/CACHEDIR.TAG"]
+
+[[category]]
+name = "Package cache"
+color = 137
+dirs = [
+  ".npm", ".pnpm-store", ".yarn/cache", ".bun/install", ".gradle", ".m2", ".nuget", ".ivy2",
+  ".sbt", ".pub-cache", ".cpan", ".conan", ".conan2", ".terraform", ".cargo/registry",
+  ".cargo/git", "pkg/mod", ".cache/pip", ".cache/uv", ".cache/pypoetry", "Caches/pip",
+  "Caches/Homebrew", "Caches/Yarn", "Caches/pnpm", "Caches/CocoaPods", "Pods",
+]
+
+[[category]]
+name = "Cache"
+color = 139
+weak = true
+dirs = [".cache", "Caches", "Cache", "CachedData", "GPUCache", "Code Cache", "ShaderCache"]
+markers = ["CACHEDIR.TAG"]
+
+[[category]]
+name = "Trash"
+color = 240
+dirs = [".Trash", ".Trashes", "$RECYCLE.BIN", "share/Trash"]
+
+# --- File types ------------------------------------------------------------
+
+[[category]]
+name = "Video"
+color = 39
+extensions = [
+  "mp4", "mkv", "mov", "avi", "wmv", "flv", "webm", "m4v", "mpg", "mpeg", "3gp", "mts",
+  "m2ts", "rmvb", "rm", "vob", "ogv", "f4v", "asf", "divx", "mxf", "r3d", "braw", "insv",
+]
+
+[[category]]
+name = "Image"
+color = 42
+extensions = [
+  "jpg", "jpeg", "jfif", "png", "gif", "bmp", "tif", "tiff", "webp", "heic", "heif", "avif",
+  "jxl", "ico", "icns", "svg", "raw", "cr2", "cr3", "nef", "arw", "dng", "orf", "rw2", "raf",
+  "pef", "srw", "exr", "hdr", "tga", "psd", "psb", "ai", "xcf", "kra", "sketch", "fig", "xd",
+  "afphoto", "afdesign",
+]
+
+[[category]]
+name = "Audio"
+color = 51
+extensions = [
+  "mp3", "wav", "flac", "aac", "ogg", "oga", "m4a", "wma", "aif", "aiff", "opus", "mid",
+  "midi", "ape", "alac", "amr", "caf", "dsf", "dff", "wv", "au", "als", "flp",
+]
+
+[[category]]
+name = "PDF"
+color = 227
+extensions = ["pdf"]
+
+[[category]]
+name = "Document"
+color = 229
+extensions = [
+  "doc", "docx", "dotx", "rtf", "odt", "pages", "xls", "xlsx", "xlsm", "xlsb", "ods",
+  "numbers", "ppt", "pptx", "potx", "odp", "odg", "key", "txt", "md", "rst", "adoc", "org",
+  "tex", "bib", "epub", "mobi", "azw3", "djvu", "chm", "hwp", "wps",
+]
+
+[[category]]
+name = "Archive"
+color = 141
+extensions = [
+  "zip", "tar", "gz", "tgz", "bz2", "tbz", "tbz2", "xz", "txz", "zst", "lz4", "lz", "lzma",
+  "7z", "rar", "cab", "arj", "z", "cpio", "xar", "sit", "whl", "jar", "war", "egg", "crate",
+]
+
+[[category]]
+name = "Installer/disk"
+color = 99
+extensions = [
+  "dmg", "iso", "img", "pkg", "mpkg", "msi", "msix", "exe", "deb", "rpm", "apk", "aab",
+  "ipa", "xip", "appimage", "snap", "flatpak", "vmdk", "qcow2", "vdi", "vhd", "vhdx", "ova",
+  "ovf",
+]
+
+[[category]]
+name = "ML model"
+color = 201
+extensions = [
+  "pt", "pth", "ckpt", "safetensors", "onnx", "h5", "keras", "pb", "tflite", "gguf", "ggml",
+  "mlmodel", "joblib", "pdparams", "engine", "trt", "caffemodel", "nemo", "mar",
+]
+
+[[category]]
+name = "Data"
+color = 117
+extensions = [
+  "csv", "tsv", "json", "jsonl", "ndjson", "xml", "parquet", "orc", "avro", "feather",
+  "arrow", "npy", "npz", "pkl", "pickle", "mat", "hdf5", "hdf", "h5ad", "nc", "tfrecord",
+  "sqlite", "sqlite3", "db", "duckdb", "mdb", "lmdb", "rds", "rdata", "sav", "dta",
+]
+
+[[category]]
+name = "Font"
+color = 179
+extensions = ["ttf", "otf", "ttc", "woff", "woff2", "eot", "fon", "pfb"]
+
+[[category]]
+name = "Log"
+color = 102
+extensions = ["log", "trace", "dmp", "crash", "ips"]
+
+[[category]]
+name = "Temp/backup"
+color = 95
+extensions = ["tmp", "temp", "bak", "old", "orig", "swp", "swo", "part", "crdownload", "download"]
+
+[[category]]
+name = "Binary"
+color = 66
+extensions = [
+  "o", "obj", "a", "lib", "so", "dylib", "dll", "rlib", "rmeta", "class", "pyc", "pyo",
+  "wasm", "node", "bin",
+]
+
+[[category]]
+name = "Code"
+color = 120
+extensions = [
+  "rs", "py", "pyi", "js", "mjs", "cjs", "ts", "mts", "cts", "tsx", "jsx", "go", "c", "h",
+  "cc", "cpp", "cxx", "hh", "hpp", "hxx", "java", "kt", "kts", "scala", "swift", "m", "mm",
+  "rb", "php", "pl", "pm", "lua", "r", "jl", "dart", "ex", "exs", "erl", "hs", "ml", "fs",
+  "clj", "zig", "nim", "cs", "vb", "sol", "asm", "s", "v", "sv", "vhd", "vhdl", "sh", "bash",
+  "zsh", "fish", "ps1", "bat", "cmd", "nix", "tf", "proto", "graphql", "sql", "html", "htm",
+  "css", "scss", "sass", "less", "vue", "svelte", "astro", "ipynb", "toml", "yaml", "yml",
+  "ini", "cfg", "conf", "cmake", "gradle", "lock",
+]
+
+[[category]]
+name = "Other"
+color = 245

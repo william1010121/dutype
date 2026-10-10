@@ -1,108 +1,313 @@
 use ratatui::style::Color;
+use rustc_hash::FxHashMap;
+use serde::Deserialize;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
-/// What a file "is". Special-directory categories (node_modules, .venv, ...) win over
-/// the file extension: every file below such a directory is counted toward it.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
-#[repr(u8)]
-pub enum Category {
-    NodeModules,
-    PyEnv,
-    PyCache,
-    Vcs,
-    BuildOutput,
-    Cache,
-    Trash,
-    Video,
-    Image,
-    Audio,
-    Pdf,
-    Document,
-    Archive,
-    DiskImage,
-    Model,
-    Data,
-    Code,
-    Other,
+pub const DEFAULT_CONFIG: &str = include_str!("default_config.toml");
+
+/// Index into the category registry.
+#[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
+pub struct Category(u8);
+
+pub struct CategoryDef {
+    pub name: String,
+    pub color: Color,
+    /// Has directory rules: its popup lists matching directories, not files.
+    pub dir_kind: bool,
+    pub weak: bool,
 }
 
-pub const COUNT: usize = 18;
+#[derive(Default)]
+pub struct Registry {
+    pub defs: Vec<CategoryDef>,
+    ext: FxHashMap<String, Category>,
+    dirs: FxHashMap<String, Category>,
+    /// name -> [(parent, category)]
+    parent_dirs: FxHashMap<String, Vec<(String, Category)>>,
+    markers: FxHashMap<String, MarkerRule>,
+    /// Bit `n` set when some marker is `n` bytes long: a cheap pre-filter, as
+    /// this check runs for every directory entry.
+    marker_lens: u64,
+    other: Category,
+}
 
-pub const ALL: [Category; COUNT] = [
-    Category::NodeModules,
-    Category::PyEnv,
-    Category::PyCache,
-    Category::Vcs,
-    Category::BuildOutput,
-    Category::Cache,
-    Category::Trash,
-    Category::Video,
-    Category::Image,
-    Category::Audio,
-    Category::Pdf,
-    Category::Document,
-    Category::Archive,
-    Category::DiskImage,
-    Category::Model,
-    Category::Data,
-    Category::Code,
-    Category::Other,
-];
+#[derive(Default)]
+struct MarkerRule {
+    /// Matches in any directory.
+    any: Option<Category>,
+    /// (dir name, category): only matches in directories with that name.
+    named: Vec<(String, Category)>,
+}
 
-impl Category {
-    pub fn index(self) -> usize {
-        self as usize
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfigFile {
+    #[serde(default)]
+    category: Vec<CategoryConfig>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CategoryConfig {
+    name: String,
+    color: Option<ColorConfig>,
+    #[serde(default)]
+    extensions: Vec<String>,
+    #[serde(default)]
+    dirs: Vec<String>,
+    #[serde(default)]
+    markers: Vec<String>,
+    weak: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ColorConfig {
+    Indexed(u8),
+    Hex(String),
+}
+
+impl ColorConfig {
+    fn to_color(&self) -> Result<Color, String> {
+        match self {
+            ColorConfig::Indexed(i) => Ok(Color::Indexed(*i)),
+            ColorConfig::Hex(s) => {
+                let h = s.strip_prefix('#').unwrap_or(s);
+                let v = u32::from_str_radix(h, 16).ok().filter(|_| h.len() == 6);
+                let v = v.ok_or_else(|| format!("invalid color {s:?}, expected 0-255 or \"#rrggbb\""))?;
+                Ok(Color::Rgb((v >> 16) as u8, (v >> 8) as u8, v as u8))
+            }
+        }
+    }
+}
+
+static REGISTRY: OnceLock<Registry> = OnceLock::new();
+
+/// The active registry. Falls back to the built-in rules if `init` was not called.
+pub fn reg() -> &'static Registry {
+    REGISTRY.get_or_init(|| Registry::from_sources(&[DEFAULT_CONFIG]).expect("built-in config is valid"))
+}
+
+/// Load built-in rules plus the user config (explicit path, or the default
+/// location if it exists). Returns the user config path that was applied.
+pub fn init(explicit: Option<&Path>) -> Result<Option<PathBuf>, String> {
+    let path = match explicit {
+        Some(p) => Some(p.to_path_buf()),
+        None => default_config_path().filter(|p| p.exists()),
+    };
+    let user = match &path {
+        Some(p) => Some(std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))?),
+        None => None,
+    };
+    let mut sources = vec![DEFAULT_CONFIG];
+    sources.extend(user.as_deref());
+    let registry = Registry::from_sources(&sources)
+        .map_err(|e| format!("{}: {e}", path.as_deref().unwrap_or(Path::new("config")).display()))?;
+    let _ = REGISTRY.set(registry);
+    Ok(path)
+}
+
+pub fn default_config_path() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("DUTYPE_CONFIG") {
+        return Some(PathBuf::from(p));
+    }
+    let base = if cfg!(windows) {
+        std::env::var_os("APPDATA").map(PathBuf::from)
+    } else {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+    };
+    base.map(|b| b.join("dutype").join("config.toml"))
+}
+
+impl Registry {
+    fn from_sources(sources: &[&str]) -> Result<Self, String> {
+        let mut r = Registry::default();
+        for src in sources {
+            let cfg: ConfigFile = toml::from_str(src).map_err(|e| e.to_string())?;
+            for c in cfg.category {
+                r.apply(c)?;
+            }
+        }
+        r.other = r.find("Other").unwrap_or_else(|| {
+            r.defs.push(CategoryDef { name: "Other".into(), color: Color::Indexed(245), dir_kind: false, weak: false });
+            Category(r.defs.len() as u8 - 1)
+        });
+        Ok(r)
     }
 
-    pub fn label(self) -> &'static str {
-        match self {
-            Category::NodeModules => "node_modules",
-            Category::PyEnv => "Python env",
-            Category::PyCache => "Python cache",
-            Category::Vcs => ".git / VCS",
-            Category::BuildOutput => "Build output",
-            Category::Cache => "Cache",
-            Category::Trash => "Trash",
-            Category::Video => "Video",
-            Category::Image => "Image",
-            Category::Audio => "Audio",
-            Category::Pdf => "PDF",
-            Category::Document => "Document",
-            Category::Archive => "Archive",
-            Category::DiskImage => "Disk image",
-            Category::Model => "ML model",
-            Category::Data => "Data",
-            Category::Code => "Code",
-            Category::Other => "Other",
+    fn find(&self, name: &str) -> Option<Category> {
+        self.defs.iter().position(|d| d.name.eq_ignore_ascii_case(name)).map(|i| Category(i as u8))
+    }
+
+    fn apply(&mut self, c: CategoryConfig) -> Result<(), String> {
+        let id = match self.find(&c.name) {
+            Some(id) => id,
+            None => {
+                if self.defs.len() >= u8::MAX as usize {
+                    return Err("too many categories".into());
+                }
+                // New categories go before "Other" so it stays last.
+                let at = self.find("Other").map_or(self.defs.len(), |o| o.0 as usize);
+                self.shift_from(at);
+                self.defs.insert(at, CategoryDef {
+                    name: c.name.clone(),
+                    color: Color::Indexed(250),
+                    dir_kind: false,
+                    weak: false,
+                });
+                Category(at as u8)
+            }
+        };
+        let def = &mut self.defs[id.0 as usize];
+        if let Some(color) = &c.color {
+            def.color = color.to_color()?;
+        }
+        if let Some(w) = c.weak {
+            def.weak = w;
+        }
+        def.dir_kind |= !c.dirs.is_empty() || !c.markers.is_empty();
+        for e in c.extensions {
+            self.ext.insert(e.trim_start_matches('.').to_ascii_lowercase(), id);
+        }
+        for d in c.dirs {
+            match d.split_once('/') {
+                Some((parent, name)) => upsert(self.parent_dirs.entry(name.into()).or_default(), parent, id),
+                None => {
+                    self.dirs.insert(d, id);
+                }
+            }
+        }
+        for m in c.markers {
+            let (dir, marker) = match m.split_once('/') {
+                Some((dir, marker)) => (Some(dir), marker),
+                None => (None, m.as_str()),
+            };
+            if marker.len() >= 64 {
+                return Err(format!("marker {marker:?} is too long"));
+            }
+            self.marker_lens |= 1 << marker.len();
+            let rule = self.markers.entry(marker.into()).or_default();
+            match dir {
+                Some(dir) => upsert(&mut rule.named, dir, id),
+                None => rule.any = Some(id),
+            }
+        }
+        Ok(())
+    }
+
+    /// Renumber every rule pointing at index >= `at` (an insert is about to happen).
+    fn shift_from(&mut self, at: usize) {
+        let bump = |c: &mut Category| {
+            if c.0 as usize >= at {
+                c.0 += 1;
+            }
+        };
+        self.ext.values_mut().for_each(bump);
+        self.dirs.values_mut().for_each(bump);
+        for list in self.parent_dirs.values_mut() {
+            list.iter_mut().for_each(|(_, c)| bump(c));
+        }
+        for rule in self.markers.values_mut() {
+            rule.any.iter_mut().for_each(bump);
+            rule.named.iter_mut().for_each(|(_, c)| bump(c));
         }
     }
 
-    pub fn color(self) -> Color {
-        Color::Indexed(match self {
-            Category::NodeModules => 203,
-            Category::PyEnv => 214,
-            Category::PyCache => 180,
-            Category::Vcs => 166,
-            Category::BuildOutput => 170,
-            Category::Cache => 139,
-            Category::Trash => 240,
-            Category::Video => 39,
-            Category::Image => 42,
-            Category::Audio => 51,
-            Category::Pdf => 227,
-            Category::Document => 229,
-            Category::Archive => 141,
-            Category::DiskImage => 99,
-            Category::Model => 201,
-            Category::Data => 117,
-            Category::Code => 120,
-            Category::Other => 245,
-        })
+    pub fn len(&self) -> usize {
+        self.defs.len()
     }
 
-    /// Categories that come from a directory rather than a file extension.
-    pub fn is_dir_kind(self) -> bool {
-        self.index() <= Category::Trash.index()
+    pub fn all(&self) -> impl Iterator<Item = Category> + '_ {
+        (0..self.defs.len()).map(|i| Category(i as u8))
     }
+
+    pub fn other(&self) -> Category {
+        self.other
+    }
+
+    pub fn classify_file(&self, name: &str) -> Category {
+        let Some(ext) = ext_of(name) else { return self.other };
+        // Lowercase into a stack buffer: this runs once per file.
+        let mut buf = [0u8; 16];
+        let Some(dst) = buf.get_mut(..ext.len()) else { return self.other };
+        dst.copy_from_slice(ext.as_bytes());
+        dst.make_ascii_lowercase();
+        std::str::from_utf8(dst).ok().and_then(|e| self.ext.get(e)).copied().unwrap_or(self.other)
+    }
+
+    /// Classify a directory from its name, its parent's name and its entries.
+    pub fn special_dir<'a>(&self, name: &str, parent: &str, entries: impl Iterator<Item = &'a str>) -> Option<Category> {
+        if let Some(c) = self.parent_dirs.get(name).and_then(|l| lookup(l, parent)) {
+            return Some(c);
+        }
+        if let Some(&c) = self.dirs.get(name) {
+            return Some(c);
+        }
+        let mut plain = None;
+        for e in entries {
+            if e.len() >= 64 || self.marker_lens & (1 << e.len()) == 0 {
+                continue;
+            }
+            if let Some(rule) = self.markers.get(e) {
+                if let Some(c) = lookup(&rule.named, name) {
+                    return Some(c);
+                }
+                plain = plain.or(rule.any);
+            }
+        }
+        plain
+    }
+}
+
+fn upsert(list: &mut Vec<(String, Category)>, key: &str, id: Category) {
+    match list.iter_mut().find(|(k, _)| k == key) {
+        Some(entry) => entry.1 = id,
+        None => list.push((key.to_string(), id)),
+    }
+}
+
+fn lookup(list: &[(String, Category)], key: &str) -> Option<Category> {
+    list.iter().find(|(k, _)| k == key).map(|(_, c)| *c)
+}
+
+impl Category {
+    pub fn index(self) -> usize {
+        self.0 as usize
+    }
+
+    fn def(self) -> &'static CategoryDef {
+        &reg().defs[self.0 as usize]
+    }
+
+    pub fn label(self) -> &'static str {
+        &self.def().name
+    }
+
+    pub fn color(self) -> Color {
+        self.def().color
+    }
+
+    pub fn is_dir_kind(self) -> bool {
+        self.def().dir_kind
+    }
+
+    pub fn is_weak(self) -> bool {
+        self.def().weak
+    }
+}
+
+/// Categories with a non-zero size, biggest first.
+pub fn by_size(cats: &[u64]) -> Vec<Category> {
+    let mut v: Vec<Category> = reg().all().filter(|c| cats[c.index()] > 0).collect();
+    v.sort_by(|a, b| cats[b.index()].cmp(&cats[a.index()]));
+    v
+}
+
+pub fn dominant(cats: &[u64]) -> Category {
+    reg().all().max_by_key(|c| cats[c.index()]).unwrap_or(reg().other())
 }
 
 pub fn ext_of(name: &str) -> Option<&str> {
@@ -112,100 +317,73 @@ pub fn ext_of(name: &str) -> Option<&str> {
     }
 }
 
-pub fn from_name(name: &str) -> Category {
-    let Some(ext) = ext_of(name) else {
-        return Category::Other;
-    };
-    let ext = ext.to_ascii_lowercase();
-    match ext.as_str() {
-        "mp4" | "mkv" | "mov" | "avi" | "wmv" | "flv" | "webm" | "m4v" | "mpg" | "mpeg" | "3gp"
-        | "mts" | "m2ts" => Category::Video,
-        "jpg" | "jpeg" | "png" | "gif" | "bmp" | "tif" | "tiff" | "webp" | "heic" | "heif"
-        | "raw" | "cr2" | "cr3" | "nef" | "arw" | "dng" | "svg" | "psd" | "ico" | "avif" => {
-            Category::Image
-        }
-        "mp3" | "wav" | "flac" | "aac" | "ogg" | "m4a" | "wma" | "aif" | "aiff" | "opus" => {
-            Category::Audio
-        }
-        "pdf" => Category::Pdf,
-        "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "odt" | "ods" | "odp" | "key"
-        | "pages" | "numbers" | "txt" | "md" | "rtf" | "epub" | "tex" => Category::Document,
-        "zip" | "tar" | "gz" | "tgz" | "bz2" | "xz" | "7z" | "rar" | "zst" | "lz4" | "tbz"
-        | "txz" | "whl" | "jar" => Category::Archive,
-        "dmg" | "iso" | "img" | "pkg" | "vmdk" | "qcow2" | "vdi" | "vhd" | "vhdx" => {
-            Category::DiskImage
-        }
-        "pt" | "pth" | "ckpt" | "safetensors" | "onnx" | "h5" | "pb" | "tflite" | "gguf"
-        | "mlmodel" | "keras" => Category::Model,
-        "csv" | "tsv" | "json" | "jsonl" | "parquet" | "npy" | "npz" | "feather" | "arrow"
-        | "sqlite" | "sqlite3" | "db" | "hdf5" | "pkl" | "pickle" | "mat" | "tfrecord"
-        | "mdb" => Category::Data,
-        "rs" | "py" | "js" | "mjs" | "cjs" | "ts" | "tsx" | "jsx" | "go" | "c" | "h" | "cc"
-        | "cpp" | "hpp" | "java" | "kt" | "swift" | "rb" | "php" | "sh" | "zsh" | "html"
-        | "css" | "scss" | "vue" | "svelte" | "lua" | "zig" | "cs" | "m" | "mm" | "sql"
-        | "toml" | "yaml" | "yml" | "ipynb" => Category::Code,
-        _ => Category::Other,
-    }
-}
-
-/// Decide whether a directory is a "special" one, using its name and the names of
-/// its direct entries (so no extra syscalls are needed).
-pub fn special_dir<'a>(name: &str, entries: impl Iterator<Item = &'a str>) -> Option<Category> {
-    match name {
-        "node_modules" => return Some(Category::NodeModules),
-        "__pycache__" | ".pytest_cache" | ".mypy_cache" | ".ruff_cache" | ".tox"
-        | ".ipynb_checkpoints" => return Some(Category::PyCache),
-        ".git" | ".hg" | ".svn" => return Some(Category::Vcs),
-        ".Trash" | ".Trashes" => return Some(Category::Trash),
-        ".cache" | "Caches" | ".npm" | ".pnpm-store" | ".gradle" => return Some(Category::Cache),
-        ".next" | ".nuxt" | ".turbo" | ".parcel-cache" | ".svelte-kit" | ".angular" => {
-            return Some(Category::BuildOutput);
-        }
-        _ => {}
-    }
-    let mut cachedir_tag = false;
-    for e in entries {
-        match e {
-            "pyvenv.cfg" | "conda-meta" => return Some(Category::PyEnv),
-            "CACHEDIR.TAG" => cachedir_tag = true,
-            _ => {}
-        }
-    }
-    // Cargo writes CACHEDIR.TAG into target/; other tools use it for caches.
-    cachedir_tag.then(|| {
-        if name == "target" {
-            Category::BuildOutput
-        } else {
-            Category::Cache
-        }
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn builtin() -> Registry {
+        Registry::from_sources(&[DEFAULT_CONFIG]).unwrap()
+    }
+
+    fn label(r: &Registry, c: Option<Category>) -> Option<&str> {
+        c.map(|c| r.defs[c.index()].name.as_str())
+    }
+
     #[test]
     fn extensions() {
-        assert_eq!(from_name("a.PDF"), Category::Pdf);
-        assert_eq!(from_name("movie.mkv"), Category::Video);
-        assert_eq!(from_name("x.tar.gz"), Category::Archive);
-        assert_eq!(from_name(".bashrc"), Category::Other);
-        assert_eq!(from_name("Makefile"), Category::Other);
+        let r = builtin();
+        let l = |n| r.defs[r.classify_file(n).index()].name.as_str();
+        assert_eq!(l("a.PDF"), "PDF");
+        assert_eq!(l("movie.mkv"), "Video");
+        assert_eq!(l("x.tar.gz"), "Archive");
+        assert_eq!(l("model.safetensors"), "ML model");
+        assert_eq!(l(".bashrc"), "Other");
+        assert_eq!(l("Makefile"), "Other");
+        assert_eq!(l("a.averyveryverylongextension"), "Other");
     }
 
     #[test]
     fn special_dirs() {
-        assert_eq!(special_dir("node_modules", [].into_iter()), Some(Category::NodeModules));
-        assert_eq!(special_dir("myenv", ["bin", "pyvenv.cfg"].into_iter()), Some(Category::PyEnv));
-        assert_eq!(special_dir("target", ["CACHEDIR.TAG"].into_iter()), Some(Category::BuildOutput));
-        assert_eq!(special_dir("src", ["main.rs"].into_iter()), None);
+        let r = builtin();
+        let s = |name, parent, entries: &[&'static str]| label(&r, r.special_dir(name, parent, entries.iter().copied()));
+        assert_eq!(s("node_modules", "app", &[]), Some("node_modules"));
+        assert_eq!(s("myenv", "x", &["bin", "pyvenv.cfg"]), Some("Python env"));
+        assert_eq!(s("target", "proj", &["CACHEDIR.TAG"]), Some("Build output"));
+        assert_eq!(s("other", "proj", &["CACHEDIR.TAG"]), Some("Cache"));
+        assert_eq!(s("torch", ".cache", &[]), Some("ML cache"));
+        assert_eq!(s("torch", "src", &[]), None);
+        assert_eq!(s("src", "proj", &["main.rs"]), None);
     }
 
     #[test]
-    fn all_is_ordered() {
-        for (i, c) in ALL.iter().enumerate() {
-            assert_eq!(c.index(), i);
-        }
+    fn user_config_extends_and_adds() {
+        let user = r##"
+            [[category]]
+            name = "video"
+            extensions = ["xyz"]
+
+            [[category]]
+            name = "Unity"
+            color = "#ff8800"
+            extensions = ["unitypackage", "pdf"]
+            dirs = ["Library"]
+        "##;
+        let r = Registry::from_sources(&[DEFAULT_CONFIG, user]).unwrap();
+        let l = |n| r.defs[r.classify_file(n).index()].name.as_str();
+        assert_eq!(l("clip.xyz"), "Video");
+        assert_eq!(l("pack.unitypackage"), "Unity");
+        assert_eq!(l("doc.pdf"), "Unity");
+        assert_eq!(label(&r, r.special_dir("Library", "game", [].into_iter())), Some("Unity"));
+        // Inserting before Other must not break existing rules.
+        assert_eq!(l("a.mp4"), "Video");
+        assert_eq!(l("Makefile"), "Other");
+        assert_eq!(r.defs.last().unwrap().name, "Other");
+        assert_eq!(label(&r, r.special_dir("node_modules", "x", [].into_iter())), Some("node_modules"));
+    }
+
+    #[test]
+    fn bad_config_is_reported() {
+        assert!(Registry::from_sources(&[DEFAULT_CONFIG, "[[category]]\nname = \"x\"\ncolour = 3"]).is_err());
+        assert!(Registry::from_sources(&[DEFAULT_CONFIG, "[[category]]\nname = \"x\"\ncolor = \"red\""]).is_err());
     }
 }

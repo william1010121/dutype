@@ -1,10 +1,9 @@
-use crate::category::{self, ALL, Category};
-use crate::scan::Node;
+use crate::category::{self, Category, by_size, reg};
+use crate::scan::{Node, TopN, walk};
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::style::Color;
 use ratatui::widgets::TableState;
-use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -114,19 +113,16 @@ impl App {
         self.breakdown = match self.mode {
             Mode::Category => {
                 let cats = cur.cats();
-                let mut items: Vec<_> = ALL
-                    .iter()
-                    .filter(|c| cats[c.index()] > 0)
-                    .map(|&c| BreakdownItem {
+                by_size(&cats)
+                    .into_iter()
+                    .map(|c| BreakdownItem {
                         key: Key::Cat(c),
                         label: c.label().to_string(),
                         color: c.color(),
                         size: cats[c.index()],
                         count: None,
                     })
-                    .collect();
-                items.sort_by(|a, b| b.size.cmp(&a.size));
-                items
+                    .collect()
             }
             Mode::Extension => ext_breakdown(cur),
         };
@@ -226,13 +222,10 @@ impl App {
             return;
         };
         let cur = self.current();
-        let mut heap: BinaryHeap<Reverse<(u64, PathBuf)>> = BinaryHeap::new();
+        let mut top = TopN::new(POPUP_LIMIT);
         let mut push = |size: u64, path: &Path| {
-            if heap.len() < POPUP_LIMIT {
-                heap.push(Reverse((size, path.to_path_buf())));
-            } else if heap.peek().is_some_and(|Reverse((s, _))| size > *s) {
-                heap.pop();
-                heap.push(Reverse((size, path.to_path_buf())));
+            if top.accepts(|min: &(u64, PathBuf)| size > min.0) {
+                top.push((size, path.to_path_buf()));
             }
         };
         let title;
@@ -267,8 +260,7 @@ impl App {
                 });
             }
         }
-        let mut items: Vec<_> = heap.into_iter().map(|Reverse((s, p))| (p, s)).collect();
-        items.sort_by(|a, b| b.1.cmp(&a.1));
+        let items: Vec<_> = top.into_sorted().into_iter().map(|(s, p)| (p, s)).collect();
         let state = first_selected(items.len());
         self.popup = Some(Popup { title, base: self.current_path(), items, state });
     }
@@ -283,18 +275,7 @@ fn step(state: &mut TableState, len: usize, delta: isize) {
     state.select(Some(cur.saturating_add(delta).clamp(0, len as isize - 1) as usize));
 }
 
-/// Depth-first walk below `node`; `f` returns false to skip descending into a dir.
-fn walk(node: &Node, rel: &mut PathBuf, f: &mut impl FnMut(&Node, &Path) -> bool) {
-    for c in node.children() {
-        rel.push(&*c.name);
-        if f(c, rel) && c.is_dir() {
-            walk(c, rel, f);
-        }
-        rel.pop();
-    }
-}
-
-fn ext_key(name: &str) -> String {
+pub fn ext_key(name: &str) -> String {
     category::ext_of(name).map_or_else(|| "(none)".to_string(), |e| e.to_ascii_lowercase())
 }
 
@@ -302,7 +283,7 @@ fn ext_breakdown(cur: &Node) -> Vec<BreakdownItem> {
     let mut map: HashMap<String, (u64, u64, Category)> = HashMap::new();
     walk(cur, &mut PathBuf::new(), &mut |n, _| {
         if !n.is_dir() {
-            let e = map.entry(ext_key(&n.name)).or_insert((0, 0, category::from_name(&n.name)));
+            let e = map.entry(ext_key(&n.name)).or_insert((0, 0, reg().classify_file(&n.name)));
             e.0 += n.size;
             e.1 += 1;
         }
@@ -323,11 +304,21 @@ fn ext_breakdown(cur: &Node) -> Vec<BreakdownItem> {
     items
 }
 
+/// Show the file in the OS file manager.
 fn reveal(path: &Path) {
-    let _ = std::process::Command::new("open")
-        .arg("-R")
-        .arg(path)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
+    use std::process::{Command, Stdio};
+    let mut cmd = if cfg!(target_os = "macos") {
+        let mut c = Command::new("open");
+        c.arg("-R").arg(path);
+        c
+    } else if cfg!(windows) {
+        let mut c = Command::new("explorer");
+        c.arg(format!("/select,{}", path.display()));
+        c
+    } else {
+        let mut c = Command::new("xdg-open");
+        c.arg(path.parent().unwrap_or(path));
+        c
+    };
+    let _ = cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
 }

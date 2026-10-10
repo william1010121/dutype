@@ -1,5 +1,5 @@
 use crate::app::{App, Focus, Mode, node_at};
-use crate::category::{ALL, COUNT, Category};
+use crate::category::{Category, by_size, dominant};
 use crate::scan::Node;
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Flex, Layout, Rect};
@@ -37,7 +37,7 @@ pub fn thousands(n: u64) -> String {
     let s = n.to_string();
     let mut out = String::with_capacity(s.len() + s.len() / 3);
     for (i, ch) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i) % 3 == 0 {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(ch);
@@ -73,15 +73,14 @@ fn smooth_bar(frac: f64, width: u16) -> String {
 
 /// Splits `len` cells among categories proportionally (largest remainder),
 /// biggest category first.
-fn apportion(cats: &[u64; COUNT], len: usize) -> Vec<(Category, usize)> {
+fn apportion(cats: &[u64], len: usize) -> Vec<(Category, usize)> {
     let total: u64 = cats.iter().sum();
     if total == 0 || len == 0 {
         return Vec::new();
     }
-    let mut parts: Vec<(Category, usize, f64)> = ALL
-        .iter()
-        .filter(|c| cats[c.index()] > 0)
-        .map(|&c| {
+    let mut parts: Vec<(Category, usize, f64)> = by_size(cats)
+        .into_iter()
+        .map(|c| {
             let exact = cats[c.index()] as f64 * len as f64 / total as f64;
             (c, exact.floor() as usize, exact.fract())
         })
@@ -98,7 +97,7 @@ fn apportion(cats: &[u64; COUNT], len: usize) -> Vec<(Category, usize)> {
 
 /// A bar whose length is `size / max` of `width`, made of colored segments
 /// proportional to the category sizes, on a dim track.
-fn stacked_bar(cats: &[u64; COUNT], size: u64, max: u64, width: u16, glyph: &str) -> Line<'static> {
+fn stacked_bar(cats: &[u64], size: u64, max: u64, width: u16, glyph: &str) -> Line<'static> {
     let len = (ratio(size, max) * width as f64).round() as usize;
     let len = if size > 0 { len.clamp(1, width as usize) } else { 0 };
     let mut spans: Vec<Span> = apportion(cats, len)
@@ -107,10 +106,6 @@ fn stacked_bar(cats: &[u64; COUNT], size: u64, max: u64, width: u16, glyph: &str
         .collect();
     spans.push(Span::styled("·".repeat(width as usize - len), Style::new().fg(DIM)));
     Line::from(spans)
-}
-
-fn dominant(cats: &[u64; COUNT]) -> Category {
-    *ALL.iter().max_by_key(|c| cats[c.index()]).unwrap()
 }
 
 fn panel(title: Line<'static>, focused: bool) -> Block<'static> {
@@ -227,8 +222,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
 
     let mut legend: Vec<Span> = Vec::new();
     let mut used = 0usize;
-    let mut items: Vec<_> = ALL.iter().filter(|c| cats[c.index()] > 0).collect();
-    items.sort_by(|a, b| cats[b.index()].cmp(&cats[a.index()]));
+    let items = by_size(&cats);
     for c in items {
         let text = format!("{} {}  ", c.label(), pct(cats[c.index()], cur.size).trim());
         if used + text.chars().count() + 2 > width as usize {
@@ -386,8 +380,7 @@ fn draw_details(f: &mut Frame, app: &App, area: Rect) {
     }
     lines.push(stacked_bar(&cats, node.size, node.size, inner.width, "▀"));
 
-    let mut items: Vec<_> = ALL.iter().filter(|c| cats[c.index()] > 0).collect();
-    items.sort_by(|a, b| cats[b.index()].cmp(&cats[a.index()]));
+    let items = by_size(&cats);
     let rows_left = (inner.height as usize).saturating_sub(lines.len());
     let col = (inner.width as usize / 2).max(1);
     for pair in items.chunks(2).take(rows_left) {
@@ -458,7 +451,7 @@ pub fn draw_scanning(f: &mut Frame, path: &Path, files: u64, bytes: u64, elapsed
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(ACCENT))
         .title(Line::from(vec![Span::raw(" "), chip("◆ dutype", ACCENT), Span::raw(" ")]))
-        .title_bottom(Line::from(keycaps(&[("q", "abort")])).right_aligned())
+        .title_bottom(keycaps(&[("q", "abort")]).right_aligned())
         .padding(Padding::new(2, 2, 1, 0));
     let inner = block.inner(area);
     f.render_widget(block, area);
