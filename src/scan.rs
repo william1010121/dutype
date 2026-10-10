@@ -95,6 +95,8 @@ struct Ctx<'a> {
     root_dev: u64,
     one_fs: bool,
     seen_inodes: Mutex<FxHashSet<(u64, u64)>>,
+    /// A directory never to descend into (dutype's own cache), as (name, full path).
+    exclude: Option<(String, PathBuf)>,
 }
 
 impl Ctx<'_> {
@@ -119,13 +121,21 @@ fn file_name_of(p: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// Scan `root`. dutype's own cache directory is always skipped, so `--cache`
+/// writing a snapshot under the scanned tree never changes the totals.
 pub fn scan(root: &Path, one_fs: bool, progress: &Progress) -> std::io::Result<Node> {
+    let cache_dir = crate::cache::dir().and_then(|d| fs::canonicalize(d).ok());
+    scan_excluding(root, one_fs, progress, cache_dir.as_deref())
+}
+
+pub fn scan_excluding(root: &Path, one_fs: bool, progress: &Progress, exclude: Option<&Path>) -> std::io::Result<Node> {
     let meta = fs::metadata(root)?;
     let ctx = Ctx {
         progress,
         root_dev: platform::device(&meta),
         one_fs,
         seen_inodes: Mutex::new(FxHashSet::default()),
+        exclude: exclude.and_then(|p| Some((p.file_name()?.to_string_lossy().into_owned(), p.to_path_buf()))),
     };
     let name: Box<str> = root.display().to_string().into();
     if !meta.is_dir() {
@@ -180,6 +190,12 @@ fn scan_dir(
     let mut children: Vec<Node> = dirs
         .into_par_iter()
         .filter(|(_, m)| !ctx.one_fs || platform::device(m) == ctx.root_dev)
+        // Compare the name first so the full path is only built for a likely match.
+        .filter(|(n, _)| {
+            ctx.exclude
+                .as_ref()
+                .is_none_or(|(name, full)| n != name || path.join(n) != *full)
+        })
         .map(|(n, m)| {
             let child_path = path.join(&n);
             scan_dir(&child_path, n.into(), &name, effective, &m, ctx)

@@ -125,7 +125,8 @@ dutype --refresh ~     # rescan and update the cache
 With `--cache`, scans are saved in `~/.cache/dutype` (`$XDG_CACHE_HOME/dutype`,
 `%LOCALAPPDATA%\dutype\cache` on Windows, or `$DUTYPE_CACHE_DIR`). A cache is
 reused until you press `r` or pass `--refresh`; it is ignored automatically
-after a dutype upgrade or a category rule change. `--json` reports `cached_at`
+after a dutype upgrade or a category rule change. dutype never counts its own
+cache directory, so totals are the same with or without `--cache`. `--json` reports `cached_at`
 (unix time) when the result came from the cache.
 
 | Key | Action |

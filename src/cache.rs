@@ -90,7 +90,7 @@ fn read_from(file: &Path, root_path: &Path) -> Option<Snapshot> {
     if r.take(MAGIC.len())? != MAGIC || u64::from_le_bytes(r.take(8)?.try_into().ok()?) != reg().fingerprint {
         return None;
     }
-    let at = UNIX_EPOCH + Duration::from_secs(r.varint()?);
+    let at = UNIX_EPOCH.checked_add(Duration::from_secs(r.varint()?))?;
     let scan_time = Duration::from_millis(r.varint()?);
     let errors = r.varint()?;
     // A hash collision between two paths must not show the wrong tree.
@@ -235,6 +235,19 @@ mod tests {
     }
 
     #[test]
+    fn cache_dir_inside_root_is_not_counted() {
+        let root = fs::canonicalize(temp("excl")).unwrap();
+        fs::write(root.join("a.pdf"), vec![1u8; 10_000]).unwrap();
+        let cache = root.join(".cache").join("dutype");
+        fs::create_dir_all(&cache).unwrap();
+        let before = crate::scan::scan_excluding(&root, true, &Progress::default(), Some(&cache)).unwrap();
+        fs::write(cache.join("snap.bin"), vec![2u8; 200_000]).unwrap();
+        let after = crate::scan::scan_excluding(&root, true, &Progress::default(), Some(&cache)).unwrap();
+        assert_eq!(before.size, after.size);
+        assert_eq!(before.files(), after.files());
+    }
+
+    #[test]
     fn round_trip() {
         let src = temp("src");
         fs::create_dir_all(src.join("node_modules/pkg")).unwrap();
@@ -256,6 +269,15 @@ mod tests {
         same(&snap.root, &back.root);
         assert_eq!((back.scan_time, back.errors), (snap.scan_time, 3));
         assert!(back.cached_at.is_some());
+
+        // A corrupt timestamp is a miss, not a panic.
+        let mut bad = Vec::from(&MAGIC[..]);
+        bad.extend(reg().fingerprint.to_le_bytes());
+        bad.extend([0xff; 9]);
+        bad.push(0x01); // u64::MAX seconds, beyond SystemTime on some platforms
+        let bad_file = temp("bad").join("c.bin");
+        fs::write(&bad_file, &bad).unwrap();
+        assert!(read_from(&bad_file, &src).is_none());
 
         // Another path, or a truncated file, is a miss rather than a wrong tree.
         assert!(read_from(&file, &src.join("node_modules")).is_none());

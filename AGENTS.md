@@ -49,7 +49,8 @@ hand-edited (`allow-dirty = ["ci"]`): if you run `dist generate`, keep its
 ### Correctness
 
 - Sizes are allocated bytes (`blocks * 512` on unix) and hard links count once;
-  totals must keep matching `du -skx`.
+  totals must keep matching `du -skx`, except that dutype's own cache
+  directory is always skipped (so `--cache` never changes the totals).
 - Directory rules beat extension rules; inside a non-weak special directory,
   every file inherits its category.
 - `Other` must stay the last category; inserting a category must renumber all
