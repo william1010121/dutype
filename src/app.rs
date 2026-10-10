@@ -37,6 +37,14 @@ pub struct BreakdownItem {
     pub count: Option<u64>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Rescan {
+    /// `r`: rescan the current folder and splice it into the tree.
+    Current,
+    /// `R`: rescan everything from the root.
+    All,
+}
+
 pub struct Popup {
     pub title: String,
     /// Paths relative to the directory the popup was opened in.
@@ -62,8 +70,9 @@ pub struct App {
     pub cached_at: Option<SystemTime>,
     pub errors: u64,
     pub quit: bool,
-    /// Set by `r`: the caller rescans and opens a fresh `App`.
-    pub rescan: bool,
+    /// Set by `r` / `R`; the caller performs the rescan. `All` also quits the
+    /// event loop so a fresh `App` is built.
+    pub rescan: Option<Rescan>,
     /// One-shot message in the footer (e.g. after copying a path).
     pub status: Option<String>,
     /// Screencast mode: show the last key pressed (for demos and recordings).
@@ -73,6 +82,12 @@ pub struct App {
 
 pub fn node_at<'a>(root: &'a Node, stack: &[usize]) -> &'a Node {
     stack.iter().fold(root, |n, &i| &n.children()[i])
+}
+
+fn node_at_mut<'a>(root: &'a mut Node, stack: &[usize]) -> &'a mut Node {
+    stack.iter().fold(root, |n, &i| {
+        &mut n.dir.as_mut().expect("stack points at a directory").children[i]
+    })
 }
 
 fn first_selected(len: usize) -> TableState {
@@ -96,7 +111,7 @@ impl App {
             cached_at: None,
             errors,
             quit: false,
-            rescan: false,
+            rescan: None,
             status: None,
             show_keys: false,
             last_key: None,
@@ -145,6 +160,69 @@ impl App {
             self.states.last_mut().unwrap().select(Some(i));
             self.enter();
         }
+    }
+
+    /// Special category the current folder inherits from its parent, for
+    /// [`crate::scan::scan_subtree`].
+    pub fn inherited_category(&self) -> Option<Category> {
+        let (_, parent) = self.stack.split_last()?;
+        let cat = node_at(&self.root, parent).cat;
+        (cat != reg().other()).then_some(cat)
+    }
+
+    /// Replace the current folder with a fresh scan of it, update every
+    /// ancestor's totals and order, and keep the cursor on the same entries.
+    pub fn replace_current(&mut self, mut fresh: Node) {
+        let location = self.location();
+        // Selected entry name at every level, to restore after re-sorting.
+        let selected: Vec<Option<Box<str>>> = (0..=self.stack.len())
+            .map(|k| {
+                let node = node_at(&self.root, &self.stack[..k]);
+                self.states[k]
+                    .selected()
+                    .and_then(|i| node.children().get(i))
+                    .map(|c| c.name.clone())
+            })
+            .collect();
+
+        let target = node_at_mut(&mut self.root, &self.stack);
+        fresh.name = target.name.clone();
+        let old = std::mem::replace(target, fresh);
+        let new = node_at(&self.root, &self.stack);
+        let size_delta = new.size as i128 - old.size as i128;
+        let files_delta = new.files() as i128 - old.files() as i128;
+        let cats_delta: Vec<i128> = new
+            .cats()
+            .iter()
+            .zip(old.cats().iter())
+            .map(|(n, o)| *n as i128 - *o as i128)
+            .collect();
+        let shift = |v: &mut u64, d: i128| *v = (*v as i128 + d).max(0) as u64;
+        for k in (0..self.stack.len()).rev() {
+            let node = node_at_mut(&mut self.root, &self.stack[..k]);
+            shift(&mut node.size, size_delta);
+            if let Some(dir) = node.dir.as_mut() {
+                shift(&mut dir.files, files_delta);
+                dir.cats.iter_mut().zip(&cats_delta).for_each(|(c, d)| shift(c, *d));
+                dir.children
+                    .sort_unstable_by(|a, b| b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name)));
+            }
+        }
+        // Free the old subtree off the UI thread; it can be large.
+        std::thread::spawn(move || drop(old));
+
+        self.stack.clear();
+        self.states = vec![first_selected(self.root.children().len())];
+        self.go_to(&location);
+        for (k, name) in selected.iter().enumerate().take(self.states.len()) {
+            let node = node_at(&self.root, &self.stack[..k]);
+            let pos = name
+                .as_ref()
+                .and_then(|n| node.children().iter().position(|c| c.name == *n));
+            self.states[k].select(pos.or(if node.children().is_empty() { None } else { Some(0) }));
+        }
+        self.popup = None;
+        self.refresh_breakdown();
     }
 
     fn selected_entry(&self) -> Option<usize> {
@@ -221,8 +299,10 @@ impl App {
                 };
                 self.copy(&path);
             }
-            KeyCode::Char('r') => {
-                self.rescan = true;
+            // At the root, rescanning "here" is a full rescan.
+            KeyCode::Char('r') if !self.stack.is_empty() => self.rescan = Some(Rescan::Current),
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                self.rescan = Some(Rescan::All);
                 self.quit = true;
             }
             _ => {}
@@ -262,7 +342,8 @@ impl App {
             KeyCode::Char('m') => ("m".to_string(), "category / extension"),
             KeyCode::Char('o') => ("o".to_string(), "reveal"),
             KeyCode::Char('y') => ("y".to_string(), "copy path"),
-            KeyCode::Char('r') if !popup => ("r".to_string(), "rescan"),
+            KeyCode::Char('r') if !popup => ("r".to_string(), "rescan folder"),
+            KeyCode::Char('R') if !popup => ("R".to_string(), "rescan all"),
             KeyCode::Char('q') => ("q".to_string(), if popup { "close" } else { "quit" }),
             KeyCode::Char(c) => (c.to_string(), ""),
             _ => ("?".to_string(), ""),
@@ -505,6 +586,78 @@ fn base64(data: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::scan::{Progress, scan_excluding, scan_subtree};
+    use std::fs;
+
+    fn temp(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("dutype-app-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        fs::canonicalize(d).unwrap()
+    }
+
+    fn full(root: &Path) -> Node {
+        scan_excluding(root, true, &Progress::default(), None).unwrap()
+    }
+
+    fn same(a: &Node, b: &Node) {
+        assert_eq!((&a.name, a.size, a.cat, a.special), (&b.name, b.size, b.cat, b.special));
+        assert_eq!((a.files(), a.cats()), (b.files(), b.cats()), "{}", a.name);
+        let names = |n: &Node| n.children().iter().map(|c| c.name.clone()).collect::<Vec<_>>();
+        assert_eq!(names(a), names(b), "order under {}", a.name);
+        a.children().iter().zip(b.children()).for_each(|(x, y)| same(x, y));
+    }
+
+    /// `r` splices a rescan of the current folder; the result must equal a
+    /// full rescan (sizes, counts, categories and sort order of ancestors).
+    #[test]
+    fn rescan_current_matches_full_scan() {
+        let root = temp("splice");
+        fs::create_dir_all(root.join("small/inner")).unwrap();
+        fs::create_dir_all(root.join("big")).unwrap();
+        fs::write(root.join("big/a.mp4"), vec![0u8; 300_000]).unwrap();
+        fs::write(root.join("small/inner/b.pdf"), vec![0u8; 10_000]).unwrap();
+
+        let mut app = App::new(full(&root), root.clone(), Duration::ZERO, 0);
+        app.go_to(&["small".into(), "inner".into()]);
+        assert_eq!(app.location(), vec![Box::from("small"), Box::from("inner")]);
+
+        // "small" grows past "big", so the root's order has to change.
+        fs::write(root.join("small/inner/c.zip"), vec![0u8; 900_000]).unwrap();
+        let fresh = scan_subtree(
+            &app.current_path(),
+            true,
+            &Progress::default(),
+            app.inherited_category(),
+        )
+        .unwrap();
+        app.replace_current(fresh);
+
+        same(&app.root, &full(&root));
+        assert_eq!(app.location(), vec![Box::from("small"), Box::from("inner")]);
+        assert_eq!(app.root.children()[app.stack[0]].name.as_ref(), "small");
+    }
+
+    #[test]
+    fn rescan_inside_special_dir_keeps_category() {
+        let root = temp("special");
+        fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        fs::write(root.join("node_modules/pkg/index.js"), vec![0u8; 5_000]).unwrap();
+        let mut app = App::new(full(&root), root.clone(), Duration::ZERO, 0);
+        app.go_to(&["node_modules".into(), "pkg".into()]);
+        fs::write(root.join("node_modules/pkg/extra.js"), vec![0u8; 5_000]).unwrap();
+        let fresh = scan_subtree(
+            &app.current_path(),
+            true,
+            &Progress::default(),
+            app.inherited_category(),
+        )
+        .unwrap();
+        app.replace_current(fresh);
+        same(&app.root, &full(&root));
+    }
+
     #[test]
     fn base64() {
         assert_eq!(super::base64(b""), "");

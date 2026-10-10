@@ -6,13 +6,13 @@ mod report;
 mod scan;
 mod ui;
 
-use app::App;
+use app::{App, Rescan};
 use cache::Snapshot;
 use clap::Parser;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use scan::Progress;
 use std::io::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -171,41 +171,16 @@ fn run(args: Args) -> Result<(), String> {
             let snap = match snap.take() {
                 Some(s) => s,
                 None => {
-                    let progress = Arc::new(Progress::default());
-                    let started = Instant::now();
-                    let handle = {
-                        let (path, progress) = (path.clone(), progress.clone());
-                        std::thread::spawn(move || scan::scan(&path, one_fs, &progress))
+                    let p = path.clone();
+                    let scanned = scan_with_progress(&mut terminal, &path, move |pr| scan::scan(&p, one_fs, pr))?;
+                    let Some((root, scan_time, errors)) = scanned else {
+                        return Ok(());
                     };
-                    while !handle.is_finished() {
-                        terminal
-                            .draw(|f| {
-                                ui::draw_scanning(
-                                    f,
-                                    &path,
-                                    progress.files.load(Ordering::Relaxed),
-                                    progress.bytes.load(Ordering::Relaxed),
-                                    started.elapsed(),
-                                )
-                            })
-                            .map_err(io)?;
-                        if event::poll(Duration::from_millis(80)).map_err(io)?
-                            && let Event::Key(k) = event::read().map_err(io)?
-                            && k.kind == KeyEventKind::Press
-                            && matches!(k.code, KeyCode::Char('q') | KeyCode::Esc)
-                        {
-                            return Ok(());
-                        }
-                    }
-                    let root = handle
-                        .join()
-                        .expect("scan thread panicked")
-                        .map_err(|e| format!("{}: {e}", path.display()))?;
                     Snapshot {
                         root,
                         cached_at: None,
-                        scan_time: started.elapsed(),
-                        errors: progress.errors.load(Ordering::Relaxed),
+                        scan_time,
+                        errors,
                     }
                 }
             };
@@ -225,8 +200,12 @@ fn run(args: Args) -> Result<(), String> {
                 {
                     app.handle_key(k);
                 }
+                if app.rescan == Some(Rescan::Current) {
+                    app.rescan = None;
+                    rescan_current(&mut terminal, &mut app, one_fs, use_cache)?;
+                }
             }
-            if !app.rescan {
+            if app.rescan != Some(Rescan::All) {
                 std::mem::forget(app);
                 return Ok(());
             }
@@ -236,5 +215,97 @@ fn run(args: Args) -> Result<(), String> {
         }
     })();
     ratatui::restore();
+    result
+}
+
+/// Run `scan` on a thread while drawing the progress screen. `Ok(None)` when
+/// the user aborts with q / Esc.
+fn scan_with_progress(
+    terminal: &mut ratatui::DefaultTerminal,
+    path: &Path,
+    scan: impl FnOnce(&Progress) -> std::io::Result<scan::Node> + Send + 'static,
+) -> Result<Option<(scan::Node, Duration, u64)>, String> {
+    let io = |e: std::io::Error| e.to_string();
+    let progress = Arc::new(Progress::default());
+    let started = Instant::now();
+    let handle = {
+        let progress = progress.clone();
+        std::thread::spawn(move || scan(&progress))
+    };
+    while !handle.is_finished() {
+        terminal
+            .draw(|f| {
+                ui::draw_scanning(
+                    f,
+                    path,
+                    progress.files.load(Ordering::Relaxed),
+                    progress.bytes.load(Ordering::Relaxed),
+                    started.elapsed(),
+                )
+            })
+            .map_err(io)?;
+        if event::poll(Duration::from_millis(80)).map_err(io)?
+            && let Event::Key(k) = event::read().map_err(io)?
+            && k.kind == KeyEventKind::Press
+            && matches!(k.code, KeyCode::Char('q') | KeyCode::Esc)
+        {
+            return Ok(None);
+        }
+    }
+    let root = handle
+        .join()
+        .expect("scan thread panicked")
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(Some((root, started.elapsed(), progress.errors.load(Ordering::Relaxed))))
+}
+
+/// `r`: rescan the folder the user is in, splice it into the tree and update
+/// the `--cache` snapshot. Failures and aborts keep the old tree.
+fn rescan_current(
+    terminal: &mut ratatui::DefaultTerminal,
+    app: &mut App,
+    one_fs: bool,
+    use_cache: bool,
+) -> Result<(), String> {
+    let target = app.current_path();
+    let inherited = app.inherited_category();
+    let t = target.clone();
+    let scanned = scan_with_progress(terminal, &target, move |pr| {
+        scan::scan_subtree(&t, one_fs, pr, inherited)
+    });
+    app.status = Some(match scanned {
+        Ok(Some((node, took, errors))) => {
+            app.replace_current(node);
+            app.errors += errors;
+            app.cached_at = None;
+            let saved = use_cache.then(|| save_tree(app, one_fs)).flatten();
+            match saved {
+                Some(e) => format!("cannot write cache: {e}"),
+                None => format!("rescanned {} in {:.2}s", ui::display_path(&target), took.as_secs_f64()),
+            }
+        }
+        Ok(None) => "rescan cancelled".into(),
+        Err(e) => format!("rescan failed: {e}"),
+    });
+    Ok(())
+}
+
+/// Save the app's (partly rescanned) tree to the cache; returns the error, if any.
+fn save_tree(app: &mut App, one_fs: bool) -> Option<std::io::Error> {
+    let placeholder = scan::Node {
+        name: "".into(),
+        size: 0,
+        cat: category::reg().other(),
+        special: false,
+        dir: None,
+    };
+    let snap = Snapshot {
+        root: std::mem::replace(&mut app.root, placeholder),
+        cached_at: None,
+        scan_time: app.scan_time,
+        errors: app.errors,
+    };
+    let result = cache::save(&app.root_path, one_fs, &snap).err();
+    app.root = snap.root;
     result
 }

@@ -214,7 +214,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             ("m", "category/ext"),
             ("o", "reveal"),
             ("y", "copy path"),
-            ("r", "rescan"),
+            ("r", "rescan folder"),
+            ("R", "rescan all"),
             ("q", "quit"),
         ]
     };

@@ -129,6 +129,30 @@ pub fn scan(root: &Path, one_fs: bool, progress: &Progress) -> std::io::Result<N
 }
 
 pub fn scan_excluding(root: &Path, one_fs: bool, progress: &Progress, exclude: Option<&Path>) -> std::io::Result<Node> {
+    scan_root(root, one_fs, progress, exclude, None)
+}
+
+/// Rescan one directory of an existing tree. `inherited` is the special
+/// category of its parent (e.g. node_modules), so files keep the category a
+/// full scan would give them. Hard links shared with the rest of the tree are
+/// counted again here, since the scan only sees this subtree.
+pub fn scan_subtree(
+    path: &Path,
+    one_fs: bool,
+    progress: &Progress,
+    inherited: Option<Category>,
+) -> std::io::Result<Node> {
+    let cache_dir = crate::cache::dir().and_then(|d| fs::canonicalize(d).ok());
+    scan_root(path, one_fs, progress, cache_dir.as_deref(), inherited)
+}
+
+fn scan_root(
+    root: &Path,
+    one_fs: bool,
+    progress: &Progress,
+    exclude: Option<&Path>,
+    inherited: Option<Category>,
+) -> std::io::Result<Node> {
     let meta = fs::metadata(root)?;
     let ctx = Ctx {
         progress,
@@ -149,7 +173,7 @@ pub fn scan_excluding(root: &Path, one_fs: bool, progress: &Progress, exclude: O
         });
     }
     let parent = root.parent().map(file_name_of).unwrap_or_default();
-    let mut node = scan_dir(root, file_name_of(root).into(), &parent, None, &meta, &ctx);
+    let mut node = scan_dir(root, file_name_of(root).into(), &parent, inherited, &meta, &ctx);
     node.name = name;
     Ok(node)
 }

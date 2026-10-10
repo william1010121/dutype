@@ -124,7 +124,7 @@ dutype --refresh ~     # rescan and update the cache
 
 With `--cache`, scans are saved in `~/.cache/dutype` (`$XDG_CACHE_HOME/dutype`,
 `%LOCALAPPDATA%\dutype\cache` on Windows, or `$DUTYPE_CACHE_DIR`). A cache is
-reused until you press `r` or pass `--refresh`; it is ignored automatically
+reused until you rescan (`r` for the current folder, `R` for everything) or pass `--refresh`; it is ignored automatically
 after a dutype upgrade or a category rule change. dutype never counts its own
 cache directory, so totals are the same with or without `--cache`. `--json` reports `cached_at`
 (unix time) when the result came from the cache.
@@ -138,7 +138,8 @@ cache directory, so totals are the same with or without `--cache`. `--json` repo
 | `m` | categories ⇄ extensions |
 | `o` | reveal in Finder / Explorer / file manager |
 | `y` | copy the selected path to the clipboard (OSC 52 over SSH) |
-| `r` | rescan (and update the `--cache`) |
+| `r` | rescan the current folder only (fast; updates the `--cache`) |
+| `R` | rescan everything from the root |
 | `q` | quit |
 
 <details>
