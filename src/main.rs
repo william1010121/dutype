@@ -175,6 +175,9 @@ fn run(args: Args) -> Result<(), String> {
         // Status to show after a full rescan (e.g. why `r` became `R`).
         let mut carried_status: Option<String> = None;
         loop {
+            // The root's device when this tree was built: `r` compares against
+            // it, so a remounted root forces a full rescan.
+            let root_dev = scan::device_of(&path).ok();
             let snap = match snap.take() {
                 Some(s) => s,
                 None => {
@@ -197,6 +200,7 @@ fn run(args: Args) -> Result<(), String> {
             };
             let mut app = App::new(snap.root, path.clone(), snap.scan_time, snap.errors);
             app.cached_at = snap.cached_at;
+            app.root_dev = root_dev;
             app.show_keys = args.show_keys;
             app.go_to(&location);
             app.status = save_error
@@ -302,10 +306,11 @@ fn rescan_current(
         full_rescan(app);
         return Ok(());
     }
-    // Replaced by a symlink or a file, or something got mounted on it, since
-    // the scan: a full rescan treats it exactly like the original scan did.
-    let root_dev = scan::device_of(&app.root_path).ok();
-    let moved_fs = one_fs && root_dev.is_some_and(|dev| scan::device_of(&target).ok() != Some(dev));
+    // Replaced by a symlink or a file, or something got mounted on it (or on
+    // the root) since the scan: a full rescan treats it like the original.
+    let root_dev = app.root_dev;
+    let same_dev = |p: &Path| root_dev.is_some() && scan::device_of(p).ok() == root_dev;
+    let moved_fs = one_fs && !(same_dev(&target) && same_dev(&app.root_path));
     if !scan::is_real_dir(&target) || moved_fs {
         app.rescan = Some(Rescan::All);
         app.quit = true;

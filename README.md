@@ -228,9 +228,10 @@ candidates) and the biggest files, with absolute paths and byte sizes:
 
 **MCP server** — `dutype --mcp` exposes two read-only tools,
 `disk_usage(path, top?, cross_fs?, refresh?)` and
-`find_by_category(path, category, top?, refresh?)`. With `dutype --mcp --cache`
-repeated calls on the same path reuse the scan in `~/.cache/dutype` instead of
-walking the disk again (`refresh: true` forces a rescan):
+`find_by_category(path, category, top?, refresh?)`. They never write files.
+With `dutype --mcp --cache`, repeated calls on the same path reuse the scan from
+memory (or a snapshot the CLI saved in `~/.cache/dutype`) instead of walking the
+disk again (`refresh: true` forces a rescan):
 
 ```bash
 claude mcp add dutype -- npx -y dutype --mcp      # Claude Code

@@ -77,6 +77,8 @@ pub struct App {
     pub status: Option<String>,
     /// Screencast mode: show the last key pressed (for demos and recordings).
     pub show_keys: bool,
+    /// Device of the scan root when the tree was built (None: unknown).
+    pub root_dev: Option<u64>,
     pub last_key: Option<(String, &'static str)>,
 }
 
@@ -96,6 +98,7 @@ fn first_selected(len: usize) -> TableState {
 
 impl App {
     pub fn new(root: Node, root_path: PathBuf, scan_time: Duration, errors: u64) -> Self {
+        // root_dev is set by the caller, which knows when the tree was built.
         let state = first_selected(root.children().len());
         let mut app = App {
             root,
@@ -114,6 +117,7 @@ impl App {
             rescan: None,
             status: None,
             show_keys: false,
+            root_dev: None,
             last_key: None,
         };
         app.refresh_breakdown();
@@ -351,7 +355,12 @@ impl App {
 
     fn copy(&mut self, path: &Path) {
         let shown = crate::ui::display_path(path);
-        self.status = Some(match copy_to_clipboard(&path.display().to_string()) {
+        // The clipboard takes text; a lossy rendering would name another file.
+        let Some(text) = path.to_str() else {
+            self.status = Some(format!("cannot copy {shown}: the path is not valid UTF-8"));
+            return;
+        };
+        self.status = Some(match copy_to_clipboard(text) {
             Ok(()) => format!("copied {shown}"),
             Err(e) => format!("copy failed: {e}"),
         });
