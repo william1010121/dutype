@@ -89,6 +89,9 @@ fn run(args: Args) -> Result<(), String> {
     }
     category::init(args.config.as_deref(), args.icons)?;
     let use_cache = args.cache || args.refresh;
+    if use_cache && let Err(e) = cache::prepare() {
+        eprintln!("dutype: cannot create cache directory: {e}");
+    }
     if args.mcp {
         return mcp::serve(mcp::CacheOpts {
             use_cache,

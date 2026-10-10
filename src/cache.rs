@@ -45,6 +45,16 @@ pub fn dir() -> Option<PathBuf> {
     }
 }
 
+/// Create the cache directory up front. Called before any scan when caching
+/// is on: creating it later could grow its parent's allocated blocks after
+/// they were measured, making the first and later scans disagree.
+pub fn prepare() -> io::Result<()> {
+    match dir() {
+        Some(d) => fs::create_dir_all(d),
+        None => Ok(()),
+    }
+}
+
 fn file_for(root: &Path, one_fs: bool) -> Option<PathBuf> {
     let h = fnv1a(0, root.as_os_str().as_encoded_bytes());
     Some(dir()?.join(format!("{h:016x}-{}.bin", if one_fs { "x" } else { "all" })))
