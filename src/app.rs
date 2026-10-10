@@ -1,10 +1,11 @@
 use crate::category::{self, Category, by_size, reg};
-use crate::scan::{Node, TopN, walk};
+use crate::scan::{Node, TopN, walk, walk_with_ancestors};
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::widgets::TableState;
 use std::collections::HashMap;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 const POPUP_LIMIT: usize = 500;
 const EXT_LIMIT: usize = 60;
@@ -36,11 +37,51 @@ pub struct BreakdownItem {
     pub count: Option<u64>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Rescan {
+    /// `r`: rescan the current folder and splice it into the tree.
+    Current,
+    /// `R`: rescan everything from the root.
+    All,
+}
+
+/// One folder of a location. The name alone is not an identity: an escaped
+/// non-UTF-8 name (e.g. `d\xffir`) can be spelled exactly like a sibling's
+/// real UTF-8 name, so lossiness is part of the match. On unix escapes are
+/// reversible, so two different non-UTF-8 names never share a Step.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Step {
+    pub name: Box<str>,
+    pub lossy: bool,
+}
+
+impl Step {
+    fn of(n: &Node) -> Self {
+        Step {
+            name: n.name.clone(),
+            lossy: n.lossy,
+        }
+    }
+
+    fn matches(&self, n: &Node) -> bool {
+        n.lossy == self.lossy && n.name == self.name
+    }
+}
+
+impl From<&str> for Step {
+    fn from(name: &str) -> Self {
+        Step {
+            name: name.into(),
+            lossy: false,
+        }
+    }
+}
+
 pub struct Popup {
     pub title: String,
-    /// Paths relative to the directory the popup was opened in.
-    pub base: PathBuf,
-    pub items: Vec<(PathBuf, u64)>,
+    /// (path relative to the folder the popup was opened in, for display;
+    /// size; real path on disk, `None` if a non-UTF-8 name is ambiguous).
+    pub items: Vec<(PathBuf, u64, Option<PathBuf>)>,
     pub state: TableState,
 }
 
@@ -57,15 +98,30 @@ pub struct App {
     pub breakdown_state: TableState,
     pub popup: Option<Popup>,
     pub scan_time: Duration,
+    /// When the shown scan ran, if it came from the `--cache`.
+    pub cached_at: Option<SystemTime>,
     pub errors: u64,
     pub quit: bool,
+    /// Set by `r` / `R`; the caller performs the rescan. `All` also quits the
+    /// event loop so a fresh `App` is built.
+    pub rescan: Option<Rescan>,
+    /// One-shot message in the footer (e.g. after copying a path).
+    pub status: Option<String>,
     /// Screencast mode: show the last key pressed (for demos and recordings).
     pub show_keys: bool,
+    /// Device of the scan root when the tree was built (None: unknown).
+    pub root_dev: Option<u64>,
     pub last_key: Option<(String, &'static str)>,
 }
 
 pub fn node_at<'a>(root: &'a Node, stack: &[usize]) -> &'a Node {
     stack.iter().fold(root, |n, &i| &n.children()[i])
+}
+
+fn node_at_mut<'a>(root: &'a mut Node, stack: &[usize]) -> &'a mut Node {
+    stack.iter().fold(root, |n, &i| {
+        &mut n.dir.as_mut().expect("stack points at a directory").children[i]
+    })
 }
 
 fn first_selected(len: usize) -> TableState {
@@ -74,6 +130,7 @@ fn first_selected(len: usize) -> TableState {
 
 impl App {
     pub fn new(root: Node, root_path: PathBuf, scan_time: Duration, errors: u64) -> Self {
+        // root_dev is set by the caller, which knows when the tree was built.
         let state = first_selected(root.children().len());
         let mut app = App {
             root,
@@ -86,9 +143,13 @@ impl App {
             breakdown_state: TableState::default(),
             popup: None,
             scan_time,
+            cached_at: None,
             errors,
             quit: false,
+            rescan: None,
+            status: None,
             show_keys: false,
+            root_dev: None,
             last_key: None,
         };
         app.refresh_breakdown();
@@ -107,6 +168,148 @@ impl App {
             p.push(&*n.name);
         }
         p
+    }
+
+    /// The current folder's real path on disk, for filesystem operations
+    /// (rescan, copy, reveal); [`Self::current_path`] is for display.
+    /// `None` if a non-UTF-8 name on the way cannot be resolved uniquely.
+    pub fn fs_path(&self) -> Option<PathBuf> {
+        let mut p = self.root_path.clone();
+        let mut n = &self.root;
+        for &i in &self.stack {
+            n = &n.children()[i];
+            p = crate::scan::resolve_child(&p, n)?;
+        }
+        Some(p)
+    }
+
+    /// Like [`Self::fs_path`], but `None` unless every folder from the root
+    /// down is still a real directory: a component replaced by a symlink
+    /// would make a subtree scan follow it, unlike a full scan.
+    pub fn fs_path_checked(&self) -> Option<PathBuf> {
+        let mut p = self.root_path.clone();
+        let mut n = &self.root;
+        for &i in &self.stack {
+            n = &n.children()[i];
+            p = crate::scan::resolve_child(&p, n)?;
+            if !crate::scan::is_real_dir(&p) {
+                return None;
+            }
+        }
+        Some(p)
+    }
+
+    /// Real path of child `i` of the current folder.
+    fn child_fs_path(&self, i: usize) -> Option<PathBuf> {
+        crate::scan::resolve_child(&self.fs_path()?, &self.current().children()[i])
+    }
+
+    /// Some folder from the root to here has a non-UTF-8 name. Its display
+    /// name may collide with a sibling, so `r` rescans everything instead.
+    pub fn path_has_lossy_name(&self) -> bool {
+        let mut n = &self.root;
+        self.stack.iter().any(|&i| {
+            n = &n.children()[i];
+            n.lossy
+        })
+    }
+
+    /// Folders from the root to the current directory.
+    pub fn location(&self) -> Vec<Step> {
+        let mut n = &self.root;
+        self.stack
+            .iter()
+            .map(|&i| {
+                n = &n.children()[i];
+                Step::of(n)
+            })
+            .collect()
+    }
+
+    /// Descend into the directories of `location` (as far as they exist).
+    pub fn go_to(&mut self, location: &[Step]) {
+        for step in location {
+            let Some(i) = self
+                .current()
+                .children()
+                .iter()
+                .position(|c| c.is_dir() && step.matches(c))
+            else {
+                break;
+            };
+            self.states.last_mut().unwrap().select(Some(i));
+            self.enter();
+        }
+    }
+
+    /// Special category the current folder inherits, for
+    /// [`crate::scan::scan_subtree`]: that of the nearest special ancestor.
+    /// (A dir's `cat` cannot tell "inherits Other" from "inherits nothing".)
+    pub fn inherited_category(&self) -> Option<Category> {
+        (0..self.stack.len())
+            .rev()
+            .map(|k| node_at(&self.root, &self.stack[..k]))
+            .find(|n| n.special)
+            .map(|n| n.cat)
+    }
+
+    /// Replace the current folder with a fresh scan of it, update every
+    /// ancestor's totals and order, and keep the cursor on the same entries.
+    pub fn replace_current(&mut self, mut fresh: Node) {
+        let location = self.location();
+        // Selected entry name at every level, to restore after re-sorting.
+        let selected: Vec<Option<Step>> = (0..=self.stack.len())
+            .map(|k| {
+                let node = node_at(&self.root, &self.stack[..k]);
+                self.states[k]
+                    .selected()
+                    .and_then(|i| node.children().get(i))
+                    .map(Step::of)
+            })
+            .collect();
+
+        let target = node_at_mut(&mut self.root, &self.stack);
+        fresh.name = target.name.clone();
+        let old = std::mem::replace(target, fresh);
+        let new = node_at(&self.root, &self.stack);
+        let size_delta = new.size as i128 - old.size as i128;
+        let files_delta = new.files() as i128 - old.files() as i128;
+        let errors_delta = new.errors() as i128 - old.errors() as i128;
+        let cats_delta: Vec<i128> = new
+            .cats()
+            .iter()
+            .zip(old.cats().iter())
+            .map(|(n, o)| *n as i128 - *o as i128)
+            .collect();
+        let shift = |v: &mut u64, d: i128| *v = (*v as i128 + d).max(0) as u64;
+        for k in (0..self.stack.len()).rev() {
+            let node = node_at_mut(&mut self.root, &self.stack[..k]);
+            shift(&mut node.size, size_delta);
+            if let Some(dir) = node.dir.as_mut() {
+                shift(&mut dir.files, files_delta);
+                shift(&mut dir.errors, errors_delta);
+                dir.cats.iter_mut().zip(&cats_delta).for_each(|(c, d)| shift(c, *d));
+                dir.children
+                    .sort_unstable_by(|a, b| b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name)));
+            }
+        }
+        // The subtree's old errors were replaced, not added to.
+        self.errors = self.root.errors();
+        // Free the old subtree off the UI thread; it can be large.
+        std::thread::spawn(move || drop(old));
+
+        self.stack.clear();
+        self.states = vec![first_selected(self.root.children().len())];
+        self.go_to(&location);
+        for (k, name) in selected.iter().enumerate().take(self.states.len()) {
+            let node = node_at(&self.root, &self.stack[..k]);
+            let pos = name
+                .as_ref()
+                .and_then(|step| node.children().iter().position(|c| step.matches(c)));
+            self.states[k].select(pos.or(if node.children().is_empty() { None } else { Some(0) }));
+        }
+        self.popup = None;
+        self.refresh_breakdown();
     }
 
     fn selected_entry(&self) -> Option<usize> {
@@ -138,6 +341,7 @@ impl App {
         if self.show_keys {
             self.last_key = Some(self.describe_key(key));
         }
+        self.status = None;
         if self.popup.is_some() {
             self.handle_popup_key(key);
             return;
@@ -170,12 +374,44 @@ impl App {
             }
             KeyCode::Char('o') => {
                 if let Some(i) = self.selected_entry() {
-                    let path = self.current_path().join(&*self.current().children()[i].name);
-                    reveal(&path);
+                    match self.child_fs_path(i) {
+                        Some(path) => reveal(&path),
+                        None => self.status = Some("cannot resolve this non-UTF-8 name".into()),
+                    }
                 }
+            }
+            KeyCode::Char('y') => {
+                // The selected entry, or the current folder from the breakdown pane.
+                let path = match (self.focus, self.selected_entry()) {
+                    (Focus::Entries, Some(i)) => self.child_fs_path(i),
+                    _ => self.fs_path(),
+                };
+                match path {
+                    Some(path) => self.copy(&path),
+                    None => self.status = Some("cannot resolve this non-UTF-8 name".into()),
+                }
+            }
+            // At the root, rescanning "here" is a full rescan.
+            KeyCode::Char('r') if !self.stack.is_empty() => self.rescan = Some(Rescan::Current),
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                self.rescan = Some(Rescan::All);
+                self.quit = true;
             }
             _ => {}
         }
+    }
+
+    fn copy(&mut self, path: &Path) {
+        let shown = crate::ui::display_path(path);
+        // The clipboard takes text; a lossy rendering would name another file.
+        let Some(text) = path.to_str() else {
+            self.status = Some(format!("cannot copy {shown}: the path is not valid UTF-8"));
+            return;
+        };
+        self.status = Some(match copy_to_clipboard(text) {
+            Ok(()) => format!("copied {shown}"),
+            Err(e) => format!("copy failed: {e}"),
+        });
     }
 
     /// Key glyph and what it does in the current state.
@@ -202,6 +438,9 @@ impl App {
             KeyCode::Tab | KeyCode::BackTab => ("⇥ Tab".to_string(), "switch pane"),
             KeyCode::Char('m') => ("m".to_string(), "category / extension"),
             KeyCode::Char('o') => ("o".to_string(), "reveal"),
+            KeyCode::Char('y') => ("y".to_string(), "copy path"),
+            KeyCode::Char('r') if !popup => ("r".to_string(), "rescan folder"),
+            KeyCode::Char('R') if !popup => ("R".to_string(), "rescan all"),
             KeyCode::Char('q') => ("q".to_string(), if popup { "close" } else { "quit" }),
             KeyCode::Char(c) => (c.to_string(), ""),
             _ => ("?".to_string(), ""),
@@ -218,9 +457,12 @@ impl App {
             KeyCode::Down | KeyCode::Char('j') => step(&mut popup.state, len, 1),
             KeyCode::PageUp => step(&mut popup.state, len, -15),
             KeyCode::PageDown => step(&mut popup.state, len, 15),
-            KeyCode::Char('o') | KeyCode::Enter => {
-                if let Some(i) = popup.state.selected() {
-                    reveal(&popup.base.join(&popup.items[i].0));
+            KeyCode::Char('o') | KeyCode::Enter | KeyCode::Char('y') => {
+                let Some(i) = popup.state.selected() else { return };
+                match popup.items[i].2.clone() {
+                    Some(path) if key.code == KeyCode::Char('y') => self.copy(&path),
+                    Some(path) => reveal(&path),
+                    None => self.status = Some("cannot resolve this non-UTF-8 name".into()),
                 }
             }
             _ => {}
@@ -260,11 +502,17 @@ impl App {
         let Some(item) = self.breakdown_state.selected().and_then(|i| self.breakdown.get(i)) else {
             return;
         };
+        let base = self.fs_path();
         let cur = self.current();
         let mut top = TopN::new(POPUP_LIMIT);
-        let mut push = |size: u64, path: &Path| {
-            if top.accepts(|min: &(u64, PathBuf)| size > min.0) {
-                top.push((size, path.to_path_buf()));
+        // The real path is resolved through the node chain (raw-name aware)
+        // only for items that make the cut.
+        let mut push = |n: &Node, path: &Path, ancestors: &[&Node]| {
+            if top.accepts(|min: &(u64, PathBuf, Option<PathBuf>)| n.size > min.0) {
+                let fs = base
+                    .as_deref()
+                    .and_then(|b| crate::scan::resolve_chain(b, ancestors, n));
+                top.push((n.size, path.to_path_buf(), fs));
             }
         };
         let title;
@@ -272,9 +520,9 @@ impl App {
             // For directory kinds, list the special directories themselves.
             Key::Cat(c) if c.is_dir_kind() => {
                 title = format!("{} directories", c.label());
-                walk(cur, &mut PathBuf::new(), &mut |n, p| {
+                walk_with_ancestors(cur, &mut PathBuf::new(), &mut Vec::new(), &mut |n, p, a| {
                     if n.special && n.cat == *c {
-                        push(n.size, p);
+                        push(n, p, a);
                         return false;
                     }
                     true
@@ -282,31 +530,26 @@ impl App {
             }
             Key::Cat(c) => {
                 title = format!("{} files", c.label());
-                walk(cur, &mut PathBuf::new(), &mut |n, p| {
+                walk_with_ancestors(cur, &mut PathBuf::new(), &mut Vec::new(), &mut |n, p, a| {
                     if !n.is_dir() && n.cat == *c {
-                        push(n.size, p);
+                        push(n, p, a);
                     }
                     true
                 });
             }
             Key::Ext(e) => {
                 title = format!("*.{e} files");
-                walk(cur, &mut PathBuf::new(), &mut |n, p| {
+                walk_with_ancestors(cur, &mut PathBuf::new(), &mut Vec::new(), &mut |n, p, a| {
                     if !n.is_dir() && ext_key(&n.name) == *e {
-                        push(n.size, p);
+                        push(n, p, a);
                     }
                     true
                 });
             }
         }
-        let items: Vec<_> = top.into_sorted().into_iter().map(|(s, p)| (p, s)).collect();
+        let items: Vec<_> = top.into_sorted().into_iter().map(|(s, p, fs)| (p, s, fs)).collect();
         let state = first_selected(items.len());
-        self.popup = Some(Popup {
-            title,
-            base: self.current_path(),
-            items,
-            state,
-        });
+        self.popup = Some(Popup { title, items, state });
     }
 }
 
@@ -375,4 +618,365 @@ fn reveal(path: &Path) {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn();
+}
+
+/// Copy `text` with the OS clipboard tool, or with an OSC 52 escape sequence
+/// over SSH or when no tool is found (most terminals, tmux with set-clipboard).
+fn copy_to_clipboard(text: &str) -> Result<(), String> {
+    use std::process::{Command, Stdio};
+    let var = |k| std::env::var_os(k).is_some();
+    let tools: &[&[&str]] = if var("SSH_CONNECTION") || var("SSH_TTY") {
+        &[]
+    } else if cfg!(target_os = "macos") {
+        &[&["pbcopy"]]
+    } else if cfg!(windows) {
+        &[&["clip"]]
+    } else if var("WAYLAND_DISPLAY") {
+        &[&["wl-copy"]]
+    } else {
+        &[
+            &["xclip", "-selection", "clipboard"],
+            &["xsel", "--clipboard", "--input"],
+        ]
+    };
+    for tool in tools {
+        let child = Command::new(tool[0])
+            .args(&tool[1..])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        let Ok(mut child) = child else { continue };
+        let wrote = child
+            .stdin
+            .take()
+            .is_some_and(|mut stdin| stdin.write_all(text.as_bytes()).is_ok());
+        if child.wait().is_ok_and(|s| s.success()) && wrote {
+            return Ok(());
+        }
+    }
+    let seq = format!("\x1b]52;c;{}\x07", base64(text.as_bytes()));
+    let mut out = std::io::stdout();
+    out.write_all(seq.as_bytes())
+        .and_then(|_| out.flush())
+        .map_err(|e| e.to_string())
+}
+
+fn base64(data: &[u8]) -> String {
+    const ABC: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32;
+        for i in 0..4 {
+            out.push(if i <= chunk.len() {
+                ABC[(n >> (18 - 6 * i) & 63) as usize] as char
+            } else {
+                '='
+            });
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scan::{Progress, scan_excluding, scan_subtree};
+    use std::fs;
+
+    fn temp(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("dutype-app-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        fs::canonicalize(d).unwrap()
+    }
+
+    fn full(root: &Path) -> Node {
+        scan_excluding(root, true, &Progress::default(), None).unwrap()
+    }
+
+    fn same(a: &Node, b: &Node) {
+        assert_eq!((&a.name, a.size, a.cat, a.special), (&b.name, b.size, b.cat, b.special));
+        assert_eq!((a.files(), a.cats()), (b.files(), b.cats()), "{}", a.name);
+        let names = |n: &Node| n.children().iter().map(|c| c.name.clone()).collect::<Vec<_>>();
+        assert_eq!(names(a), names(b), "order under {}", a.name);
+        a.children().iter().zip(b.children()).for_each(|(x, y)| same(x, y));
+    }
+
+    /// `r` splices a rescan of the current folder; the result must equal a
+    /// full rescan (sizes, counts, categories and sort order of ancestors).
+    #[test]
+    fn rescan_current_matches_full_scan() {
+        let root = temp("splice");
+        fs::create_dir_all(root.join("small/inner")).unwrap();
+        fs::create_dir_all(root.join("big")).unwrap();
+        fs::write(root.join("big/a.mp4"), vec![0u8; 300_000]).unwrap();
+        fs::write(root.join("small/inner/b.pdf"), vec![0u8; 10_000]).unwrap();
+
+        let mut app = App::new(full(&root), root.clone(), Duration::ZERO, 0);
+        app.go_to(&["small".into(), "inner".into()]);
+        assert_eq!(app.location(), vec![Step::from("small"), Step::from("inner")]);
+
+        // "small" grows past "big", so the root's order has to change.
+        fs::write(root.join("small/inner/c.zip"), vec![0u8; 900_000]).unwrap();
+        let fresh = scan_subtree(
+            &app.current_path(),
+            true,
+            &Progress::default(),
+            app.inherited_category(),
+            None,
+        )
+        .unwrap();
+        app.replace_current(fresh);
+
+        same(&app.root, &full(&root));
+        assert_eq!(app.location(), vec![Step::from("small"), Step::from("inner")]);
+        assert_eq!(app.root.children()[app.stack[0]].name.as_ref(), "small");
+    }
+
+    #[test]
+    fn rescan_inside_special_dir_keeps_category() {
+        let root = temp("special");
+        fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        fs::write(root.join("node_modules/pkg/index.js"), vec![0u8; 5_000]).unwrap();
+        let mut app = App::new(full(&root), root.clone(), Duration::ZERO, 0);
+        app.go_to(&["node_modules".into(), "pkg".into()]);
+        fs::write(root.join("node_modules/pkg/extra.js"), vec![0u8; 5_000]).unwrap();
+        let fresh = scan_subtree(
+            &app.current_path(),
+            true,
+            &Progress::default(),
+            app.inherited_category(),
+            None,
+        )
+        .unwrap();
+        app.replace_current(fresh);
+        same(&app.root, &full(&root));
+    }
+
+    /// Errors of the rescanned folder replace its old share instead of adding up.
+    #[cfg(unix)]
+    #[test]
+    fn rescan_replaces_error_counts() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = temp("errors");
+        let locked = root.join("small/locked");
+        fs::create_dir_all(&locked).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read_dir(&locked).is_ok() {
+            return; // running as root: permissions are not enforced
+        }
+        let mut app = App::new(full(&root), root.clone(), Duration::ZERO, 0);
+        app.errors = app.root.errors();
+        assert_eq!(app.errors, 1);
+        app.go_to(&["small".into()]);
+        let rescan = |app: &App| {
+            scan_subtree(
+                &app.current_path(),
+                true,
+                &Progress::default(),
+                app.inherited_category(),
+                None,
+            )
+            .unwrap()
+        };
+        for _ in 0..3 {
+            let fresh = rescan(&app);
+            app.replace_current(fresh);
+            assert_eq!(app.errors, 1);
+        }
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        let fresh = rescan(&app);
+        app.replace_current(fresh);
+        assert_eq!(app.errors, 0);
+    }
+
+    /// A subtree with hard links is reported so the caller rescans everything.
+    #[cfg(unix)]
+    #[test]
+    fn subtree_reports_hard_links() {
+        let root = temp("hardlinks");
+        fs::create_dir_all(root.join("a")).unwrap();
+        fs::create_dir_all(root.join("b")).unwrap();
+        fs::write(root.join("a/f.bin"), vec![0u8; 50_000]).unwrap();
+        let sub = |p: &str| scan_subtree(&root.join(p), true, &Progress::default(), None, None).unwrap();
+        assert!(!sub("a").hardlink);
+        fs::hard_link(root.join("a/f.bin"), root.join("b/f.bin")).unwrap();
+        assert!(sub("b").hardlink);
+        // The old tree remembers hard links, so deleting the local link
+        // before `r` still forces a full rescan.
+        let app = App::new(full(&root), root.clone(), Duration::ZERO, 0);
+        let a = app.root.children().iter().find(|c| &*c.name == "a").unwrap();
+        assert!(a.hardlink && app.root.hardlink);
+    }
+
+    /// A cancelled scan stops descending right away.
+    #[test]
+    fn cancelled_scan_stops() {
+        let root = temp("cancel");
+        fs::create_dir_all(root.join("x/y")).unwrap();
+        fs::write(root.join("x/y/z.txt"), "z").unwrap();
+        let progress = Progress::default();
+        progress.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        let node = scan_excluding(&root, true, &progress, None).unwrap();
+        assert!(node.children().is_empty());
+    }
+
+    /// Directories inside a special dir of category Other (user rule) keep
+    /// inheriting Other after `r`, like in a full scan.
+    #[test]
+    fn rescan_inherits_from_nearest_special_ancestor() {
+        let root = temp("inherit");
+        fs::create_dir_all(root.join("node_modules/pkg/lib")).unwrap();
+        fs::write(root.join("node_modules/pkg/lib/x.mp4"), "x").unwrap();
+        let mut app = App::new(full(&root), root.clone(), Duration::ZERO, 0);
+        app.go_to(&["node_modules".into(), "pkg".into(), "lib".into()]);
+        let nm = app
+            .root
+            .children()
+            .iter()
+            .find(|c| &*c.name == "node_modules")
+            .unwrap()
+            .cat;
+        assert_eq!(app.inherited_category(), Some(nm));
+        // At the root, or in node_modules itself, nothing is inherited.
+        let mut app = App::new(full(&root), root.clone(), Duration::ZERO, 0);
+        assert_eq!(app.inherited_category(), None);
+        app.go_to(&["node_modules".into()]);
+        assert_eq!(app.inherited_category(), None);
+    }
+
+    /// A folder replaced by a symlink or a file is not rescanned alone.
+    #[cfg(unix)]
+    #[test]
+    fn subtree_rejects_non_directories() {
+        let root = temp("nondir");
+        fs::create_dir_all(root.join("target")).unwrap();
+        fs::create_dir_all(root.join("d")).unwrap();
+        std::os::unix::fs::symlink(root.join("target"), root.join("link")).unwrap();
+        fs::write(root.join("f.txt"), "x").unwrap();
+        let sub = |p: &str| scan_subtree(&root.join(p), true, &Progress::default(), None, None);
+        assert!(sub("d").is_ok());
+        assert!(sub("link").is_err());
+        assert!(sub("f.txt").is_err());
+        assert!(!crate::scan::is_real_dir(&root.join("link")));
+    }
+
+    /// With one_fs, a folder now on another device than the scan root is
+    /// refused (simulated with a wrong root device id).
+    #[cfg(unix)]
+    #[test]
+    fn subtree_rejects_other_filesystem() {
+        let root = temp("mount");
+        fs::create_dir_all(root.join("d")).unwrap();
+        let dev = crate::scan::device_of(&root).unwrap();
+        let sub = |dev| scan_subtree(&root.join("d"), true, &Progress::default(), None, Some(dev));
+        assert!(sub(dev).is_ok());
+        assert!(sub(dev.wrapping_add(1)).is_err());
+        // --cross-fs: no device check.
+        assert!(scan_subtree(&root.join("d"), false, &Progress::default(), None, Some(dev + 1)).is_ok());
+    }
+
+    /// Non-UTF-8 names (allowed on Linux) are scanned, not reported as
+    /// unreadable, and such a cache directory is still excluded.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn non_utf8_names_are_scanned_and_excluded() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let root = temp("nonutf8");
+        let weird = root.join(OsStr::from_bytes(b"d\xffir"));
+        fs::create_dir_all(&weird).unwrap();
+        fs::write(weird.join("f.bin"), vec![0u8; 50_000]).unwrap();
+        let node = full(&root);
+        assert_eq!(node.errors(), 0);
+        assert_eq!(node.files(), 1);
+        let excluded = scan_excluding(&root, true, &Progress::default(), Some(&weird)).unwrap();
+        assert_eq!((excluded.files(), excluded.errors()), (0, 0));
+        // TUI paths for filesystem operations resolve the raw name.
+        let mut app = App::new(full(&root), root.clone(), Duration::ZERO, 0);
+        let lossy = app.root.children().iter().find(|c| c.lossy).unwrap();
+        app.go_to(&[Step::of(lossy)]);
+        assert_eq!(app.fs_path(), Some(weird.clone()));
+        assert_ne!(app.current_path(), weird);
+        assert!(app.path_has_lossy_name());
+
+        // A UTF-8 sibling spelled like the escaped rendering must not be
+        // picked, nor a second invalid name (distinct escapes).
+        let twin = root.join("d\\xffir");
+        let other = root.join(OsStr::from_bytes(b"d\xfeir"));
+        fs::create_dir_all(&other).unwrap();
+        fs::create_dir_all(&twin).unwrap();
+        let app = {
+            let mut app = App::new(full(&root), root.clone(), Duration::ZERO, 0);
+            let i = app
+                .root
+                .children()
+                .iter()
+                .position(|c| c.lossy && &*c.name == "d\\xffir")
+                .unwrap();
+            let name = app.root.children()[i].name.clone();
+            assert!(app.root.children().iter().any(|c| !c.lossy && c.name == name));
+            app.states[0].select(Some(i));
+            app.enter();
+            app
+        };
+        assert_eq!(app.fs_path(), Some(weird.clone()));
+
+        // Going back to a location picks the sibling with the same lossiness,
+        // in either direction.
+        let mut app = App::new(full(&root), root.clone(), Duration::ZERO, 0);
+        let utf8 = app.root.children().iter().find(|c| !c.lossy && c.is_dir()).unwrap();
+        let to = |name: &str| {
+            let n = app
+                .root
+                .children()
+                .iter()
+                .find(|c| c.lossy && &*c.name == name)
+                .unwrap();
+            [Step::of(n)]
+        };
+        let (to_utf8, to_ff, to_fe) = ([Step::of(utf8)], to("d\\xffir"), to("d\\xfeir"));
+        app.go_to(&to_utf8);
+        assert_eq!(app.fs_path(), Some(twin.clone()));
+        for (steps, want) in [(&to_ff, &weird), (&to_fe, &other)] {
+            let mut app = App::new(full(&root), root.clone(), Duration::ZERO, 0);
+            app.go_to(steps);
+            assert_eq!(app.fs_path().as_ref(), Some(want));
+        }
+
+        // Popup results keep the raw path too (the twin is empty, so the
+        // only file in the biggest category is the one in the raw dir).
+        let mut app = App::new(full(&root), root.clone(), Duration::ZERO, 0);
+        app.open_popup();
+        let popup = app.popup.as_ref().unwrap();
+        assert_eq!(popup.items[0].2, Some(weird.join("f.bin")));
+    }
+
+    /// An ancestor replaced by a symlink makes the checked path unavailable,
+    /// so `r` falls back to a full rescan.
+    #[cfg(unix)]
+    #[test]
+    fn ancestor_symlink_blocks_subtree_rescan() {
+        let root = temp("ancestor");
+        fs::create_dir_all(root.join("a/b")).unwrap();
+        fs::create_dir_all(root.join("elsewhere/b")).unwrap();
+        let mut app = App::new(full(&root), root.clone(), Duration::ZERO, 0);
+        app.go_to(&["a".into(), "b".into()]);
+        assert_eq!(app.fs_path_checked(), Some(root.join("a/b")));
+        fs::rename(root.join("a"), root.join("a-old")).unwrap();
+        std::os::unix::fs::symlink(root.join("elsewhere"), root.join("a")).unwrap();
+        assert!(crate::scan::is_real_dir(&root.join("a/b"))); // the leaf alone looks fine
+        assert_eq!(app.fs_path_checked(), None);
+    }
+
+    #[test]
+    fn base64() {
+        assert_eq!(super::base64(b""), "");
+        assert_eq!(super::base64(b"f"), "Zg==");
+        assert_eq!(super::base64(b"fo"), "Zm8=");
+        assert_eq!(super::base64(b"foo"), "Zm9v");
+        assert_eq!(super::base64("/路徑".as_bytes()), "L+i3r+W+kQ==");
+    }
 }

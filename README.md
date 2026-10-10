@@ -118,7 +118,18 @@ dutype ~/Projects      # any directory
 dutype --report ~      # plain-text report
 dutype --json ~        # JSON report
 dutype --json --category node_modules ~   # every node_modules with its size
+dutype --cache ~       # reuse the last scan of ~ (instant), save new ones
+dutype --refresh ~     # rescan and update the cache
 ```
+
+With `--cache`, scans are saved in `~/.cache/dutype` (`$XDG_CACHE_HOME/dutype`,
+`%LOCALAPPDATA%\dutype\cache` on Windows, or `$DUTYPE_CACHE_DIR`). A cache is
+reused until you rescan (`r` for the current folder, `R` for everything) or pass `--refresh`; it is ignored automatically
+after a dutype upgrade or a category rule change. dutype never counts its own
+cache directory, so totals are the same with or without `--cache`. Snapshots
+list every file name, so they are private: the cache directory must belong to
+you and is set to mode 0700, snapshots to 0600. `--json` reports `cached_at`
+(unix time) when the result came from the cache.
 
 | Key | Action |
 |:---|:---|
@@ -128,6 +139,9 @@ dutype --json --category node_modules ~   # every node_modules with its size
 | `Tab` | switch between the folder list and the breakdown |
 | `m` | categories ⇄ extensions |
 | `o` | reveal in Finder / Explorer / file manager |
+| `y` | copy the selected path to the clipboard (OSC 52 over SSH) |
+| `r` | rescan the current folder only (fast; updates the `--cache`) |
+| `R` | rescan everything from the root |
 | `q` | quit |
 
 <details>
@@ -149,6 +163,8 @@ Options:
       --icons <SET>      Icon set for categories [possible values: emoji, nerd, none]
       --dump-config      Print the built-in category rules (a config template) and exit
       --mcp              Run as an MCP server on stdio, for LLM agents
+      --cache            Reuse the last scan of this path if there is one, and save new scans (in ~/.cache/dutype, or $DUTYPE_CACHE_DIR)
+      --refresh          Ignore a cached scan: scan again and update the cache (implies --cache)
 ```
 
 </details>
@@ -213,7 +229,11 @@ candidates) and the biggest files, with absolute paths and byte sizes:
 ```
 
 **MCP server** — `dutype --mcp` exposes two read-only tools,
-`disk_usage(path, top?, cross_fs?)` and `find_by_category(path, category, top?)`:
+`disk_usage(path, top?, cross_fs?, refresh?)` and
+`find_by_category(path, category, top?, refresh?)`. They never write files.
+With `dutype --mcp --cache`, repeated calls on the same path reuse the scan from
+memory (or a snapshot the CLI saved in `~/.cache/dutype`) instead of walking the
+disk again (`refresh: true` forces a rescan):
 
 ```bash
 claude mcp add dutype -- npx -y dutype --mcp      # Claude Code

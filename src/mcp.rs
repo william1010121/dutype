@@ -1,14 +1,17 @@
 //! Minimal Model Context Protocol server over stdio (`dutype --mcp`), so LLM
 //! agents can call dutype as a tool. One JSON-RPC message per line.
 
+use crate::cache::{self, Snapshot};
 use crate::category::reg;
 use crate::report;
 use crate::scan::{self, Progress};
 use serde_json::{Value, json};
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
 
@@ -29,7 +32,8 @@ fn tools() -> Value {
                 "properties": {
                     "path": {"type": "string", "description": "Directory to scan. Absolute paths are best; ~ is expanded."},
                     "top": {"type": "integer", "minimum": 1, "maximum": 500, "default": 20, "description": "Length of each list."},
-                    "cross_fs": {"type": "boolean", "default": false, "description": "Descend into other mounted filesystems."}
+                    "cross_fs": {"type": "boolean", "default": false, "description": "Descend into other mounted filesystems."},
+                    "refresh": {"type": "boolean", "default": false, "description": "Rescan even if a cached scan exists (only matters with dutype --mcp --cache; see cached_at in the result)."}
                 },
                 "required": ["path"]
             },
@@ -48,7 +52,8 @@ fn tools() -> Value {
                     "path": {"type": "string", "description": "Directory to scan."},
                     "category": {"type": "string", "enum": categories, "description": "Category name."},
                     "top": {"type": "integer", "minimum": 1, "maximum": 500, "default": 50},
-                    "cross_fs": {"type": "boolean", "default": false}
+                    "cross_fs": {"type": "boolean", "default": false},
+                    "refresh": {"type": "boolean", "default": false}
                 },
                 "required": ["path", "category"]
             },
@@ -69,7 +74,16 @@ fn expand(path: &str) -> PathBuf {
     }
 }
 
-fn call_tool(name: &str, args: &Value) -> Result<Value, String> {
+/// Cache behaviour for the whole server, from `dutype --mcp [--cache|--refresh]`.
+#[derive(Clone, Copy)]
+pub struct CacheOpts {
+    pub use_cache: bool,
+    /// `--refresh`: every call rescans (and updates the in-memory cache).
+    pub always_refresh: bool,
+}
+
+fn call_tool(name: &str, args: &Value, opts: CacheOpts) -> Result<Value, String> {
+    let use_cache = opts.use_cache;
     let path = args
         .get("path")
         .and_then(Value::as_str)
@@ -79,6 +93,7 @@ fn call_tool(name: &str, args: &Value) -> Result<Value, String> {
         .and_then(Value::as_u64)
         .map(|t| t.clamp(1, 500) as usize);
     let cross_fs = args.get("cross_fs").and_then(Value::as_bool).unwrap_or(false);
+    let refresh = opts.always_refresh || args.get("refresh").and_then(Value::as_bool).unwrap_or(false);
     let category = match name {
         "disk_usage" => None,
         "find_by_category" => {
@@ -92,31 +107,75 @@ fn call_tool(name: &str, args: &Value) -> Result<Value, String> {
     };
 
     let path = std::fs::canonicalize(expand(path)).map_err(|e| format!("{path}: {e}"))?;
-    let progress = Progress::default();
-    let started = Instant::now();
-    let root = scan::scan(&path, !cross_fs, &progress).map_err(|e| format!("{}: {e}", path.display()))?;
-    let value = match category {
-        None => {
-            let errors = progress.errors.load(Ordering::Relaxed);
-            serde_json::to_value(report::build(
-                &root,
+    let one_fs = !cross_fs;
+    let render = |snap: &Snapshot| -> Result<Value, String> {
+        match category {
+            None => serde_json::to_value(report::build(
+                &snap.root,
                 &path,
-                started.elapsed(),
-                errors,
+                snap.scan_time,
+                snap.cached_at,
+                snap.errors,
                 top.unwrap_or(20),
-            ))
+            )),
+            Some(c) => serde_json::to_value(json!({
+                "path": path.display().to_string(),
+                "category": c.label(),
+                "cached_at": report::unix_secs(snap.cached_at),
+                "items": report::find(&snap.root, &path, c, top.unwrap_or(50)),
+            })),
         }
-        Some(c) => serde_json::to_value(json!({
-            "path": path.display().to_string(),
-            "category": c.label(),
-            "items": report::find(&root, &path, c, top.unwrap_or(50)),
-        })),
+        .map_err(|e| e.to_string())
     };
-    std::mem::forget(root);
-    value.map_err(|e| e.to_string())
+
+    // The tools are read-only, so MCP never writes snapshots. With --cache it
+    // reuses scans from this session (in memory) and snapshots the CLI saved.
+    MEMORY.with_borrow_mut(|memory| {
+        let key = (path.clone(), one_fs);
+        if use_cache && !refresh {
+            if let Some(snap) = memory.get(&key) {
+                return render(snap);
+            }
+            if let Some(snap) = cache::load(&path, one_fs) {
+                let value = render(&snap);
+                memory.insert(key, snap);
+                return value;
+            }
+        }
+        let progress = Progress::default();
+        let started = Instant::now();
+        let root_dev = scan::device_of(&path).ok();
+        let root = scan::scan(&path, one_fs, &progress).map_err(|e| format!("{}: {e}", path.display()))?;
+        let snap = Snapshot {
+            root,
+            cached_at: None,
+            scan_time: started.elapsed(),
+            errors: progress.errors.load(Ordering::Relaxed),
+            root_dev,
+        };
+        let value = render(&snap);
+        if use_cache {
+            let snap = Snapshot {
+                cached_at: Some(SystemTime::now()),
+                ..snap
+            };
+            // Replacing an older tree frees it; do that off the request path.
+            if let Some(old) = memory.insert(key, snap) {
+                std::thread::spawn(move || drop(old));
+            }
+        } else {
+            std::thread::spawn(move || drop(snap));
+        }
+        value
+    })
 }
 
-fn handle(msg: &Value) -> Option<Value> {
+thread_local! {
+    /// Scans kept for the server's lifetime with `--mcp --cache`.
+    static MEMORY: RefCell<HashMap<(PathBuf, bool), Snapshot>> = RefCell::new(HashMap::new());
+}
+
+fn handle(msg: &Value, opts: CacheOpts) -> Option<Value> {
     let id = msg.get("id")?.clone(); // notifications get no response
     let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
     let result = match method {
@@ -135,7 +194,7 @@ fn handle(msg: &Value) -> Option<Value> {
             let name = params.get("name").and_then(Value::as_str).unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
             // Tool failures are results with isError, not protocol errors.
-            Ok(match call_tool(name, &args) {
+            Ok(match call_tool(name, &args, opts) {
                 Ok(v) => json!({
                     "content": [{"type": "text", "text": serde_json::to_string(&v).unwrap_or_default()}],
                     "structuredContent": v,
@@ -152,7 +211,7 @@ fn handle(msg: &Value) -> Option<Value> {
     })
 }
 
-pub fn serve() -> Result<(), String> {
+pub fn serve(opts: CacheOpts) -> Result<(), String> {
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
     for line in stdin.lock().lines() {
@@ -161,7 +220,7 @@ pub fn serve() -> Result<(), String> {
             continue;
         }
         let response = match serde_json::from_str::<Value>(&line) {
-            Ok(msg) => handle(&msg),
+            Ok(msg) => handle(&msg, opts),
             Err(e) => Some(json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32700, "message": e.to_string()}})),
         };
         if let Some(r) = response {
