@@ -78,11 +78,27 @@ pub struct Progress {
 
 #[cfg(unix)]
 mod platform {
+    use super::Entry;
     use std::ffi::OsStr;
     use std::fs::Metadata;
+    use std::io;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::MetadataExt;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::AtomicBool;
+
+    #[cfg(target_os = "macos")]
+    pub(super) mod bulk;
+
+    /// Entries of the directory `path`: from `getattrlistbulk` on macOS when
+    /// the volume supports it, else [`super::read_entries_std`].
+    pub fn read_entries(path: &Path, cancel: &AtomicBool, out: &mut Vec<Entry>) -> io::Result<u64> {
+        #[cfg(target_os = "macos")]
+        if let Some(r) = bulk::read_entries(path, cancel, out) {
+            return r;
+        }
+        super::read_entries_std(path, cancel, out)
+    }
 
     pub fn allocated(m: &Metadata) -> u64 {
         m.blocks() * 512
@@ -153,9 +169,16 @@ mod platform {
 
 #[cfg(not(unix))]
 mod platform {
+    use super::Entry;
     use std::ffi::OsStr;
     use std::fs::{self, Metadata};
+    use std::io;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::AtomicBool;
+
+    pub fn read_entries(path: &Path, cancel: &AtomicBool, out: &mut Vec<Entry>) -> io::Result<u64> {
+        super::read_entries_std(path, cancel, out)
+    }
 
     pub fn allocated(m: &Metadata) -> u64 {
         m.len()
@@ -230,18 +253,6 @@ fn read_entries_std(path: &Path, cancel: &AtomicBool, out: &mut Vec<Entry>) -> i
         }
     }
     Ok(errors)
-}
-
-#[cfg(target_os = "macos")]
-mod bulk;
-
-/// Entries of the directory `path` (see [`read_entries_std`]).
-fn read_entries(path: &Path, cancel: &AtomicBool, out: &mut Vec<Entry>) -> io::Result<u64> {
-    #[cfg(target_os = "macos")]
-    if let Some(r) = bulk::read_entries(path, cancel, out) {
-        return r;
-    }
-    read_entries_std(path, cancel, out)
 }
 
 struct Ctx<'a> {
@@ -394,7 +405,7 @@ fn scan_dir(
     // A cancelled scan stops descending; its partial result is discarded.
     let mut errors = match ctx.progress.cancel.load(Ordering::Relaxed) {
         true => 0,
-        false => read_entries(path, &ctx.progress.cancel, &mut entries).unwrap_or(1),
+        false => platform::read_entries(path, &ctx.progress.cancel, &mut entries).unwrap_or(1),
     };
     if errors > 0 {
         ctx.progress.errors.fetch_add(errors, Ordering::Relaxed);
@@ -612,7 +623,7 @@ mod bulk_tests {
         for dir in [d.clone(), d.join("sub"), d.join("sub/deeper")] {
             let (mut a, mut b) = (Vec::new(), Vec::new());
             assert_eq!(read_entries_std(&dir, &cancel, &mut a).unwrap(), 0);
-            assert_eq!(bulk::read_entries(&dir, &cancel, &mut b).unwrap().unwrap(), 0);
+            assert_eq!(platform::bulk::read_entries(&dir, &cancel, &mut b).unwrap().unwrap(), 0);
             assert_eq!(sorted(a), sorted(b), "{}", dir.display());
         }
         fs::remove_dir_all(&d).unwrap();
@@ -636,7 +647,7 @@ mod bulk_tests {
     #[test]
     fn missing_dir_is_an_error() {
         let mut v = Vec::new();
-        let r = bulk::read_entries(Path::new("/nonexistent-dutype"), &AtomicBool::new(false), &mut v);
+        let r = platform::bulk::read_entries(Path::new("/nonexistent-dutype"), &AtomicBool::new(false), &mut v);
         assert!(r.unwrap().is_err());
     }
 }

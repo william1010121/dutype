@@ -2,7 +2,7 @@
 //! the names and metadata of many entries, instead of `readdir` plus one
 //! `lstat` per entry. Sizes and identities match what `lstat` reports.
 
-use super::Entry;
+use crate::scan::Entry;
 use std::cell::RefCell;
 use std::ffi::{CString, OsStr};
 use std::io;
@@ -50,9 +50,9 @@ impl Drop for Fd {
     }
 }
 
-/// Like [`super::read_entries_std`]. `None` when the volume does not support
+/// Like [`crate::scan::read_entries_std`]. `None` when the volume does not support
 /// bulk reads (the caller then falls back to `read_dir`).
-pub(super) fn read_entries(path: &Path, cancel: &AtomicBool, out: &mut Vec<Entry>) -> Option<io::Result<u64>> {
+pub(in crate::scan) fn read_entries(path: &Path, cancel: &AtomicBool, out: &mut Vec<Entry>) -> Option<io::Result<u64>> {
     let Ok(cpath) = CString::new(path.as_os_str().as_bytes()) else {
         return Some(Err(io::ErrorKind::InvalidInput.into()));
     };
