@@ -599,6 +599,21 @@ fn draw_details(f: &mut Frame, app: &App, area: Rect) {
         ));
     }
     lines.push(Line::from(space));
+    // --private: what deleting this partial clone alone frees right now.
+    let lossy = node.lossy || app.path_has_lossy_name();
+    let private = (!node.is_dir() && !lossy && app.private_sizes && !app.private_missing)
+        .then(|| app.privates.get(&app.current_rel().join(&*node.name)))
+        .flatten();
+    if let Some(p) = private {
+        lines.push(Line::from(vec![
+            label("private"),
+            Span::styled(human(p), Style::new().fg(TEXT)),
+            Span::styled(
+                "   freed now if deleted (snapshots may keep it)",
+                Style::new().fg(MUTED),
+            ),
+        ]));
+    }
     if node.is_dir() {
         lines.push(Line::from(vec![
             label("files"),

@@ -29,7 +29,10 @@ fn tools() -> Value {
                 allocated on disk (size_bytes, like du). With clones: true (slower), on APFS \
                 dedup_bytes counts each clone family once and freeable_min_bytes is a lower \
                 bound of what deleting an item frees; without it freeable_min_bytes is null on \
-                macOS and leaves out hard-linked files. See accounting. Read-only.",
+                macOS and leaves out hard-linked files. With private: true \
+                (macOS/APFS; implies clones), files that may share blocks but are not full \
+                clones get private_bytes: what deleting that file alone frees right now. See \
+                accounting. Read-only.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -38,7 +41,8 @@ fn tools() -> Value {
                     "cross_fs": {"type": "boolean", "default": false, "description": "Descend into other mounted filesystems."},
                     "refresh": {"type": "boolean", "default": false, "description": "Rescan even if a cached scan exists (only matters with dutype --mcp --cache; see cached_at in the result)."},
                     "clones": {"type": "boolean", "default": false, "description": "Detect APFS clones (macOS; makes the scan slower): fills dedup_bytes and freeable_min_bytes."},
-                    "size_mode": {"type": "string", "enum": ["du", "dedup"], "default": "du", "description": "Rank lists by allocated size (du) or by size with APFS clones counted once (dedup; implies clones)."}
+                    "size_mode": {"type": "string", "enum": ["du", "dedup"], "default": "du", "description": "Rank lists by allocated size (du) or by size with APFS clones counted once (dedup; implies clones)."},
+                    "private": {"type": "boolean", "default": false, "description": "Also read the APFS private size (private_bytes) of partial clones: bytes freed immediately if that file alone is deleted; affected by APFS snapshots, never summed into folders. Slower; implies clones; macOS only (elsewhere accepted, no values; see accounting.private)."}
                 },
                 "required": ["path"]
             },
@@ -60,7 +64,8 @@ fn tools() -> Value {
                     "cross_fs": {"type": "boolean", "default": false},
                     "refresh": {"type": "boolean", "default": false},
                     "clones": {"type": "boolean", "default": false},
-                    "size_mode": {"type": "string", "enum": ["du", "dedup"], "default": "du"}
+                    "size_mode": {"type": "string", "enum": ["du", "dedup"], "default": "du"},
+                    "private": {"type": "boolean", "default": false, "description": "Add private_bytes to file items (see disk_usage)."}
                 },
                 "required": ["path", "category"]
             },
@@ -101,13 +106,16 @@ fn call_tool(name: &str, args: &Value, opts: CacheOpts) -> Result<Value, String>
         .map(|t| t.clamp(1, 500) as usize);
     let cross_fs = args.get("cross_fs").and_then(Value::as_bool).unwrap_or(false);
     let refresh = opts.always_refresh || args.get("refresh").and_then(Value::as_bool).unwrap_or(false);
+    let private = args.get("private").and_then(Value::as_bool).unwrap_or(false);
     let size_mode = match args.get("size_mode").filter(|v| !v.is_null()) {
         None => report::SizeMode::Du,
         Some(v) if v == "du" => report::SizeMode::Du,
         Some(v) if v == "dedup" => report::SizeMode::Dedup,
         Some(v) => return Err(format!("unknown size_mode {v} (du or dedup)")),
     };
-    let clones = size_mode == report::SizeMode::Dedup || args.get("clones").and_then(Value::as_bool).unwrap_or(false);
+    // Private sizes need the clone flags to pick partial clones.
+    let clones =
+        size_mode == report::SizeMode::Dedup || private || args.get("clones").and_then(Value::as_bool).unwrap_or(false);
     let category = match name {
         "disk_usage" => None,
         "find_by_category" => {
@@ -124,26 +132,24 @@ fn call_tool(name: &str, args: &Value, opts: CacheOpts) -> Result<Value, String>
     let one_fs = !cross_fs;
     let shares = scan::may_share_blocks(&path, one_fs);
     let render = |snap: &Snapshot| -> Result<Value, String> {
+        let meta = report::Meta {
+            elapsed: snap.scan_time,
+            cached_at: snap.cached_at,
+            unreadable: snap.errors,
+            clones: snap.clones,
+            clone_ids: snap.clone_ids,
+            clone_gaps: snap.clone_gaps,
+            shares,
+            size_mode,
+            private: snap.private_table(),
+        };
         match category {
-            None => serde_json::to_value(report::build(
-                &snap.root,
-                &path,
-                &report::Meta {
-                    elapsed: snap.scan_time,
-                    cached_at: snap.cached_at,
-                    unreadable: snap.errors,
-                    clones: snap.clones,
-                    clone_ids: snap.clone_ids,
-                    clone_gaps: snap.clone_gaps,
-                    shares,
-                    size_mode,
-                },
-                top.unwrap_or(20),
-            )),
+            None => serde_json::to_value(report::build(&snap.root, &path, &meta, top.unwrap_or(20))),
             Some(c) => serde_json::to_value(json!({
                 "path": path.display().to_string(),
                 "category": c.label(),
                 "cached_at": report::unix_secs(snap.cached_at),
+                "accounting": report::accounting(&meta),
                 "items": report::find(
                     &snap.root,
                     &path,
@@ -151,6 +157,7 @@ fn call_tool(name: &str, args: &Value, opts: CacheOpts) -> Result<Value, String>
                     top.unwrap_or(50),
                     size_mode,
                     report::freeable_known(snap.clones && snap.clone_ids, shares),
+                    meta.private,
                 ),
             })),
         }
@@ -162,16 +169,20 @@ fn call_tool(name: &str, args: &Value, opts: CacheOpts) -> Result<Value, String>
     MEMORY.with_borrow_mut(|memory| {
         let key = (path.clone(), one_fs);
         if use_cache && !refresh {
-            if let Some(snap) = memory.get(&key).filter(|s| cache::answers(s, clones)) {
+            let fits = |s: &Snapshot| cache::answers(s, clones) && s.serves(private);
+            if let Some(snap) = memory.get(&key).filter(|s| fits(s)) {
                 return render(snap);
             }
-            if let Some(snap) = cache::load(&path, one_fs, clones) {
+            if let Some(snap) = cache::load(&path, one_fs, clones).filter(|s| s.serves(private)) {
                 let value = render(&snap);
                 memory.insert(key, snap);
                 return value;
             }
         }
-        let progress = Progress::default();
+        let progress = Progress {
+            private,
+            ..Progress::default()
+        };
         let started = Instant::now();
         let root_dev = scan::device_of(&path).ok();
         let root = scan::scan(&path, one_fs, clones, &progress).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -184,6 +195,10 @@ fn call_tool(name: &str, args: &Value, opts: CacheOpts) -> Result<Value, String>
             clones,
             clone_ids: progress.clone_ids.load(Ordering::Relaxed),
             clone_gaps: progress.clone_gaps.load(Ordering::Relaxed),
+            private,
+            private_sizes: progress.private_sizes.load(Ordering::Relaxed),
+            private_missing: progress.private_missing.load(Ordering::Relaxed),
+            privates: progress.take_private(),
         };
         let value = render(&snap);
         if use_cache {

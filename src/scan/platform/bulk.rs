@@ -46,7 +46,10 @@ fn attr_list(clones: bool) -> libc::attrlist {
         // With FSOPT_ATTR_CMN_EXTENDED, forkattr holds the extended common
         // attributes. Not ATTR_CMNEXT_CLONE_REFCNT: APFS serializes that
         // lookup across threads, which made parallel scans 2x slower; it is
-        // read per family instead (see `clone_refcnt`).
+        // read per family instead (see `clone_refcnt`). Not PRIVATESIZE
+        // either: it slows down every entry (+77% on Xcode's Platforms),
+        // while `--private` needs it only for partial clones and reads
+        // those one by one (see `private_size`).
         forkattr: match clones {
             true => libc::ATTR_CMNEXT_CLONEID | libc::ATTR_CMNEXT_EXT_FLAGS,
             false => 0,
@@ -69,6 +72,7 @@ pub(in crate::scan) fn read_entries(
     cancel: &AtomicBool,
     out: &mut Vec<Entry>,
     clones: bool,
+    private: bool,
 ) -> Option<io::Result<ReadStats>> {
     let Ok(cpath) = CString::new(path.as_os_str().as_bytes()) else {
         return Some(Err(io::ErrorKind::InvalidInput.into()));
@@ -79,7 +83,7 @@ pub(in crate::scan) fn read_entries(
         return Some(Err(io::Error::last_os_error()));
     }
     let fd = Fd(fd);
-    BUF.with_borrow_mut(|buf| read_all(&fd, buf, cancel, out, clones))
+    BUF.with_borrow_mut(|buf| read_all(&fd, buf, cancel, out, clones, private))
 }
 
 fn read_all(
@@ -88,8 +92,11 @@ fn read_all(
     cancel: &AtomicBool,
     out: &mut Vec<Entry>,
     clones: bool,
+    private: bool,
 ) -> Option<io::Result<ReadStats>> {
     let mut list = attr_list(clones);
+    // Private sizes need the clone flags to pick partial clones.
+    let private = clones && private;
     let mut stats = ReadStats::default();
     let mut first = true;
     loop {
@@ -129,7 +136,7 @@ fn read_all(
                 stats.errors += 1;
                 return Some(Ok(stats));
             };
-            match parse(fd, &data[at..at + len], clones, &mut stats) {
+            match parse(fd, &data[at..at + len], clones, private, &mut stats) {
                 Some(e) => out.push(e),
                 None => stats.errors += 1,
             }
@@ -172,8 +179,9 @@ impl Cursor<'_> {
 /// attribute set, then each returned attribute in bit order, group by group
 /// (common, dir, file, extended common). `None` for an entry with no
 /// usable name or metadata. Sets `stats.clone_ids` when clone flags are
-/// reported, `stats.clone_gaps` when a file's are missing.
-fn parse(fd: &Fd, d: &[u8], clones: bool, stats: &mut ReadStats) -> Option<Entry> {
+/// reported, `stats.clone_gaps` when a file's are missing. With `private`,
+/// adds the private size of a partial clone to `stats.private`.
+fn parse(fd: &Fd, d: &[u8], clones: bool, private: bool, stats: &mut ReadStats) -> Option<Entry> {
     let mut c = Cursor { d, at: 4 };
     let common = c.u32()?;
     let _vol = c.u32()?;
@@ -183,6 +191,8 @@ fn parse(fd: &Fd, d: &[u8], clones: bool, stats: &mut ReadStats) -> Option<Entry
     // Dirs report the flags too, so a tree of dirs only still counts.
     if ext_attrs & libc::ATTR_CMNEXT_EXT_FLAGS != 0 {
         stats.clone_ids = true;
+        // Partial clones can be told apart, so their private sizes read.
+        stats.private_sizes |= private;
     }
     // ATTR_CMN_ERROR comes right after the returned set.
     let error = match common & ATTR_CMN_ERROR != 0 {
@@ -202,7 +212,7 @@ fn parse(fd: &Fd, d: &[u8], clones: bool, stats: &mut ReadStats) -> Option<Entry
     // An entry the kernel could not read in bulk may still `lstat`.
     let need = libc::ATTR_CMN_DEVID | libc::ATTR_CMN_OBJTYPE | libc::ATTR_CMN_FILEID;
     if error != 0 || common & need != need {
-        return fallback(fd, name, clones, stats);
+        return fallback(fd, name, clones, private, stats);
     }
     // dev_t is signed; widen it like `MetadataExt::dev` does.
     let dev = c.u32()? as i32 as u64;
@@ -220,7 +230,7 @@ fn parse(fd: &Fd, d: &[u8], clones: bool, stats: &mut ReadStats) -> Option<Entry
         // A mount point reports the attributes of the filesystem below it;
         // `lstat` gives the mounted one, as a `read_dir` scan sees it.
         if mount & (libc::DIR_MNTSTATUS_MNTPOINT | DIR_MNTSTATUS_TRIGGER) != 0 || alloc.is_none() {
-            return fallback(fd, name, clones, stats);
+            return fallback(fd, name, clones, private, stats);
         }
         return Some(Entry {
             name: name.to_os_string(),
@@ -235,11 +245,11 @@ fn parse(fd: &Fd, d: &[u8], clones: bool, stats: &mut ReadStats) -> Option<Entry
     }
     let nlink = match file_attrs & libc::ATTR_FILE_LINKCOUNT != 0 {
         true => c.u32()?,
-        false => return fallback(fd, name, clones, stats),
+        false => return fallback(fd, name, clones, private, stats),
     };
     let alloc = match file_attrs & libc::ATTR_FILE_ALLOCSIZE != 0 {
         true => c.u64()?,
-        false => return fallback(fd, name, clones, stats),
+        false => return fallback(fd, name, clones, private, stats),
     };
     let clone_id = match ext_attrs & libc::ATTR_CMNEXT_CLONEID != 0 {
         true => Some(c.u64()?),
@@ -251,6 +261,8 @@ fn parse(fd: &Fd, d: &[u8], clones: bool, stats: &mut ReadStats) -> Option<Entry
         true => c.u64()?,
         false if clones => {
             stats.clone_gaps += 1;
+            // It may be a partial clone: its private size is unknown.
+            stats.private_missing |= private;
             EF_MAY_SHARE_BLOCKS
         }
         false => 0,
@@ -261,6 +273,18 @@ fn parse(fd: &Fd, d: &[u8], clones: bool, stats: &mut ReadStats) -> Option<Entry
     let clone = clone_id.filter(|_| flags & EF_SHARES_ALL_BLOCKS != 0);
     if flags & EF_SHARES_ALL_BLOCKS != 0 && clone.is_none() {
         stats.clone_gaps += 1;
+    }
+    // A full clone frees nothing alone and a file without shared blocks
+    // frees its size; a hard-linked one frees nothing while a link stays.
+    // A file whose flags were skipped is a clone gap (no private size).
+    let known = ext_attrs & libc::ATTR_CMNEXT_EXT_FLAGS != 0;
+    let partial = known && flags & EF_MAY_SHARE_BLOCKS != 0 && flags & EF_SHARES_ALL_BLOCKS == 0 && nlink == 1;
+    if private && partial {
+        match private_size(fd, raw) {
+            PrivateReply::Size(bytes) => stats.private.push((name.to_os_string(), bytes.min(alloc))),
+            PrivateReply::Gone => {}
+            PrivateReply::Unknown => stats.private_missing = true,
+        }
     }
     Some(Entry {
         name: name.to_os_string(),
@@ -277,9 +301,12 @@ fn parse(fd: &Fd, d: &[u8], clones: bool, stats: &mut ReadStats) -> Option<Entry
 
 /// [`lstat_at`] from [`parse`]: with `clones`, a file read this way is a gap
 /// in clone coverage.
-fn fallback(fd: &Fd, name: &OsStr, clones: bool, stats: &mut ReadStats) -> Option<Entry> {
+/// With `private`, such a file may be a partial clone whose private size
+/// is unknown.
+fn fallback(fd: &Fd, name: &OsStr, clones: bool, private: bool, stats: &mut ReadStats) -> Option<Entry> {
     let e = lstat_at(fd, name, clones)?;
     stats.clone_gaps += (clones && !e.dir) as u64;
+    stats.private_missing |= private && !e.dir;
     Some(e)
 }
 
@@ -307,6 +334,71 @@ fn lstat_at(fd: &Fd, name: &OsStr, clones: bool) -> Option<Entry> {
     })
 }
 
+/// What a private-size lookup gave.
+#[derive(Debug, PartialEq)]
+enum PrivateReply {
+    Size(u64),
+    /// The file is gone (deleted since the directory was read).
+    Gone,
+    /// Not reported (no such attribute on the volume, no permission, an
+    /// I/O error): the scan's private sizes are incomplete.
+    Unknown,
+}
+
+/// Classify a `getattrlistat` reply for `ATTR_CMNEXT_PRIVATESIZE`.
+fn private_reply(rc: libc::c_int, errno: Option<i32>, returned: u32, value: u64) -> PrivateReply {
+    match (rc, errno) {
+        (0, _) if returned & libc::ATTR_CMNEXT_PRIVATESIZE != 0 => PrivateReply::Size(value),
+        (_, Some(libc::ENOENT)) if rc != 0 => PrivateReply::Gone,
+        _ => PrivateReply::Unknown,
+    }
+}
+
+/// `ATTR_CMNEXT_PRIVATESIZE` of the entry `raw` (its name with the
+/// terminating NUL, as the bulk buffer holds it) of the directory `fd`:
+/// the bytes only this file holds.
+fn private_size(fd: &Fd, raw: &[u8]) -> PrivateReply {
+    if raw.last() != Some(&0) {
+        return PrivateReply::Unknown;
+    }
+    let mut list = libc::attrlist {
+        bitmapcount: libc::ATTR_BIT_MAP_COUNT,
+        reserved: 0,
+        commonattr: libc::ATTR_CMN_RETURNED_ATTRS,
+        volattr: 0,
+        dirattr: 0,
+        fileattr: 0,
+        forkattr: libc::ATTR_CMNEXT_PRIVATESIZE,
+    };
+    let mut reply = std::mem::MaybeUninit::<Reply<u64>>::zeroed();
+    let options = (libc::FSOPT_ATTR_CMN_EXTENDED | libc::FSOPT_NOFOLLOW) as libc::c_ulong;
+    let rc = unsafe {
+        libc::getattrlistat(
+            fd.0,
+            raw.as_ptr().cast(),
+            (&raw mut list).cast(),
+            reply.as_mut_ptr().cast(),
+            std::mem::size_of::<Reply<u64>>(),
+            options,
+        )
+    };
+    if rc != 0 {
+        return private_reply(rc, io::Error::last_os_error().raw_os_error(), 0, 0);
+    }
+    let reply = unsafe { reply.assume_init() };
+    let returned = reply.returned;
+    private_reply(rc, None, returned.forkattr, reply.value)
+}
+
+/// A `getattrlist` reply holding one attribute.
+#[repr(C, packed(4))]
+#[derive(Clone, Copy)]
+struct Reply<T: Copy> {
+    len: u32,
+    returned: libc::attribute_set_t,
+    value: T,
+}
+
 /// Number of files in the APFS full-clone family of the file at `path`
 /// (macOS 14+). `None` when the volume or the system cannot tell.
 pub(in crate::scan) fn clone_refcnt(path: &Path) -> Option<u32> {
@@ -322,13 +414,6 @@ pub(in crate::scan) fn may_share(path: &Path) -> Option<bool> {
 
 /// One extended common attribute of `path` (not following a symlink).
 fn ext_attr<T: Copy>(path: &Path, attr: u32) -> Option<T> {
-    #[repr(C, packed(4))]
-    #[derive(Clone, Copy)]
-    struct Reply<T: Copy> {
-        len: u32,
-        returned: libc::attribute_set_t,
-        value: T,
-    }
     let cpath = CString::new(path.as_os_str().as_bytes()).ok()?;
     let mut list = libc::attrlist {
         bitmapcount: libc::ATTR_BIT_MAP_COUNT,
@@ -405,10 +490,14 @@ mod tests {
         let common = libc::ATTR_CMN_RETURNED_ATTRS | libc::ATTR_CMN_NAME | ATTR_CMN_ERROR;
         let (d, fd, e) = synthetic("fallback-clones", common, libc::EIO as u32);
         let mut stats = ReadStats::default();
-        let got = parse(&fd, &e, true, &mut stats).expect("entry kept");
+        let got = parse(&fd, &e, true, false, &mut stats).expect("entry kept");
         assert!(got.may_share && got.clone.is_none());
         assert_eq!(stats.clone_gaps, 1);
-        assert!(!parse(&fd, &e, false, &mut ReadStats::default()).unwrap().may_share);
+        assert!(
+            !parse(&fd, &e, false, false, &mut ReadStats::default())
+                .unwrap()
+                .may_share
+        );
         std::fs::remove_dir_all(&d).unwrap();
     }
 
@@ -453,10 +542,11 @@ mod tests {
     #[test]
     fn omitted_clone_flags_are_unknown() {
         let (d, fd, _) = synthetic("omitted-flags", 0, 0);
-        let parse_rec =
-            |ext, flags, clones| parse(&fd, &file_record(ext, flags), clones, &mut ReadStats::default()).unwrap();
+        let parse_rec = |ext, flags, clones| {
+            parse(&fd, &file_record(ext, flags), clones, false, &mut ReadStats::default()).unwrap()
+        };
         let mut stats = ReadStats::default();
-        parse(&fd, &file_record(0, 0), true, &mut stats).unwrap();
+        parse(&fd, &file_record(0, 0), true, false, &mut stats).unwrap();
         assert!(stats.clone_gaps == 1 && !stats.clone_ids);
         let both = libc::ATTR_CMNEXT_CLONEID | libc::ATTR_CMNEXT_EXT_FLAGS;
         assert!(parse_rec(0, 0, true).may_share);
@@ -467,10 +557,77 @@ mod tests {
         // A full clone whose clone id was skipped: shared, ungrouped, a gap.
         let flags_only = libc::ATTR_CMNEXT_EXT_FLAGS;
         let mut stats = ReadStats::default();
-        let e = parse(&fd, &file_record(flags_only, EF_SHARES_ALL_BLOCKS), true, &mut stats).unwrap();
+        let e = parse(
+            &fd,
+            &file_record(flags_only, EF_SHARES_ALL_BLOCKS),
+            true,
+            false,
+            &mut stats,
+        )
+        .unwrap();
         assert!(e.may_share && e.clone.is_none() && stats.clone_gaps == 1);
         assert_eq!(parse_rec(0, 0, true).alloc, 16384);
         std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// Private sizes count as read only where the volume returned the
+    /// clone flags that pick out partial clones.
+    #[test]
+    fn private_sizes_need_clone_flags() {
+        let (d, fd, _) = synthetic("private-flags", 0, 0);
+        let read = |ext| {
+            let mut stats = ReadStats::default();
+            parse(&fd, &file_record(ext, 0), true, true, &mut stats).unwrap();
+            stats.private_sizes
+        };
+        assert!(!read(0));
+        // Skipped flags: a clone gap, never looked up, and it may be a
+        // partial clone, so the private sizes are incomplete.
+        let mut stats = ReadStats::default();
+        parse(&fd, &file_record(0, 0), true, true, &mut stats).unwrap();
+        assert!(stats.clone_gaps > 0 && stats.private.is_empty() && stats.private_missing);
+        // A full clone without its clone id is a clone gap, but its flags
+        // say it is no partial clone: the private sizes stay complete.
+        let mut stats = ReadStats::default();
+        let flags_only = libc::ATTR_CMNEXT_EXT_FLAGS;
+        parse(
+            &fd,
+            &file_record(flags_only, EF_SHARES_ALL_BLOCKS),
+            true,
+            true,
+            &mut stats,
+        )
+        .unwrap();
+        assert!(stats.clone_gaps > 0 && !stats.private_missing && stats.private_sizes);
+        // A file read through the lstat fallback has unknown flags.
+        let common = libc::ATTR_CMN_RETURNED_ATTRS | libc::ATTR_CMN_NAME | ATTR_CMN_ERROR;
+        let (d2, fd2, e) = synthetic("private-fallback", common, libc::EIO as u32);
+        let mut stats = ReadStats::default();
+        parse(&fd2, &e, true, true, &mut stats).unwrap();
+        assert!(stats.private_missing);
+        let mut stats = ReadStats::default();
+        parse(&fd2, &e, true, false, &mut stats).unwrap();
+        assert!(!stats.private_missing);
+        std::fs::remove_dir_all(&d2).unwrap();
+        assert!(read(libc::ATTR_CMNEXT_CLONEID | libc::ATTR_CMNEXT_EXT_FLAGS));
+        let mut stats = ReadStats::default();
+        let both = libc::ATTR_CMNEXT_CLONEID | libc::ATTR_CMNEXT_EXT_FLAGS;
+        parse(&fd, &file_record(both, 0), true, false, &mut stats).unwrap();
+        assert!(!stats.private_sizes);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// Any lookup that does not give a size makes the scan's private sizes
+    /// incomplete, except for a file that vanished meanwhile.
+    #[test]
+    fn private_reply_kinds() {
+        let size = libc::ATTR_CMNEXT_PRIVATESIZE;
+        assert_eq!(private_reply(0, None, size, 7), PrivateReply::Size(7));
+        assert_eq!(private_reply(0, None, 0, 0), PrivateReply::Unknown);
+        assert_eq!(private_reply(-1, Some(libc::ENOTSUP), 0, 0), PrivateReply::Unknown);
+        assert_eq!(private_reply(-1, Some(libc::EACCES), 0, 0), PrivateReply::Unknown);
+        assert_eq!(private_reply(-1, Some(libc::EIO), 0, 0), PrivateReply::Unknown);
+        assert_eq!(private_reply(-1, Some(libc::ENOENT), 0, 0), PrivateReply::Gone);
     }
 
     #[test]
@@ -484,7 +641,7 @@ mod tests {
         let common =
             libc::ATTR_CMN_RETURNED_ATTRS | libc::ATTR_CMN_NAME | libc::ATTR_CMN_DEVID | libc::ATTR_CMN_OBJTYPE;
         let (d, fd, e) = synthetic("attrs", common, 0);
-        let got = parse(&fd, &e, false, &mut ReadStats::default()).expect("entry kept");
+        let got = parse(&fd, &e, false, false, &mut ReadStats::default()).expect("entry kept");
         assert_eq!(Some(got), lstat_at(&fd, OsStr::new("f.bin"), false));
         std::fs::remove_dir_all(&d).unwrap();
     }
@@ -493,7 +650,7 @@ mod tests {
     fn entry_error_falls_back_to_lstat() {
         let common = libc::ATTR_CMN_RETURNED_ATTRS | libc::ATTR_CMN_NAME | ATTR_CMN_ERROR;
         let (d, fd, e) = synthetic("error", common, libc::EIO as u32);
-        let got = parse(&fd, &e, false, &mut ReadStats::default()).expect("entry kept");
+        let got = parse(&fd, &e, false, false, &mut ReadStats::default()).expect("entry kept");
         assert_eq!(Some(got), lstat_at(&fd, OsStr::new("f.bin"), false));
         std::fs::remove_dir_all(&d).unwrap();
     }

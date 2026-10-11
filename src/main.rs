@@ -80,6 +80,12 @@ struct Args {
     /// `dedup` (each APFS clone family counted once; implies --clones)
     #[arg(long, value_enum, default_value_t = report::SizeMode::Du, value_name = "MODE")]
     size_mode: report::SizeMode,
+    /// Also read the APFS private size of partial clones (files that may
+    /// share blocks but are not full clones): what deleting that file alone
+    /// frees right now. Costs one syscall per such file; implies --clones.
+    /// macOS only (accepted elsewhere, no values)
+    #[arg(long)]
+    private: bool,
 }
 
 fn main() -> ExitCode {
@@ -129,18 +135,24 @@ fn run(args: Args) -> Result<(), String> {
         eprintln!("dutype: cannot create cache directory: {e}");
     }
     let one_fs = !args.cross_fs;
-    let clones = args.clones || args.size_mode == report::SizeMode::Dedup;
+    // Private sizes need the clone flags to pick partial clones.
+    let clones = args.clones || args.size_mode == report::SizeMode::Dedup || args.private;
     let cached = || {
         (use_cache && !args.refresh)
             .then(|| cache::load(&path, one_fs, clones))
             .flatten()
+            // A scan without private sizes cannot answer --private.
+            .filter(|s| s.serves(args.private))
     };
 
     if args.report || args.json {
         let snap = match cached() {
             Some(s) => s,
             None => {
-                let progress = Progress::default();
+                let progress = Progress {
+                    private: args.private,
+                    ..Progress::default()
+                };
                 let started = Instant::now();
                 let root_dev = scan::device_of(&path).ok();
                 let root =
@@ -154,6 +166,10 @@ fn run(args: Args) -> Result<(), String> {
                     clones,
                     clone_ids: progress.clone_ids.load(Ordering::Relaxed),
                     clone_gaps: progress.clone_gaps.load(Ordering::Relaxed),
+                    private: args.private,
+                    private_sizes: progress.private_sizes.load(Ordering::Relaxed),
+                    private_missing: progress.private_missing.load(Ordering::Relaxed),
+                    privates: progress.take_private(),
                 };
                 if use_cache && let Err(e) = cache::save(&path, one_fs, &snap) {
                     eprintln!("dutype: cannot write cache: {e}");
@@ -162,14 +178,26 @@ fn run(args: Args) -> Result<(), String> {
             }
         };
         let root = &snap.root;
+        let meta = report::Meta {
+            elapsed: snap.scan_time,
+            cached_at: snap.cached_at,
+            unreadable: snap.errors,
+            clones: snap.clones,
+            clone_ids: snap.clone_ids,
+            clone_gaps: snap.clone_gaps,
+            shares: scan::may_share_blocks(&path, one_fs),
+            size_mode: args.size_mode,
+            private: snap.private_table(),
+        };
         if let Some(cat) = only {
-            let known = report::freeable_known(snap.clones && snap.clone_ids, scan::may_share_blocks(&path, one_fs));
-            let items = report::find(root, &path, cat, args.top, args.size_mode, known);
+            let known = report::freeable_known(snap.clones && snap.clone_ids, meta.shares);
+            let items = report::find(root, &path, cat, args.top, args.size_mode, known, meta.private);
             if args.json {
                 let doc = serde_json::json!({
                     "path": path.display().to_string(),
                     "category": cat.label(),
                     "cached_at": report::unix_secs(snap.cached_at),
+                    "accounting": report::accounting(&meta),
                     "items": items,
                 });
                 print(&serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?);
@@ -178,21 +206,7 @@ fn run(args: Args) -> Result<(), String> {
                 print(&report::find_to_text(cat, &items, args.size_mode));
             }
         } else {
-            let r = report::build(
-                root,
-                &path,
-                &report::Meta {
-                    elapsed: snap.scan_time,
-                    cached_at: snap.cached_at,
-                    unreadable: snap.errors,
-                    clones: snap.clones,
-                    clone_ids: snap.clone_ids,
-                    clone_gaps: snap.clone_gaps,
-                    shares: scan::may_share_blocks(&path, one_fs),
-                    size_mode: args.size_mode,
-                },
-                args.top,
-            );
+            let r = report::build(root, &path, &meta, args.top);
             if args.json {
                 print(&serde_json::to_string_pretty(&r).map_err(|e| e.to_string())?);
                 print("\n");
@@ -209,6 +223,8 @@ fn run(args: Args) -> Result<(), String> {
     let result = (|| -> Result<(), String> {
         let io = |e: std::io::Error| e.to_string();
         let mut snap = cached();
+        // Once the tree holds private sizes, rescans keep collecting them.
+        let mut private = args.private;
         let mut location = Vec::new();
         // Status to show after a full rescan (e.g. why `r` became `R`).
         let mut carried_status: Option<String> = None;
@@ -223,20 +239,25 @@ fn run(args: Args) -> Result<(), String> {
                 Some(s) => s,
                 None => {
                     let p = path.clone();
-                    let scanned =
-                        scan_with_progress(&mut terminal, &path, move |pr| scan::scan(&p, one_fs, clones, pr))?;
-                    let Some((root, scan_time, errors, (clone_ids, clone_gaps))) = scanned else {
+                    let scanned = scan_with_progress(&mut terminal, &path, private, move |pr| {
+                        scan::scan(&p, one_fs, clones, pr)
+                    })?;
+                    let Some((root, scan_time, mut done)) = scanned else {
                         return Ok(());
                     };
                     Snapshot {
                         root,
                         cached_at: None,
                         scan_time,
-                        errors,
+                        errors: done.errors,
                         root_dev,
                         clones,
-                        clone_ids,
-                        clone_gaps,
+                        clone_ids: done.clone_ids,
+                        clone_gaps: done.clone_gaps,
+                        private,
+                        private_sizes: done.private_sizes,
+                        private_missing: done.private_missing,
+                        privates: std::mem::take(&mut done.privates),
                     }
                 }
             };
@@ -247,12 +268,19 @@ fn run(args: Args) -> Result<(), String> {
             let snap_root_dev = snap.root_dev;
             let (clone_ids, clone_gaps) = (snap.clone_ids, snap.clone_gaps);
             let snap_clones = snap.clones;
+            private |= snap.private;
+            let (private_sizes, private_missing) = (snap.private_sizes, snap.private_missing);
+            let privates = snap.privates;
             let mut app = App::new(snap.root, path.clone(), snap.scan_time, snap.errors);
             app.cached_at = snap.cached_at;
             app.root_dev = snap_root_dev;
             (app.clone_ids, app.clone_gaps) = (clone_ids, clone_gaps);
             app.clones = snap_clones;
             app.shares = scan::may_share_blocks(&path, one_fs);
+            app.private = private;
+            app.private_sizes = private_sizes;
+            app.private_missing = private_missing;
+            app.privates = privates;
             app.set_size_mode(size_mode);
             app.show_keys = args.show_keys;
             app.go_to(&location);
@@ -287,19 +315,29 @@ fn run(args: Args) -> Result<(), String> {
     result
 }
 
-/// A finished scan: its result, time, unreadable entries and
-/// `(Progress::clone_ids, Progress::clone_gaps)`.
-type Scanned<T> = (T, Duration, u64, (bool, bool));
+/// What a finished scan reported besides its tree.
+struct Done {
+    errors: u64,
+    clone_ids: bool,
+    clone_gaps: bool,
+    private_sizes: bool,
+    private_missing: bool,
+    privates: scan::PrivateSizes,
+}
 
-/// Run `scan` on a thread while drawing the progress screen. `Ok(None)` when
-/// the user aborts with q / Esc.
+/// Run `scan` on a thread while drawing the progress screen (`private`:
+/// see [`Progress::private`]). `Ok(None)` when the user aborts with q / Esc.
 fn scan_with_progress<T: Send + 'static>(
     terminal: &mut ratatui::DefaultTerminal,
     path: &Path,
+    private: bool,
     scan: impl FnOnce(&Progress) -> std::io::Result<T> + Send + 'static,
-) -> Result<Option<Scanned<T>>, String> {
+) -> Result<Option<(T, Duration, Done)>, String> {
     let io = |e: std::io::Error| e.to_string();
-    let progress = Arc::new(Progress::default());
+    let progress = Arc::new(Progress {
+        private,
+        ..Progress::default()
+    });
     let started = Instant::now();
     let handle = {
         let progress = progress.clone();
@@ -336,11 +374,14 @@ fn scan_with_progress<T: Send + 'static>(
     Ok(Some((
         root,
         started.elapsed(),
-        progress.errors.load(Ordering::Relaxed),
-        (
-            progress.clone_ids.load(Ordering::Relaxed),
-            progress.clone_gaps.load(Ordering::Relaxed),
-        ),
+        Done {
+            errors: progress.errors.load(Ordering::Relaxed),
+            clone_ids: progress.clone_ids.load(Ordering::Relaxed),
+            clone_gaps: progress.clone_gaps.load(Ordering::Relaxed),
+            private_sizes: progress.private_sizes.load(Ordering::Relaxed),
+            private_missing: progress.private_missing.load(Ordering::Relaxed),
+            privates: progress.take_private(),
+        },
     )))
 }
 
@@ -388,7 +429,7 @@ fn rescan_current(
     let inherited = app.inherited_category();
     let t = target.clone();
     let clones = app.clones;
-    let scanned = scan_with_progress(terminal, &target, move |pr| {
+    let scanned = scan_with_progress(terminal, &target, app.private, move |pr| {
         scan::scan_subtree(&t, one_fs, clones, pr, inherited, root_dev)
     });
     if let Ok(Some((sub, ..))) = &scanned
@@ -398,9 +439,10 @@ fn rescan_current(
         return Ok(());
     }
     app.status = Some(match scanned {
-        Ok(Some((sub, took, _, (clone_ids, _)))) => {
+        Ok(Some((sub, took, done))) => {
             // replace_current swaps in the subtree's own error and gap counts.
-            app.replace_current(sub, clone_ids);
+            app.replace_current(sub, done.clone_ids);
+            app.merge_private(done.private_sizes, done.private_missing, done.privates);
             app.cached_at = None;
             let saved = use_cache.then(|| save_tree(app, one_fs)).flatten();
             match saved {
@@ -429,8 +471,10 @@ fn save_tree(app: &mut App, one_fs: bool) -> Option<std::io::Error> {
     let root_path = app.root_path.clone();
     let (scan_time, errors, root_dev, clone_ids) = (app.scan_time, app.errors, app.root_dev, app.clone_ids);
     let (clones, clone_gaps) = (app.clones, app.clone_gaps);
+    let (private, private_sizes, private_missing) = (app.private, app.private_sizes, app.private_missing);
+    let privates = std::mem::take(&mut app.privates);
     // A cache holds the tree in du order, whatever the TUI shows.
-    app.in_du_order(|root| {
+    let (result, privates) = app.in_du_order(|root| {
         let snap = Snapshot {
             root: std::mem::replace(root, placeholder),
             cached_at: None,
@@ -440,9 +484,15 @@ fn save_tree(app: &mut App, one_fs: bool) -> Option<std::io::Error> {
             clones,
             clone_ids,
             clone_gaps,
+            private,
+            private_sizes,
+            private_missing,
+            privates,
         };
         let result = cache::save(&root_path, one_fs, &snap).err();
         *root = snap.root;
-        result
-    })
+        (result, snap.privates)
+    });
+    app.privates = privates;
+    result
 }

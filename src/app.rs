@@ -121,6 +121,14 @@ pub struct App {
     /// Files may share blocks on the scanned filesystem (see
     /// [`crate::scan::may_share_blocks`]).
     pub shares: bool,
+    /// Scans collect APFS private sizes (`--private`), rescans included.
+    pub private: bool,
+    /// Partial clones could be told apart (see `Snapshot::private_sizes`).
+    pub private_sizes: bool,
+    /// ... but some private size was not reported: none are shown.
+    pub private_missing: bool,
+    /// The private sizes (see [`crate::scan::PrivateSizes`]).
+    pub privates: crate::scan::PrivateSizes,
     /// Size shown and sorted by (`c` toggles).
     pub size_mode: SizeMode,
     pub last_key: Option<(String, &'static str)>,
@@ -166,6 +174,10 @@ impl App {
             clone_ids: false,
             clone_gaps: false,
             shares: true,
+            private: false,
+            private_sizes: false,
+            private_missing: false,
+            privates: Default::default(),
             size_mode: SizeMode::Du,
             last_key: None,
         };
@@ -185,6 +197,32 @@ impl App {
             p.push(&*n.name);
         }
         p
+    }
+
+    /// The current folder relative to the root, by the tree's names (as
+    /// [`crate::scan::PrivateSizes`] keys it).
+    pub fn current_rel(&self) -> PathBuf {
+        let mut p = PathBuf::new();
+        let mut n = &self.root;
+        for &i in &self.stack {
+            n = &n.children()[i];
+            p.push(&*n.name);
+        }
+        p
+    }
+
+    /// Take in the private sizes of a rescan of the current folder. Their
+    /// coverage of the whole tree: a rescan of the root replaces it, one of
+    /// a folder only adds to what was seen or missed.
+    pub fn merge_private(&mut self, sizes: bool, missing: bool, fresh: crate::scan::PrivateSizes) {
+        let below = self.current_rel();
+        if self.stack.is_empty() {
+            (self.private_sizes, self.private_missing) = (sizes, missing);
+        } else {
+            self.private_sizes |= sizes;
+            self.private_missing |= missing;
+        }
+        self.privates.replace_below(&below, fresh);
     }
 
     /// The current folder's real path on disk, for filesystem operations
@@ -847,6 +885,34 @@ mod tests {
         let names = |n: &Node| n.children().iter().map(|c| c.name.clone()).collect::<Vec<_>>();
         assert_eq!(names(a), names(b), "order under {}", a.name);
         a.children().iter().zip(b.children()).for_each(|(x, y)| same(x, y));
+    }
+
+    /// `r` keeps private sizes of the rest of the tree, replaces the
+    /// rescanned folder's, and never turns incomplete coverage complete.
+    #[test]
+    fn rescan_merges_private_sizes() {
+        use crate::scan::PrivateSizes;
+        let root = temp("private");
+        fs::create_dir_all(root.join("sub")).unwrap();
+        fs::write(root.join("f"), b"x").unwrap();
+        fs::write(root.join("sub/g"), b"x").unwrap();
+        let table = |e: &[(&str, u64)]| PrivateSizes(e.iter().map(|&(p, b)| (p.split('/').collect(), b)).collect());
+        let mut app = App::new(full(&root), root.clone(), Duration::ZERO, 0);
+        (app.private_sizes, app.privates) = (true, table(&[("f", 1), ("sub/g", 2)]));
+        app.go_to(&["sub".into()]);
+        // A folder whose lookups the volume could not answer.
+        app.merge_private(true, true, table(&[]));
+        assert_eq!(app.privates, table(&[("f", 1)]));
+        assert!(app.private_missing);
+        // A later complete rescan of a folder does not hide that.
+        app.merge_private(true, false, table(&[("g", 3)]));
+        assert_eq!(app.privates, table(&[("f", 1), ("sub/g", 3)]));
+        assert!(app.private_sizes && app.private_missing);
+        // A rescan of the root replaces the coverage.
+        app.leave();
+        app.merge_private(true, false, table(&[("f", 4)]));
+        assert_eq!(app.privates, table(&[("f", 4)]));
+        assert!(app.private_sizes && !app.private_missing);
     }
 
     /// `r` splices a rescan of the current folder; the result must equal a
