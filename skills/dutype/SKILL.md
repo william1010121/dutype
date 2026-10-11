@@ -17,7 +17,8 @@ dutype --json --top 50 PATH               # longer lists
 dutype --json --category node_modules PATH   # every node_modules with its size
 dutype --json --category "Python env" ~      # every venv / conda env
 dutype --json --category Video ~/Movies      # biggest video files
-dutype --json --size-mode dedup PATH      # rank by size with APFS clones counted once
+dutype --json --clones PATH               # macOS: also detect APFS clones (slower)
+dutype --json --size-mode dedup PATH      # rank by size with APFS clones counted once (implies --clones)
 dutype --report PATH                      # same data as plain text
 dutype --dump-config                      # list all categories and rules
 ```
@@ -49,7 +50,10 @@ If `dutype` is not installed, run it through npx with the same arguments:
 
 `size_bytes` is what `du` reports. On macOS, APFS clones (made by uv, bun,
 pnpm, `cp -c`, Finder Duplicate) share blocks, so `size_bytes` can be far
-more than deleting would free:
+more than deleting would free. Clone detection is opt-in because it slows the
+scan: on macOS, pass `--clones` (MCP: `clones: true`) whenever you will tell
+the user how much a deletion frees. Without it, `freeable_min_bytes` is
+`null` on macOS and `accounting.clone_detection` is `"off"`.
 
 - `freeable_min_bytes`: at least this much is freed by deleting the item.
   Use it, not `size_bytes`, when you tell the user how much a cleanup frees.
@@ -58,8 +62,9 @@ more than deleting would free:
 - `dedup_bytes`: size with each clone family counted once; it adds up like
   `size_bytes`. `clone_shared_bytes = size_bytes - dedup_bytes`.
 - `accounting.clone_detection` is `"apfs-full"` when clones were detected,
-  `"unsupported"` elsewhere (then `dedup_bytes == size_bytes` and only hard
-  links make `freeable_min_bytes` smaller). `accounting.caveats` lists what is
+  `"unsupported"` when `--clones` was given but the filesystem has no clone
+  information (then `dedup_bytes == size_bytes` and only hard links make
+  `freeable_min_bytes` smaller), `"off"` without `--clones`. `accounting.caveats` lists what is
   not considered, e.g. APFS snapshots: freed space may appear only after Time
   Machine local snapshots expire.
 
@@ -83,7 +88,8 @@ user wants the space back.
 ## MCP
 
 `dutype --mcp` is an MCP server on stdio with two read-only tools,
-`disk_usage(path, top?, cross_fs?, refresh?, size_mode?)` and
-`find_by_category(path, category, top?, cross_fs?, refresh?, size_mode?)`, with
-the same fields as `--json`. `size_mode` is `"du"` (default) or `"dedup"`.
+`disk_usage(path, top?, cross_fs?, refresh?, clones?, size_mode?)` and
+`find_by_category(path, category, top?, cross_fs?, refresh?, clones?, size_mode?)`,
+with the same fields as `--json`. `size_mode` is `"du"` (default) or `"dedup"`
+(implies `clones: true`).
 Claude Code: `claude mcp add dutype -- npx -y dutype --mcp`.
