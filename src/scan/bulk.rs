@@ -138,7 +138,7 @@ impl Cursor<'_> {
 
 /// One entry, laid out as described in getattrlist(2): length, returned
 /// attribute set, then each returned attribute in bit order, group by group
-/// (common, dir, file). `None` for an entry the kernel could not read.
+/// (common, dir, file). `None` for an entry with no usable name or metadata.
 fn parse(fd: &Fd, d: &[u8]) -> Option<Entry> {
     let mut c = Cursor { d, at: 4 };
     let common = c.u32()?;
@@ -147,9 +147,10 @@ fn parse(fd: &Fd, d: &[u8]) -> Option<Entry> {
     let file_attrs = c.u32()?;
     let _fork = c.u32()?;
     // ATTR_CMN_ERROR comes right after the returned set.
-    if common & ATTR_CMN_ERROR != 0 && c.u32()? != 0 {
-        return None;
-    }
+    let error = match common & ATTR_CMN_ERROR != 0 {
+        true => c.u32()?,
+        false => 0,
+    };
     if common & libc::ATTR_CMN_NAME == 0 {
         return None;
     }
@@ -160,8 +161,9 @@ fn parse(fd: &Fd, d: &[u8]) -> Option<Entry> {
     // The length includes the terminating NUL.
     let raw = d.get(start..start.checked_add(len)?)?;
     let name = OsStr::from_bytes(raw.strip_suffix(&[0]).unwrap_or(raw));
+    // An entry the kernel could not read in bulk may still `lstat`.
     let need = libc::ATTR_CMN_DEVID | libc::ATTR_CMN_OBJTYPE | libc::ATTR_CMN_FILEID;
-    if common & need != need {
+    if error != 0 || common & need != need {
         return lstat_at(fd, name);
     }
     // dev_t is signed; widen it like `MetadataExt::dev` does.
@@ -230,21 +232,20 @@ fn lstat_at(fd: &Fd, name: &OsStr) -> Option<Entry> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn missing_common_attrs_fall_back_to_lstat() {
-        let d = std::env::temp_dir().join(format!("dutype-bulk-attrs-{}", std::process::id()));
+    /// A directory holding `f.bin` and a synthetic bulk entry for it with
+    /// the given common attributes (and `error` if ATTR_CMN_ERROR is set):
+    /// length, returned set, then the name's attrreference pointing just
+    /// past itself. Later attributes are left out.
+    fn synthetic(tag: &str, common: u32, error: u32) -> (std::path::PathBuf, Fd, Vec<u8>) {
+        let d = std::env::temp_dir().join(format!("dutype-bulk-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(d.join("f.bin"), vec![1u8; 10_000]).unwrap();
         let cpath = CString::new(d.as_os_str().as_bytes()).unwrap();
         let fd = Fd(unsafe { libc::open(cpath.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY) });
         assert!(fd.0 >= 0);
-        // An entry with a name but no ATTR_CMN_FILEID: length, returned set,
-        // then the name's attrreference pointing just past itself.
         let name = b"f.bin\0";
         let mut e = Vec::new();
-        let common =
-            libc::ATTR_CMN_RETURNED_ATTRS | libc::ATTR_CMN_NAME | libc::ATTR_CMN_DEVID | libc::ATTR_CMN_OBJTYPE;
         for w in [
             0,
             common,
@@ -255,11 +256,31 @@ mod tests {
         ] {
             e.extend_from_slice(&w.to_ne_bytes());
         }
+        if common & ATTR_CMN_ERROR != 0 {
+            e.extend_from_slice(&error.to_ne_bytes());
+        }
         e.extend_from_slice(&8i32.to_ne_bytes());
         e.extend_from_slice(&(name.len() as u32).to_ne_bytes());
         e.extend_from_slice(name);
         let len = e.len() as u32;
         e[..4].copy_from_slice(&len.to_ne_bytes());
+        (d, fd, e)
+    }
+
+    #[test]
+    fn missing_common_attrs_fall_back_to_lstat() {
+        let common =
+            libc::ATTR_CMN_RETURNED_ATTRS | libc::ATTR_CMN_NAME | libc::ATTR_CMN_DEVID | libc::ATTR_CMN_OBJTYPE;
+        let (d, fd, e) = synthetic("attrs", common, 0);
+        let got = parse(&fd, &e).expect("entry kept");
+        assert_eq!(Some(got), lstat_at(&fd, OsStr::new("f.bin")));
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn entry_error_falls_back_to_lstat() {
+        let common = libc::ATTR_CMN_RETURNED_ATTRS | libc::ATTR_CMN_NAME | ATTR_CMN_ERROR;
+        let (d, fd, e) = synthetic("error", common, libc::EIO as u32);
         let got = parse(&fd, &e).expect("entry kept");
         assert_eq!(Some(got), lstat_at(&fd, OsStr::new("f.bin")));
         std::fs::remove_dir_all(&d).unwrap();
