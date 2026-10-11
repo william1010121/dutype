@@ -272,15 +272,13 @@ impl App {
 
     /// Replace the current folder with a fresh scan of it, update every
     /// ancestor's totals and order, and keep the cursor on the same entries.
-    /// `clone_ids` / `clone_gaps`: what the rescan saw (see
-    /// `Progress::clone_ids` and `Progress::clone_gaps`).
-    pub fn replace_current(&mut self, mut fresh: Node, clone_ids: bool, clone_gaps: bool) {
+    /// `clone_ids`: the rescan saw APFS clone flags (see
+    /// `Progress::clone_ids`).
+    pub fn replace_current(&mut self, mut fresh: Node, clone_ids: bool) {
         // A rescan of the root replaces what the tree saw; below it adds.
-        if self.stack.is_empty() {
-            (self.clone_ids, self.clone_gaps) = (clone_ids, clone_gaps);
-        } else {
-            self.clone_ids |= clone_ids;
-            self.clone_gaps |= clone_gaps;
+        match self.stack.is_empty() {
+            true => self.clone_ids = clone_ids,
+            false => self.clone_ids |= clone_ids,
         }
         let place = self.remember();
 
@@ -291,6 +289,7 @@ impl App {
         let size_delta = new.size as i128 - old.size as i128;
         let files_delta = new.files() as i128 - old.files() as i128;
         let errors_delta = new.errors() as i128 - old.errors() as i128;
+        let gaps_delta = new.clone_gaps() as i128 - old.clone_gaps() as i128;
         let free_delta =
             new.dir.as_ref().map_or(0, |d| d.free_base) as i128 - old.dir.as_ref().map_or(0, |d| d.free_base) as i128;
         let cats_delta: Vec<i128> = new
@@ -306,6 +305,7 @@ impl App {
             if let Some(dir) = node.dir.as_mut() {
                 shift(&mut dir.files, files_delta);
                 shift(&mut dir.errors, errors_delta);
+                shift(&mut dir.clone_gaps, gaps_delta);
                 shift(&mut dir.free_base, free_delta);
                 dir.cats.iter_mut().zip(&cats_delta).for_each(|(c, d)| shift(c, *d));
                 // Clones may have appeared or gone below.
@@ -325,8 +325,9 @@ impl App {
                 dir.sort_children(by_dedup);
             }
         }
-        // The subtree's old errors were replaced, not added to.
+        // The subtree's old errors and clone gaps were replaced, not added to.
         self.errors = self.root.errors();
+        self.clone_gaps = self.root.clone_gaps() > 0;
         // Free the old subtree off the UI thread; it can be large.
         std::thread::spawn(move || drop(old));
         self.restore(place);
@@ -868,7 +869,7 @@ mod tests {
             None,
         )
         .unwrap();
-        app.replace_current(fresh, false, false);
+        app.replace_current(fresh, false);
 
         same(&app.root, &full(&root));
         assert_eq!(app.location(), vec![Step::from("small"), Step::from("inner")]);
@@ -892,7 +893,7 @@ mod tests {
             None,
         )
         .unwrap();
-        app.replace_current(fresh, false, false);
+        app.replace_current(fresh, false);
         same(&app.root, &full(&root));
     }
 
@@ -925,12 +926,12 @@ mod tests {
         };
         for _ in 0..3 {
             let fresh = rescan(&app);
-            app.replace_current(fresh, false, false);
+            app.replace_current(fresh, false);
             assert_eq!(app.errors, 1);
         }
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
         let fresh = rescan(&app);
-        app.replace_current(fresh, false, false);
+        app.replace_current(fresh, false);
         assert_eq!(app.errors, 0);
     }
 
@@ -1214,18 +1215,18 @@ mod tests {
         // (here as if the first scan had seen none).
         app.clone_ids = false;
         let saw = |f: &std::sync::atomic::AtomicBool| f.load(std::sync::atomic::Ordering::Relaxed);
-        app.replace_current(fresh, saw(&progress.clone_ids), saw(&progress.clone_gaps));
+        app.replace_current(fresh, saw(&progress.clone_ids));
         assert!(!app.clone_gaps);
 
-        // At the root, a rescan replaces the coverage state instead.
+        // Gaps follow the tree: a subtree that had files of unknown clone
+        // state, rescanned with none, leaves no gap behind.
+        node_at_mut(&mut app.root, &app.stack).dir.as_mut().unwrap().clone_gaps = 2;
+        app.root.dir.as_mut().unwrap().clone_gaps = 2;
         app.clone_gaps = true;
-        while !app.stack.is_empty() {
-            app.leave();
-        }
-        let fresh = scan_subtree(&root, true, true, &Progress::default(), None, None).unwrap();
-        app.replace_current(fresh, true, false);
-        assert!(app.clone_ids && !app.clone_gaps);
-        app.go_to(&["copies".into()]);
+        let fresh = scan_subtree(&app.fs_path().unwrap(), true, true, &Progress::default(), None, None).unwrap();
+        app.replace_current(fresh, true);
+        assert!(!app.clone_gaps);
+        assert_eq!(app.root.clone_gaps(), 0);
         assert!(app.clone_ids);
         assert_eq!(app.root.dedup(), 10 << 20);
         assert_eq!(app.current().name.as_ref(), "copies");
@@ -1272,7 +1273,7 @@ mod tests {
         }
         app.go_to(&["p".into()]);
         let fresh = scan_subtree(&app.fs_path().unwrap(), true, true, &Progress::default(), None, None).unwrap();
-        app.replace_current(fresh, true, false);
+        app.replace_current(fresh, true);
         assert!(!app.root.clone);
         assert_eq!(names(&app), ["p", "q"]);
         fs::remove_dir_all(&root).unwrap();

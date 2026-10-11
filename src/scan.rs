@@ -50,6 +50,9 @@ pub struct DirInfo {
     pub dup: u64,
     /// Files of this dir with hard links or clone siblings, by child index.
     pub shared: Box<[Shared]>,
+    /// Files in this subtree whose clone flags could not be read (with
+    /// --clones), so a subtree rescan can replace its share of the gaps.
+    pub clone_gaps: u64,
 }
 
 /// A file of a [`DirInfo`] that shares blocks with other files: hard links
@@ -86,6 +89,11 @@ impl Node {
     /// Unreadable entries in this subtree.
     pub fn errors(&self) -> u64 {
         self.dir.as_ref().map_or(0, |d| d.errors)
+    }
+
+    /// Files in this subtree whose clone flags could not be read.
+    pub fn clone_gaps(&self) -> u64 {
+        self.dir.as_ref().map_or(0, |d| d.clone_gaps)
     }
 
     pub fn files(&self) -> u64 {
@@ -221,25 +229,24 @@ mod platform {
         let mut r = super::read_entries_std(path, cancel, out);
         // On macOS any volume may share blocks (APFS clones, server-side
         // copies); without bulk flags a file's clone state is unknown.
-        if clones
-            && cfg!(target_os = "macos")
-            && unknown_clone_state(&mut out[first..])
-            && let Ok(stats) = &mut r
-        {
-            stats.clone_gaps = true;
+        if clones && cfg!(target_os = "macos") {
+            let gaps = unknown_clone_state(&mut out[first..]);
+            if let Ok(stats) = &mut r {
+                stats.clone_gaps += gaps;
+            }
         }
         r
     }
 
     /// Files whose clone state could not be read: they may share blocks, so
-    /// they are never counted as freeable. Whether there were any.
-    pub fn unknown_clone_state(entries: &mut [Entry]) -> bool {
-        let mut any = false;
+    /// they are never counted as freeable. Returns how many.
+    pub fn unknown_clone_state(entries: &mut [Entry]) -> u64 {
+        let mut n = 0;
         for e in entries.iter_mut().filter(|e| !e.dir) {
             e.may_share = true;
-            any = true;
+            n += 1;
         }
-        any
+        n
     }
 
     /// Files in the APFS full-clone family of the file at `path`, where the
@@ -487,9 +494,9 @@ pub(crate) struct ReadStats {
     pub errors: u64,
     /// The filesystem reported clone flags (APFS).
     pub clone_ids: bool,
-    /// With --clones, some files' clone flags could not be read (another
+    /// With --clones, files whose clone flags could not be read (another
     /// volume, a reader without them): those count as possibly shared.
-    pub clone_gaps: bool,
+    pub clone_gaps: u64,
 }
 
 /// Reads `path` with `read_dir` + `lstat`, appending to `out`. Stops early
@@ -718,7 +725,8 @@ fn scan_dir(
     if stats.clone_ids {
         ctx.progress.clone_ids.store(true, Ordering::Relaxed);
     }
-    if stats.clone_gaps {
+    let mut clone_gaps = stats.clone_gaps;
+    if clone_gaps > 0 {
         ctx.progress.clone_gaps.store(true, Ordering::Relaxed);
     }
     let mut errors = stats.errors;
@@ -817,6 +825,7 @@ fn scan_dir(
             Some(d) => {
                 cats.iter_mut().zip(d.cats.iter()).for_each(|(a, b)| *a += b);
                 errors += d.errors;
+                clone_gaps += d.clone_gaps;
                 free_base += d.free_base;
             }
             None => cats[c.cat.index()] += c.size,
@@ -831,6 +840,7 @@ fn scan_dir(
         group_free: 0,
         dup: 0,
         shared: shared.into_boxed_slice(),
+        clone_gaps,
     };
     dir.sort_children(false);
 
@@ -951,7 +961,7 @@ mod share_tests {
             may_share: false,
         };
         let mut v = vec![entry("f", false), entry("d", true)];
-        assert!(platform::unknown_clone_state(&mut v));
+        assert_eq!(platform::unknown_clone_state(&mut v), 1);
         assert_eq!((v[0].may_share, v[1].may_share), (true, false));
     }
 

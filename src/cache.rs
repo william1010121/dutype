@@ -286,7 +286,7 @@ impl<W: Write> Writer<W> {
     }
 
     /// Pre-order: name, size, category, flags, then for dirs the children,
-    /// the dir's own error count and its shared-block records. Per-dir
+    /// the dir's own error and clone-gap counts and its shared-block records. Per-dir
     /// category totals, file counts, error totals and freeable bytes are
     /// derived again on load.
     fn node(&mut self, n: &Node) -> io::Result<()> {
@@ -305,6 +305,8 @@ impl<W: Write> Writer<W> {
             }
             let child_errors: u64 = d.children.iter().map(Node::errors).sum();
             self.varint(d.errors.saturating_sub(child_errors))?;
+            let child_gaps: u64 = d.children.iter().map(Node::clone_gaps).sum();
+            self.varint(d.clone_gaps.saturating_sub(child_gaps))?;
             self.varint(d.shared.len() as u64)?;
             for s in &d.shared {
                 for v in [
@@ -389,12 +391,14 @@ impl Reader<'_> {
             // Checked arithmetic throughout: a damaged file is a miss, never
             // a panic or a wrapped (wrong) total.
             let (mut files, mut child_bytes, mut errors, mut free) = (0u64, 0u64, 0u64, 0u64);
+            let mut gaps = 0u64;
             let (mut hardlink, mut clone) = (false, false);
             for _ in 0..count {
                 let c = self.node(depth + 1)?;
                 child_bytes = child_bytes.checked_add(c.size)?;
                 files = files.checked_add(c.files())?;
                 errors = errors.checked_add(c.errors())?;
+                gaps = gaps.checked_add(c.clone_gaps())?;
                 hardlink |= c.hardlink;
                 clone |= c.clone;
                 match &c.dir {
@@ -417,6 +421,7 @@ impl Reader<'_> {
             let own = size.checked_sub(child_bytes)?;
             cats[cat.index()] = cats[cat.index()].checked_add(own)?;
             let errors = errors.checked_add(self.varint()?)?;
+            let clone_gaps = gaps.checked_add(self.varint()?)?;
             let shared_count = usize::try_from(self.varint()?).ok()?;
             if shared_count > children.len() {
                 return None;
@@ -455,6 +460,7 @@ impl Reader<'_> {
                 cats,
                 files,
                 errors,
+                clone_gaps,
                 children,
                 free_base: free.checked_add(own)?,
                 group_free: 0,

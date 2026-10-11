@@ -250,7 +250,7 @@ fn parse(fd: &Fd, d: &[u8], clones: bool, stats: &mut ReadStats) -> Option<Entry
     let flags = match ext_attrs & libc::ATTR_CMNEXT_EXT_FLAGS != 0 {
         true => c.u64()?,
         false if clones => {
-            stats.clone_gaps = true;
+            stats.clone_gaps += 1;
             EF_MAY_SHARE_BLOCKS
         }
         false => 0,
@@ -275,7 +275,7 @@ fn parse(fd: &Fd, d: &[u8], clones: bool, stats: &mut ReadStats) -> Option<Entry
 /// in clone coverage.
 fn fallback(fd: &Fd, name: &OsStr, clones: bool, stats: &mut ReadStats) -> Option<Entry> {
     let e = lstat_at(fd, name, clones)?;
-    stats.clone_gaps |= clones && !e.dir;
+    stats.clone_gaps += (clones && !e.dir) as u64;
     Some(e)
 }
 
@@ -401,7 +401,7 @@ mod tests {
         let mut stats = ReadStats::default();
         let got = parse(&fd, &e, true, &mut stats).expect("entry kept");
         assert!(got.may_share && got.clone.is_none());
-        assert!(stats.clone_gaps);
+        assert_eq!(stats.clone_gaps, 1);
         assert!(!parse(&fd, &e, false, &mut ReadStats::default()).unwrap().may_share);
         std::fs::remove_dir_all(&d).unwrap();
     }
@@ -451,7 +451,7 @@ mod tests {
             |ext, flags, clones| parse(&fd, &file_record(ext, flags), clones, &mut ReadStats::default()).unwrap();
         let mut stats = ReadStats::default();
         parse(&fd, &file_record(0, 0), true, &mut stats).unwrap();
-        assert!(stats.clone_gaps && !stats.clone_ids);
+        assert!(stats.clone_gaps == 1 && !stats.clone_ids);
         let both = libc::ATTR_CMNEXT_CLONEID | libc::ATTR_CMNEXT_EXT_FLAGS;
         assert!(parse_rec(0, 0, true).may_share);
         assert!(!parse_rec(0, 0, false).may_share);

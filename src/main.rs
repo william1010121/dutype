@@ -396,9 +396,9 @@ fn rescan_current(
         return Ok(());
     }
     app.status = Some(match scanned {
-        Ok(Some((sub, took, _, (clone_ids, clone_gaps)))) => {
-            // replace_current swaps in the subtree's own error count.
-            app.replace_current(sub, clone_ids, clone_gaps);
+        Ok(Some((sub, took, _, (clone_ids, _)))) => {
+            // replace_current swaps in the subtree's own error and gap counts.
+            app.replace_current(sub, clone_ids);
             app.cached_at = None;
             let saved = use_cache.then(|| save_tree(app, one_fs)).flatten();
             match saved {

@@ -385,6 +385,7 @@ mod synthetic {
                 group_free: 0,
                 dup: 0,
                 shared: shared.into_boxed_slice(),
+                clone_gaps: 0,
             })),
         }
     }
