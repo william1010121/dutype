@@ -202,7 +202,7 @@ fn parse(fd: &Fd, d: &[u8], clones: bool, stats: &mut ReadStats) -> Option<Entry
     // An entry the kernel could not read in bulk may still `lstat`.
     let need = libc::ATTR_CMN_DEVID | libc::ATTR_CMN_OBJTYPE | libc::ATTR_CMN_FILEID;
     if error != 0 || common & need != need {
-        return lstat_at(fd, name, clones);
+        return fallback(fd, name, clones, stats);
     }
     // dev_t is signed; widen it like `MetadataExt::dev` does.
     let dev = c.u32()? as i32 as u64;
@@ -220,7 +220,7 @@ fn parse(fd: &Fd, d: &[u8], clones: bool, stats: &mut ReadStats) -> Option<Entry
         // A mount point reports the attributes of the filesystem below it;
         // `lstat` gives the mounted one, as a `read_dir` scan sees it.
         if mount & (libc::DIR_MNTSTATUS_MNTPOINT | DIR_MNTSTATUS_TRIGGER) != 0 || alloc.is_none() {
-            return lstat_at(fd, name, clones);
+            return fallback(fd, name, clones, stats);
         }
         return Some(Entry {
             name: name.to_os_string(),
@@ -235,11 +235,11 @@ fn parse(fd: &Fd, d: &[u8], clones: bool, stats: &mut ReadStats) -> Option<Entry
     }
     let nlink = match file_attrs & libc::ATTR_FILE_LINKCOUNT != 0 {
         true => c.u32()?,
-        false => return lstat_at(fd, name, clones),
+        false => return fallback(fd, name, clones, stats),
     };
     let alloc = match file_attrs & libc::ATTR_FILE_ALLOCSIZE != 0 {
         true => c.u64()?,
-        false => return lstat_at(fd, name, clones),
+        false => return fallback(fd, name, clones, stats),
     };
     let clone_id = match ext_attrs & libc::ATTR_CMNEXT_CLONEID != 0 {
         true => Some(c.u64()?),
@@ -271,6 +271,14 @@ fn parse(fd: &Fd, d: &[u8], clones: bool, stats: &mut ReadStats) -> Option<Entry
 
 /// Fallback for an entry whose bulk attributes are incomplete or describe
 /// another filesystem.
+/// [`lstat_at`] from [`parse`]: with `clones`, a file read this way is a gap
+/// in clone coverage.
+fn fallback(fd: &Fd, name: &OsStr, clones: bool, stats: &mut ReadStats) -> Option<Entry> {
+    let e = lstat_at(fd, name, clones)?;
+    stats.clone_gaps |= clones && !e.dir;
+    Some(e)
+}
+
 /// With `clones`, a file read this way has unknown clone flags, so it
 /// counts as one that may share blocks (never as freeable).
 fn lstat_at(fd: &Fd, name: &OsStr, clones: bool) -> Option<Entry> {
@@ -390,8 +398,10 @@ mod tests {
     fn fallback_entry_may_share_with_clones() {
         let common = libc::ATTR_CMN_RETURNED_ATTRS | libc::ATTR_CMN_NAME | ATTR_CMN_ERROR;
         let (d, fd, e) = synthetic("fallback-clones", common, libc::EIO as u32);
-        let got = parse(&fd, &e, true, &mut ReadStats::default()).expect("entry kept");
+        let mut stats = ReadStats::default();
+        let got = parse(&fd, &e, true, &mut stats).expect("entry kept");
         assert!(got.may_share && got.clone.is_none());
+        assert!(stats.clone_gaps);
         assert!(!parse(&fd, &e, false, &mut ReadStats::default()).unwrap().may_share);
         std::fs::remove_dir_all(&d).unwrap();
     }
