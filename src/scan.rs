@@ -5,6 +5,7 @@ use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::ffi::OsString;
 use std::fs::{self, Metadata};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -77,11 +78,27 @@ pub struct Progress {
 
 #[cfg(unix)]
 mod platform {
+    use super::Entry;
     use std::ffi::OsStr;
     use std::fs::Metadata;
+    use std::io;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::MetadataExt;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::AtomicBool;
+
+    #[cfg(target_os = "macos")]
+    pub(super) mod bulk;
+
+    /// Entries of the directory `path`: from `getattrlistbulk` on macOS when
+    /// the volume supports it, else [`super::read_entries_std`].
+    pub fn read_entries(path: &Path, cancel: &AtomicBool, out: &mut Vec<Entry>) -> io::Result<u64> {
+        #[cfg(target_os = "macos")]
+        if let Some(r) = bulk::read_entries(path, cancel, out) {
+            return r;
+        }
+        super::read_entries_std(path, cancel, out)
+    }
 
     pub fn allocated(m: &Metadata) -> u64 {
         m.blocks() * 512
@@ -152,9 +169,16 @@ mod platform {
 
 #[cfg(not(unix))]
 mod platform {
+    use super::Entry;
     use std::ffi::OsStr;
     use std::fs::{self, Metadata};
+    use std::io;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::AtomicBool;
+
+    pub fn read_entries(path: &Path, cancel: &AtomicBool, out: &mut Vec<Entry>) -> io::Result<u64> {
+        super::read_entries_std(path, cancel, out)
+    }
 
     pub fn allocated(m: &Metadata) -> u64 {
         m.len()
@@ -187,6 +211,50 @@ mod platform {
     }
 }
 
+/// One directory entry with the metadata the scan needs, from `lstat` or,
+/// on macOS, from `getattrlistbulk`.
+#[cfg_attr(test, derive(Debug, PartialEq))]
+pub(crate) struct Entry {
+    /// Raw name: paths must be built from it (names need not be UTF-8).
+    pub name: OsString,
+    pub dir: bool,
+    /// Allocated bytes (`st_blocks * 512` on unix).
+    pub alloc: u64,
+    pub dev: u64,
+    /// `(dev, ino)` of a non-directory with more than one link.
+    pub link: Option<(u64, u64)>,
+}
+
+impl Entry {
+    fn from_metadata(name: OsString, m: &Metadata) -> Entry {
+        Entry {
+            name,
+            dir: m.is_dir(),
+            alloc: platform::allocated(m),
+            dev: platform::device(m),
+            link: platform::hardlink_id(m),
+        }
+    }
+}
+
+/// Reads `path` with `read_dir` + `lstat`, appending to `out`; returns how
+/// many entries could not be read. Stops early once `cancel` is set.
+fn read_entries_std(path: &Path, cancel: &AtomicBool, out: &mut Vec<Entry>) -> io::Result<u64> {
+    let mut errors = 0;
+    for (i, e) in fs::read_dir(path)?.enumerate() {
+        // Huge flat directories: notice a cancel without reading them all.
+        if i % 256 == 255 && cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        // DirEntry::metadata does not follow symlinks.
+        match e.and_then(|e| Ok((e.file_name(), e.metadata()?))) {
+            Ok((n, m)) => out.push(Entry::from_metadata(n, &m)),
+            Err(_) => errors += 1,
+        }
+    }
+    Ok(errors)
+}
+
 struct Ctx<'a> {
     progress: &'a Progress,
     root_dev: u64,
@@ -197,18 +265,14 @@ struct Ctx<'a> {
 }
 
 impl Ctx<'_> {
-    fn error(&self) {
-        self.progress.errors.fetch_add(1, Ordering::Relaxed);
-    }
-
     /// Allocated size, counting each hard-linked inode only once.
-    fn alloc_size(&self, m: &Metadata) -> u64 {
-        if let Some(id) = platform::hardlink_id(m)
+    fn alloc_size(&self, alloc: u64, link: Option<(u64, u64)>) -> u64 {
+        if let Some(id) = link
             && !self.seen_inodes.lock().unwrap().insert(id)
         {
             return 0;
         }
-        platform::allocated(m)
+        alloc
     }
 }
 
@@ -313,7 +377,7 @@ fn scan_root(
         let cat = reg().classify_file(&name);
         return Ok(Node {
             name,
-            size: ctx.alloc_size(&meta),
+            size: ctx.alloc_size(platform::allocated(&meta), platform::hardlink_id(&meta)),
             cat,
             special: false,
             hardlink: platform::hardlink_id(&meta).is_some(),
@@ -322,7 +386,8 @@ fn scan_root(
         });
     }
     let parent = root.parent().map(file_name_of).unwrap_or_default();
-    let mut node = scan_dir(root, file_name_of(root).into(), &parent, inherited, &meta, &ctx);
+    let own_size = platform::allocated(&meta);
+    let mut node = scan_dir(root, file_name_of(root).into(), &parent, inherited, own_size, &ctx);
     node.name = name;
     Ok(node)
 }
@@ -332,41 +397,18 @@ fn scan_dir(
     name: Box<str>,
     parent_name: &str,
     inherited: Option<Category>,
-    meta: &Metadata,
+    own_size: u64,
     ctx: &Ctx,
 ) -> Node {
     let reg = reg();
-    // Raw names: paths must be built from them (names need not be UTF-8);
-    // only display and classification use a lossy string.
-    let mut entries: Vec<(OsString, Metadata)> = Vec::new();
-    let mut errors = 0u64;
+    let mut entries: Vec<Entry> = Vec::new();
     // A cancelled scan stops descending; its partial result is discarded.
-    let read = match ctx.progress.cancel.load(Ordering::Relaxed) {
-        true => Ok(None),
-        false => fs::read_dir(path).map(Some),
+    let mut errors = match ctx.progress.cancel.load(Ordering::Relaxed) {
+        true => 0,
+        false => platform::read_entries(path, &ctx.progress.cancel, &mut entries).unwrap_or(1),
     };
-    match read {
-        Ok(Some(rd)) => {
-            for (i, e) in rd.enumerate() {
-                // Huge flat directories: notice a cancel without reading them all.
-                if i % 256 == 255 && ctx.progress.cancel.load(Ordering::Relaxed) {
-                    break;
-                }
-                // DirEntry::metadata does not follow symlinks.
-                match e.and_then(|e| Ok((e.file_name(), e.metadata()?))) {
-                    Ok((n, m)) => entries.push((n, m)),
-                    Err(_) => {
-                        ctx.error();
-                        errors += 1;
-                    }
-                }
-            }
-        }
-        Ok(None) => {}
-        Err(_) => {
-            ctx.error();
-            errors += 1;
-        }
+    if errors > 0 {
+        ctx.progress.errors.fetch_add(errors, Ordering::Relaxed);
     }
 
     // Inside a special dir everything inherits it, unless that category is weak
@@ -374,25 +416,25 @@ fn scan_dir(
     let own = match inherited {
         Some(c) if !c.is_weak() => None,
         // Rule names are UTF-8, so a non-UTF-8 entry can never match one.
-        _ => reg.special_dir(&name, parent_name, entries.iter().filter_map(|(n, _)| n.to_str())),
+        _ => reg.special_dir(&name, parent_name, entries.iter().filter_map(|e| e.name.to_str())),
     };
     let effective = own.or(inherited);
 
-    let (dirs, files): (Vec<_>, Vec<_>) = entries.into_iter().partition(|(_, m)| m.is_dir());
+    let (dirs, files): (Vec<_>, Vec<_>) = entries.into_iter().partition(|e| e.dir);
 
     let mut children: Vec<Node> = dirs
         .into_par_iter()
-        .filter(|(_, m)| !ctx.one_fs || platform::device(m) == ctx.root_dev)
+        .filter(|e| !ctx.one_fs || e.dev == ctx.root_dev)
         // Compare the name first so the full path is only built for a likely match.
-        .filter(|(n, _)| {
+        .filter(|e| {
             ctx.exclude
                 .as_ref()
-                .is_none_or(|(name, full)| n != name || path.join(n) != *full)
+                .is_none_or(|(name, full)| e.name != *name || path.join(&e.name) != *full)
         })
-        .map(|(n, m)| {
-            let child_path = path.join(&n);
-            let (display, lossy) = display_name(n);
-            let mut node = scan_dir(&child_path, display, &name, effective, &m, ctx);
+        .map(|e| {
+            let child_path = path.join(&e.name);
+            let (display, lossy) = display_name(e.name);
+            let mut node = scan_dir(&child_path, display, &name, effective, e.alloc, ctx);
             node.lossy = lossy;
             node
         })
@@ -400,14 +442,14 @@ fn scan_dir(
 
     // Progress is updated once per directory to keep atomics off the hot path.
     let (file_entries, mut file_bytes) = (files.len() as u64, 0);
-    for (i, (n, m)) in files.into_iter().enumerate() {
+    for (i, e) in files.into_iter().enumerate() {
         if i % 256 == 255 && ctx.progress.cancel.load(Ordering::Relaxed) {
             break;
         }
-        let hardlink = platform::hardlink_id(&m).is_some();
-        let size = ctx.alloc_size(&m);
+        let hardlink = e.link.is_some();
+        let size = ctx.alloc_size(e.alloc, e.link);
         file_bytes += size;
-        let (name, lossy) = display_name(n);
+        let (name, lossy) = display_name(e.name);
         let cat = effective.unwrap_or_else(|| reg.classify_file(&name));
         children.push(Node {
             name,
@@ -422,7 +464,6 @@ fn scan_dir(
     ctx.progress.files.fetch_add(file_entries, Ordering::Relaxed);
     ctx.progress.bytes.fetch_add(file_bytes, Ordering::Relaxed);
 
-    let own_size = ctx.alloc_size(meta);
     let mut cats = vec![0u64; reg.len()].into_boxed_slice();
     cats[effective.unwrap_or(reg.other()).index()] += own_size;
     let mut size = own_size;
@@ -537,5 +578,76 @@ mod escape_tests {
         assert_ne!(escape(b"d\xffir"), escape(b"d\xfeir"));
         assert_eq!(escape(b"d\xffir"), "d\\xffir");
         assert!(unescape("bad\\q").is_none());
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod bulk_tests {
+    use super::*;
+    use std::process::Command;
+
+    fn tree(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("dutype-bulk-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(d.join("sub/deeper")).unwrap();
+        fs::write(d.join("small.txt"), b"hi").unwrap();
+        fs::write(d.join("sub/big.bin"), vec![7u8; 3 << 20]).unwrap();
+        fs::write(d.join("sub/deeper/empty"), b"").unwrap();
+        fs::hard_link(d.join("sub/big.bin"), d.join("link.bin")).unwrap();
+        std::os::unix::fs::symlink("sub", d.join("to-sub")).unwrap();
+        // A clone: its own inode, full st_blocks (counted again, like du).
+        assert!(
+            Command::new("cp")
+                .arg("-c")
+                .arg(d.join("sub/big.bin"))
+                .arg(d.join("clone.bin"))
+                .status()
+                .unwrap()
+                .success()
+        );
+        for i in 0..600 {
+            fs::write(d.join(format!("sub/deeper/f{i}")), vec![1u8; i * 100]).unwrap();
+        }
+        d
+    }
+
+    fn sorted(mut v: Vec<Entry>) -> Vec<Entry> {
+        v.sort_by(|a, b| a.name.cmp(&b.name));
+        v
+    }
+
+    #[test]
+    fn bulk_matches_lstat() {
+        let d = tree("lstat");
+        let cancel = AtomicBool::new(false);
+        for dir in [d.clone(), d.join("sub"), d.join("sub/deeper")] {
+            let (mut a, mut b) = (Vec::new(), Vec::new());
+            assert_eq!(read_entries_std(&dir, &cancel, &mut a).unwrap(), 0);
+            assert_eq!(platform::bulk::read_entries(&dir, &cancel, &mut b).unwrap().unwrap(), 0);
+            assert_eq!(sorted(a), sorted(b), "{}", dir.display());
+        }
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn total_matches_du() {
+        let d = tree("du");
+        let node = scan_excluding(&d, true, &Progress::default(), None).unwrap();
+        let out = Command::new("/usr/bin/du").arg("-skx").arg(&d).output().unwrap();
+        let kib: u64 = String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(node.size, kib * 1024);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn missing_dir_is_an_error() {
+        let mut v = Vec::new();
+        let r = platform::bulk::read_entries(Path::new("/nonexistent-dutype"), &AtomicBool::new(false), &mut v);
+        assert!(r.unwrap().is_err());
     }
 }
