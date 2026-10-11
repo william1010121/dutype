@@ -26,14 +26,19 @@ fn tools() -> Value {
                 (node_modules, Python envs, .git, build output, caches, ...). Returns totals, \
                 every category's share, the biggest children, the biggest special \
                 directories (cleanup candidates) and the biggest files. Sizes are bytes \
-                allocated on disk. Read-only.",
+                allocated on disk (size_bytes, like du). With clones: true (slower), on APFS \
+                dedup_bytes counts each clone family once and freeable_min_bytes is a lower \
+                bound of what deleting an item frees; without it freeable_min_bytes is null on \
+                macOS and leaves out hard-linked files. See accounting. Read-only.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "Directory to scan. Absolute paths are best; ~ is expanded."},
                     "top": {"type": "integer", "minimum": 1, "maximum": 500, "default": 20, "description": "Length of each list."},
                     "cross_fs": {"type": "boolean", "default": false, "description": "Descend into other mounted filesystems."},
-                    "refresh": {"type": "boolean", "default": false, "description": "Rescan even if a cached scan exists (only matters with dutype --mcp --cache; see cached_at in the result)."}
+                    "refresh": {"type": "boolean", "default": false, "description": "Rescan even if a cached scan exists (only matters with dutype --mcp --cache; see cached_at in the result)."},
+                    "clones": {"type": "boolean", "default": false, "description": "Detect APFS clones (macOS; makes the scan slower): fills dedup_bytes and freeable_min_bytes."},
+                    "size_mode": {"type": "string", "enum": ["du", "dedup"], "default": "du", "description": "Rank lists by allocated size (du) or by size with APFS clones counted once (dedup; implies clones)."}
                 },
                 "required": ["path"]
             },
@@ -53,7 +58,9 @@ fn tools() -> Value {
                     "category": {"type": "string", "enum": categories, "description": "Category name."},
                     "top": {"type": "integer", "minimum": 1, "maximum": 500, "default": 50},
                     "cross_fs": {"type": "boolean", "default": false},
-                    "refresh": {"type": "boolean", "default": false}
+                    "refresh": {"type": "boolean", "default": false},
+                    "clones": {"type": "boolean", "default": false},
+                    "size_mode": {"type": "string", "enum": ["du", "dedup"], "default": "du"}
                 },
                 "required": ["path", "category"]
             },
@@ -94,6 +101,13 @@ fn call_tool(name: &str, args: &Value, opts: CacheOpts) -> Result<Value, String>
         .map(|t| t.clamp(1, 500) as usize);
     let cross_fs = args.get("cross_fs").and_then(Value::as_bool).unwrap_or(false);
     let refresh = opts.always_refresh || args.get("refresh").and_then(Value::as_bool).unwrap_or(false);
+    let size_mode = match args.get("size_mode").filter(|v| !v.is_null()) {
+        None => report::SizeMode::Du,
+        Some(v) if v == "du" => report::SizeMode::Du,
+        Some(v) if v == "dedup" => report::SizeMode::Dedup,
+        Some(v) => return Err(format!("unknown size_mode {v} (du or dedup)")),
+    };
+    let clones = size_mode == report::SizeMode::Dedup || args.get("clones").and_then(Value::as_bool).unwrap_or(false);
     let category = match name {
         "disk_usage" => None,
         "find_by_category" => {
@@ -108,21 +122,36 @@ fn call_tool(name: &str, args: &Value, opts: CacheOpts) -> Result<Value, String>
 
     let path = std::fs::canonicalize(expand(path)).map_err(|e| format!("{path}: {e}"))?;
     let one_fs = !cross_fs;
+    let shares = scan::may_share_blocks(&path, one_fs);
     let render = |snap: &Snapshot| -> Result<Value, String> {
         match category {
             None => serde_json::to_value(report::build(
                 &snap.root,
                 &path,
-                snap.scan_time,
-                snap.cached_at,
-                snap.errors,
+                &report::Meta {
+                    elapsed: snap.scan_time,
+                    cached_at: snap.cached_at,
+                    unreadable: snap.errors,
+                    clones: snap.clones,
+                    clone_ids: snap.clone_ids,
+                    clone_gaps: snap.clone_gaps,
+                    shares,
+                    size_mode,
+                },
                 top.unwrap_or(20),
             )),
             Some(c) => serde_json::to_value(json!({
                 "path": path.display().to_string(),
                 "category": c.label(),
                 "cached_at": report::unix_secs(snap.cached_at),
-                "items": report::find(&snap.root, &path, c, top.unwrap_or(50)),
+                "items": report::find(
+                    &snap.root,
+                    &path,
+                    c,
+                    top.unwrap_or(50),
+                    size_mode,
+                    report::freeable_known(snap.clones && snap.clone_ids, shares),
+                ),
             })),
         }
         .map_err(|e| e.to_string())
@@ -133,10 +162,10 @@ fn call_tool(name: &str, args: &Value, opts: CacheOpts) -> Result<Value, String>
     MEMORY.with_borrow_mut(|memory| {
         let key = (path.clone(), one_fs);
         if use_cache && !refresh {
-            if let Some(snap) = memory.get(&key) {
+            if let Some(snap) = memory.get(&key).filter(|s| cache::answers(s, clones)) {
                 return render(snap);
             }
-            if let Some(snap) = cache::load(&path, one_fs) {
+            if let Some(snap) = cache::load(&path, one_fs, clones) {
                 let value = render(&snap);
                 memory.insert(key, snap);
                 return value;
@@ -145,13 +174,16 @@ fn call_tool(name: &str, args: &Value, opts: CacheOpts) -> Result<Value, String>
         let progress = Progress::default();
         let started = Instant::now();
         let root_dev = scan::device_of(&path).ok();
-        let root = scan::scan(&path, one_fs, &progress).map_err(|e| format!("{}: {e}", path.display()))?;
+        let root = scan::scan(&path, one_fs, clones, &progress).map_err(|e| format!("{}: {e}", path.display()))?;
         let snap = Snapshot {
             root,
             cached_at: None,
             scan_time: started.elapsed(),
             errors: progress.errors.load(Ordering::Relaxed),
             root_dev,
+            clones,
+            clone_ids: progress.clone_ids.load(Ordering::Relaxed),
+            clone_gaps: progress.clone_gaps.load(Ordering::Relaxed),
         };
         let value = render(&snap);
         if use_cache {
@@ -230,4 +262,47 @@ pub fn serve(opts: CacheOpts) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn opts() -> CacheOpts {
+        CacheOpts {
+            use_cache: false,
+            always_refresh: false,
+        }
+    }
+
+    #[test]
+    fn size_mode_is_validated_and_reported() {
+        let dir = std::env::temp_dir().join(format!("dutype-mcp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("f"), b"x").unwrap();
+        let path = dir.display().to_string();
+        let call = |mode: Value| call_tool("disk_usage", &json!({"path": path, "size_mode": mode}), opts());
+        let r = call(json!("dedup")).unwrap();
+        assert_eq!(r["accounting"]["size_mode"], "dedup");
+        assert_ne!(r["accounting"]["clone_detection"], "off");
+        assert_eq!(r["dedup_bytes"], r["size_bytes"]);
+        // Known where APFS reported clone flags, or where nothing shares blocks.
+        let shares = scan::may_share_blocks(&dir, true);
+        let known = r["accounting"]["clone_detection"] == "apfs-full" || !shares;
+        assert_eq!(r["freeable_min_bytes"].is_u64(), known);
+        if cfg!(target_os = "macos") {
+            assert!(known, "temp dir on APFS expected");
+        }
+        // Without clones: detection off, and no freeable bound where files
+        // may share blocks (always on macOS).
+        let r = call(Value::Null).unwrap();
+        assert_eq!(r["accounting"]["size_mode"], "du");
+        assert_eq!(r["accounting"]["clone_detection"], "off");
+        assert_eq!(r["freeable_min_bytes"].is_null(), shares);
+        assert_eq!(r["children"][0]["freeable_min_bytes"].is_null(), shares);
+        assert!(shares || !cfg!(target_os = "macos"));
+        assert!(call(json!("DEDUP")).is_err());
+        assert!(call(json!(1)).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

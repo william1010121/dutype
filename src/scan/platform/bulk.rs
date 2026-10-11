@@ -2,7 +2,7 @@
 //! the names and metadata of many entries, instead of `readdir` plus one
 //! `lstat` per entry. Sizes and identities match what `lstat` reports.
 
-use crate::scan::Entry;
+use crate::scan::{Entry, ReadStats};
 use std::cell::RefCell;
 use std::ffi::{CString, OsStr};
 use std::io;
@@ -12,6 +12,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 // Missing from libc 0.2 (values from the SDK's sys/attr.h and sys/vnode.h).
 const ATTR_CMN_ERROR: u32 = 0x2000_0000;
+const ATTR_CMNEXT_CLONE_REFCNT: u32 = 0x1000;
+const EF_MAY_SHARE_BLOCKS: u64 = 0x1;
+const EF_SHARES_ALL_BLOCKS: u64 = 0x40;
 const DIR_MNTSTATUS_TRIGGER: u32 = 0x2;
 const VDIR: u32 = 2;
 
@@ -23,7 +26,9 @@ thread_local! {
     static BUF: RefCell<Vec<u64>> = RefCell::new(vec![0; BUF_WORDS]);
 }
 
-fn attr_list() -> libc::attrlist {
+/// What `getattrlistbulk` returns; with `clones`, also the APFS clone
+/// identity (otherwise exactly the plain scan's request, at its speed).
+fn attr_list(clones: bool) -> libc::attrlist {
     libc::attrlist {
         bitmapcount: libc::ATTR_BIT_MAP_COUNT,
         reserved: 0,
@@ -38,7 +43,14 @@ fn attr_list() -> libc::attrlist {
         volattr: 0,
         dirattr: libc::ATTR_DIR_MOUNTSTATUS | libc::ATTR_DIR_ALLOCSIZE,
         fileattr: libc::ATTR_FILE_LINKCOUNT | libc::ATTR_FILE_ALLOCSIZE,
-        forkattr: 0,
+        // With FSOPT_ATTR_CMN_EXTENDED, forkattr holds the extended common
+        // attributes. Not ATTR_CMNEXT_CLONE_REFCNT: APFS serializes that
+        // lookup across threads, which made parallel scans 2x slower; it is
+        // read per family instead (see `clone_refcnt`).
+        forkattr: match clones {
+            true => libc::ATTR_CMNEXT_CLONEID | libc::ATTR_CMNEXT_EXT_FLAGS,
+            false => 0,
+        },
     }
 }
 
@@ -52,7 +64,12 @@ impl Drop for Fd {
 
 /// Like [`crate::scan::read_entries_std`]. `None` when the volume does not support
 /// bulk reads (the caller then falls back to `read_dir`).
-pub(in crate::scan) fn read_entries(path: &Path, cancel: &AtomicBool, out: &mut Vec<Entry>) -> Option<io::Result<u64>> {
+pub(in crate::scan) fn read_entries(
+    path: &Path,
+    cancel: &AtomicBool,
+    out: &mut Vec<Entry>,
+    clones: bool,
+) -> Option<io::Result<ReadStats>> {
     let Ok(cpath) = CString::new(path.as_os_str().as_bytes()) else {
         return Some(Err(io::ErrorKind::InvalidInput.into()));
     };
@@ -62,16 +79,27 @@ pub(in crate::scan) fn read_entries(path: &Path, cancel: &AtomicBool, out: &mut 
         return Some(Err(io::Error::last_os_error()));
     }
     let fd = Fd(fd);
-    BUF.with_borrow_mut(|buf| read_all(&fd, buf, cancel, out))
+    BUF.with_borrow_mut(|buf| read_all(&fd, buf, cancel, out, clones))
 }
 
-fn read_all(fd: &Fd, buf: &mut [u64], cancel: &AtomicBool, out: &mut Vec<Entry>) -> Option<io::Result<u64>> {
-    let mut list = attr_list();
-    let mut errors = 0;
+fn read_all(
+    fd: &Fd,
+    buf: &mut [u64],
+    cancel: &AtomicBool,
+    out: &mut Vec<Entry>,
+    clones: bool,
+) -> Option<io::Result<ReadStats>> {
+    let mut list = attr_list(clones);
+    let mut stats = ReadStats::default();
     let mut first = true;
     loop {
         let bytes = std::mem::size_of_val(buf);
-        let n = unsafe { libc::getattrlistbulk(fd.0, (&raw mut list).cast(), buf.as_mut_ptr().cast(), bytes, 0) };
+        let options = if clones {
+            libc::FSOPT_ATTR_CMN_EXTENDED as u64
+        } else {
+            0
+        };
+        let n = unsafe { libc::getattrlistbulk(fd.0, (&raw mut list).cast(), buf.as_mut_ptr().cast(), bytes, options) };
         if n < 0 {
             let err = io::Error::last_os_error();
             if first && matches!(err.raw_os_error(), Some(libc::ENOTSUP | libc::EINVAL)) {
@@ -80,11 +108,14 @@ fn read_all(fd: &Fd, buf: &mut [u64], cancel: &AtomicBool, out: &mut Vec<Entry>)
             // Like a failing `read_dir` iteration: what was read is kept.
             return Some(match first {
                 true => Err(err),
-                false => Ok(errors + 1),
+                false => {
+                    stats.errors += 1;
+                    Ok(stats)
+                }
             });
         }
         if n == 0 {
-            return Some(Ok(errors));
+            return Some(Ok(stats));
         }
         first = false;
         let data = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), bytes) };
@@ -95,16 +126,17 @@ fn read_all(fd: &Fd, buf: &mut [u64], cancel: &AtomicBool, out: &mut Vec<Entry>)
                 .filter(|&l| l >= 4 && at + l <= data.len())
             else {
                 // A malformed buffer: drop the rest of the directory.
-                return Some(Ok(errors + 1));
+                stats.errors += 1;
+                return Some(Ok(stats));
             };
-            match parse(fd, &data[at..at + len]) {
+            match parse(fd, &data[at..at + len], clones, &mut stats) {
                 Some(e) => out.push(e),
-                None => errors += 1,
+                None => stats.errors += 1,
             }
             at += len;
         }
         if cancel.load(Ordering::Relaxed) {
-            return Some(Ok(errors));
+            return Some(Ok(stats));
         }
     }
 }
@@ -138,14 +170,20 @@ impl Cursor<'_> {
 
 /// One entry, laid out as described in getattrlist(2): length, returned
 /// attribute set, then each returned attribute in bit order, group by group
-/// (common, dir, file). `None` for an entry with no usable name or metadata.
-fn parse(fd: &Fd, d: &[u8]) -> Option<Entry> {
+/// (common, dir, file, extended common). `None` for an entry with no
+/// usable name or metadata. Sets `stats.clone_ids` when clone flags are
+/// reported, `stats.clone_gaps` when a file's are missing.
+fn parse(fd: &Fd, d: &[u8], clones: bool, stats: &mut ReadStats) -> Option<Entry> {
     let mut c = Cursor { d, at: 4 };
     let common = c.u32()?;
     let _vol = c.u32()?;
     let dir_attrs = c.u32()?;
     let file_attrs = c.u32()?;
-    let _fork = c.u32()?;
+    let ext_attrs = c.u32()?;
+    // Dirs report the flags too, so a tree of dirs only still counts.
+    if ext_attrs & libc::ATTR_CMNEXT_EXT_FLAGS != 0 {
+        stats.clone_ids = true;
+    }
     // ATTR_CMN_ERROR comes right after the returned set.
     let error = match common & ATTR_CMN_ERROR != 0 {
         true => c.u32()?,
@@ -164,7 +202,7 @@ fn parse(fd: &Fd, d: &[u8]) -> Option<Entry> {
     // An entry the kernel could not read in bulk may still `lstat`.
     let need = libc::ATTR_CMN_DEVID | libc::ATTR_CMN_OBJTYPE | libc::ATTR_CMN_FILEID;
     if error != 0 || common & need != need {
-        return lstat_at(fd, name);
+        return fallback(fd, name, clones, stats);
     }
     // dev_t is signed; widen it like `MetadataExt::dev` does.
     let dev = c.u32()? as i32 as u64;
@@ -182,36 +220,74 @@ fn parse(fd: &Fd, d: &[u8]) -> Option<Entry> {
         // A mount point reports the attributes of the filesystem below it;
         // `lstat` gives the mounted one, as a `read_dir` scan sees it.
         if mount & (libc::DIR_MNTSTATUS_MNTPOINT | DIR_MNTSTATUS_TRIGGER) != 0 || alloc.is_none() {
-            return lstat_at(fd, name);
+            return fallback(fd, name, clones, stats);
         }
         return Some(Entry {
             name: name.to_os_string(),
             dir: true,
             alloc: alloc?,
             dev,
-            link: None,
+            ino,
+            nlink: 1,
+            clone: None,
+            may_share: false,
         });
     }
     let nlink = match file_attrs & libc::ATTR_FILE_LINKCOUNT != 0 {
         true => c.u32()?,
-        false => return lstat_at(fd, name),
+        false => return fallback(fd, name, clones, stats),
     };
     let alloc = match file_attrs & libc::ATTR_FILE_ALLOCSIZE != 0 {
         true => c.u64()?,
-        false => return lstat_at(fd, name),
+        false => return fallback(fd, name, clones, stats),
     };
+    let clone_id = match ext_attrs & libc::ATTR_CMNEXT_CLONEID != 0 {
+        true => Some(c.u64()?),
+        false => None,
+    };
+    // With --clones, a volume that skips the flags leaves the file's clone
+    // state unknown: it may share blocks.
+    let flags = match ext_attrs & libc::ATTR_CMNEXT_EXT_FLAGS != 0 {
+        true => c.u64()?,
+        false if clones => {
+            stats.clone_gaps += 1;
+            EF_MAY_SHARE_BLOCKS
+        }
+        false => 0,
+    };
+    // Only a family with other members matters: a file that shares all
+    // its blocks has at least one identical clone. Without its clone id
+    // (skipped by the volume) it is a gap: shared, but not grouped.
+    let clone = clone_id.filter(|_| flags & EF_SHARES_ALL_BLOCKS != 0);
+    if flags & EF_SHARES_ALL_BLOCKS != 0 && clone.is_none() {
+        stats.clone_gaps += 1;
+    }
     Some(Entry {
         name: name.to_os_string(),
         dir: false,
         alloc,
         dev,
-        link: (nlink > 1).then_some((dev, ino)),
+        ino,
+        nlink: nlink as u64,
+        clone,
+        // EF_SHARES_ALL_BLOCKS implies EF_MAY_SHARE_BLOCKS.
+        may_share: flags & (EF_MAY_SHARE_BLOCKS | EF_SHARES_ALL_BLOCKS) != 0,
     })
 }
 
+/// [`lstat_at`] from [`parse`]: with `clones`, a file read this way is a gap
+/// in clone coverage.
+fn fallback(fd: &Fd, name: &OsStr, clones: bool, stats: &mut ReadStats) -> Option<Entry> {
+    let e = lstat_at(fd, name, clones)?;
+    stats.clone_gaps += (clones && !e.dir) as u64;
+    Some(e)
+}
+
 /// Fallback for an entry whose bulk attributes are incomplete or describe
-/// another filesystem.
-fn lstat_at(fd: &Fd, name: &OsStr) -> Option<Entry> {
+/// another filesystem. With `clones`, a file read this way has unknown
+/// clone flags, so it counts as one that may share blocks (never as
+/// freeable).
+fn lstat_at(fd: &Fd, name: &OsStr, clones: bool) -> Option<Entry> {
     let cname = CString::new(name.as_bytes()).ok()?;
     let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
     if unsafe { libc::fstatat(fd.0, cname.as_ptr(), st.as_mut_ptr(), libc::AT_SYMLINK_NOFOLLOW) } != 0 {
@@ -224,8 +300,63 @@ fn lstat_at(fd: &Fd, name: &OsStr) -> Option<Entry> {
         dir,
         alloc: st.st_blocks as u64 * 512,
         dev: st.st_dev as u64,
-        link: (!dir && st.st_nlink > 1).then_some((st.st_dev as u64, st.st_ino)),
+        ino: st.st_ino,
+        nlink: if dir { 1 } else { st.st_nlink as u64 },
+        clone: None,
+        may_share: clones && !dir,
     })
+}
+
+/// Number of files in the APFS full-clone family of the file at `path`
+/// (macOS 14+). `None` when the volume or the system cannot tell.
+pub(in crate::scan) fn clone_refcnt(path: &Path) -> Option<u32> {
+    // Sealed system volumes report 0.
+    ext_attr::<u32>(path, ATTR_CMNEXT_CLONE_REFCNT).filter(|&n| n > 0)
+}
+
+/// The file at `path` shares, or may share, blocks with another file.
+/// `None` when the volume does not report the flags.
+pub(in crate::scan) fn may_share(path: &Path) -> Option<bool> {
+    ext_attr::<u64>(path, libc::ATTR_CMNEXT_EXT_FLAGS).map(|f| f & (EF_MAY_SHARE_BLOCKS | EF_SHARES_ALL_BLOCKS) != 0)
+}
+
+/// One extended common attribute of `path` (not following a symlink).
+fn ext_attr<T: Copy>(path: &Path, attr: u32) -> Option<T> {
+    #[repr(C, packed(4))]
+    #[derive(Clone, Copy)]
+    struct Reply<T: Copy> {
+        len: u32,
+        returned: libc::attribute_set_t,
+        value: T,
+    }
+    let cpath = CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut list = libc::attrlist {
+        bitmapcount: libc::ATTR_BIT_MAP_COUNT,
+        reserved: 0,
+        commonattr: libc::ATTR_CMN_RETURNED_ATTRS,
+        volattr: 0,
+        dirattr: 0,
+        fileattr: 0,
+        forkattr: attr,
+    };
+    let mut reply = std::mem::MaybeUninit::<Reply<T>>::zeroed();
+    let options = libc::FSOPT_ATTR_CMN_EXTENDED | libc::FSOPT_NOFOLLOW;
+    let size = std::mem::size_of::<Reply<T>>();
+    let rc = unsafe {
+        libc::getattrlist(
+            cpath.as_ptr(),
+            (&raw mut list).cast(),
+            reply.as_mut_ptr().cast(),
+            size,
+            options,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    let reply = unsafe { reply.assume_init() };
+    let returned = reply.returned;
+    (returned.forkattr & attr != 0).then_some(reply.value)
 }
 
 #[cfg(test)]
@@ -267,13 +398,94 @@ mod tests {
         (d, fd, e)
     }
 
+    /// With --clones, an entry read through the lstat fallback has unknown
+    /// clone flags: it may share blocks, so it is never counted as freeable.
+    #[test]
+    fn fallback_entry_may_share_with_clones() {
+        let common = libc::ATTR_CMN_RETURNED_ATTRS | libc::ATTR_CMN_NAME | ATTR_CMN_ERROR;
+        let (d, fd, e) = synthetic("fallback-clones", common, libc::EIO as u32);
+        let mut stats = ReadStats::default();
+        let got = parse(&fd, &e, true, &mut stats).expect("entry kept");
+        assert!(got.may_share && got.clone.is_none());
+        assert_eq!(stats.clone_gaps, 1);
+        assert!(!parse(&fd, &e, false, &mut ReadStats::default()).unwrap().may_share);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// A complete file record (common, file and the given extended
+    /// attributes) for `f.bin` in `dir`'s fd.
+    fn file_record(ext: u32, flags: u64) -> Vec<u8> {
+        let common = libc::ATTR_CMN_RETURNED_ATTRS
+            | libc::ATTR_CMN_NAME
+            | libc::ATTR_CMN_DEVID
+            | libc::ATTR_CMN_OBJTYPE
+            | libc::ATTR_CMN_FILEID;
+        let file = libc::ATTR_FILE_LINKCOUNT | libc::ATTR_FILE_ALLOCSIZE;
+        let mut e = Vec::new();
+        for w in [0, common, 0, 0, file, ext] {
+            e.extend_from_slice(&w.to_ne_bytes());
+        }
+        let name = b"f.bin\0";
+        let name_ref = e.len();
+        e.extend_from_slice(&[0; 8]);
+        e.extend_from_slice(&1u32.to_ne_bytes()); // dev
+        e.extend_from_slice(&1u32.to_ne_bytes()); // VREG
+        e.extend_from_slice(&42u64.to_ne_bytes()); // ino
+        e.extend_from_slice(&1u32.to_ne_bytes()); // links
+        e.extend_from_slice(&16384u64.to_ne_bytes()); // alloc
+        if ext & libc::ATTR_CMNEXT_CLONEID != 0 {
+            e.extend_from_slice(&42u64.to_ne_bytes());
+        }
+        if ext & libc::ATTR_CMNEXT_EXT_FLAGS != 0 {
+            e.extend_from_slice(&flags.to_ne_bytes());
+        }
+        let off = (e.len() - name_ref) as i32;
+        e[name_ref..name_ref + 4].copy_from_slice(&off.to_ne_bytes());
+        e[name_ref + 4..name_ref + 8].copy_from_slice(&(name.len() as u32).to_ne_bytes());
+        e.extend_from_slice(name);
+        let len = e.len() as u32;
+        e[..4].copy_from_slice(&len.to_ne_bytes());
+        e
+    }
+
+    /// With --clones, a record without the requested clone flags (a volume
+    /// that skips them) leaves the file's clone state unknown.
+    #[test]
+    fn omitted_clone_flags_are_unknown() {
+        let (d, fd, _) = synthetic("omitted-flags", 0, 0);
+        let parse_rec =
+            |ext, flags, clones| parse(&fd, &file_record(ext, flags), clones, &mut ReadStats::default()).unwrap();
+        let mut stats = ReadStats::default();
+        parse(&fd, &file_record(0, 0), true, &mut stats).unwrap();
+        assert!(stats.clone_gaps == 1 && !stats.clone_ids);
+        let both = libc::ATTR_CMNEXT_CLONEID | libc::ATTR_CMNEXT_EXT_FLAGS;
+        assert!(parse_rec(0, 0, true).may_share);
+        assert!(!parse_rec(0, 0, false).may_share);
+        assert!(!parse_rec(both, 0, true).may_share);
+        assert!(parse_rec(both, EF_MAY_SHARE_BLOCKS, true).may_share);
+        assert_eq!(parse_rec(both, EF_SHARES_ALL_BLOCKS, true).clone, Some(42));
+        // A full clone whose clone id was skipped: shared, ungrouped, a gap.
+        let flags_only = libc::ATTR_CMNEXT_EXT_FLAGS;
+        let mut stats = ReadStats::default();
+        let e = parse(&fd, &file_record(flags_only, EF_SHARES_ALL_BLOCKS), true, &mut stats).unwrap();
+        assert!(e.may_share && e.clone.is_none() && stats.clone_gaps == 1);
+        assert_eq!(parse_rec(0, 0, true).alloc, 16384);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn plain_request_has_no_extended_attributes() {
+        assert_eq!(attr_list(false).forkattr, 0);
+        assert_ne!(attr_list(true).forkattr, 0);
+    }
+
     #[test]
     fn missing_common_attrs_fall_back_to_lstat() {
         let common =
             libc::ATTR_CMN_RETURNED_ATTRS | libc::ATTR_CMN_NAME | libc::ATTR_CMN_DEVID | libc::ATTR_CMN_OBJTYPE;
         let (d, fd, e) = synthetic("attrs", common, 0);
-        let got = parse(&fd, &e).expect("entry kept");
-        assert_eq!(Some(got), lstat_at(&fd, OsStr::new("f.bin")));
+        let got = parse(&fd, &e, false, &mut ReadStats::default()).expect("entry kept");
+        assert_eq!(Some(got), lstat_at(&fd, OsStr::new("f.bin"), false));
         std::fs::remove_dir_all(&d).unwrap();
     }
 
@@ -281,8 +493,8 @@ mod tests {
     fn entry_error_falls_back_to_lstat() {
         let common = libc::ATTR_CMN_RETURNED_ATTRS | libc::ATTR_CMN_NAME | ATTR_CMN_ERROR;
         let (d, fd, e) = synthetic("error", common, libc::EIO as u32);
-        let got = parse(&fd, &e).expect("entry kept");
-        assert_eq!(Some(got), lstat_at(&fd, OsStr::new("f.bin")));
+        let got = parse(&fd, &e, false, &mut ReadStats::default()).expect("entry kept");
+        assert_eq!(Some(got), lstat_at(&fd, OsStr::new("f.bin"), false));
         std::fs::remove_dir_all(&d).unwrap();
     }
 }
