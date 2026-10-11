@@ -244,8 +244,11 @@ fn parse(fd: &Fd, d: &[u8], clones: bool, clone_ids: &mut bool) -> Option<Entry>
         true => Some(c.u64()?),
         false => None,
     };
+    // With --clones, a volume that skips the flags leaves the file's clone
+    // state unknown: it may share blocks.
     let flags = match ext_attrs & libc::ATTR_CMNEXT_EXT_FLAGS != 0 {
         true => c.u64()?,
+        false if clones => EF_MAY_SHARE_BLOCKS,
         false => 0,
     };
     Some(Entry {
@@ -386,6 +389,58 @@ mod tests {
         let got = parse(&fd, &e, true, &mut false).expect("entry kept");
         assert!(got.may_share && got.clone.is_none());
         assert!(!parse(&fd, &e, false, &mut false).unwrap().may_share);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// A complete file record (common, file and the given extended
+    /// attributes) for `f.bin` in `dir`'s fd.
+    fn file_record(ext: u32, flags: u64) -> Vec<u8> {
+        let common = libc::ATTR_CMN_RETURNED_ATTRS
+            | libc::ATTR_CMN_NAME
+            | libc::ATTR_CMN_DEVID
+            | libc::ATTR_CMN_OBJTYPE
+            | libc::ATTR_CMN_FILEID;
+        let file = libc::ATTR_FILE_LINKCOUNT | libc::ATTR_FILE_ALLOCSIZE;
+        let mut e = Vec::new();
+        for w in [0, common, 0, 0, file, ext] {
+            e.extend_from_slice(&w.to_ne_bytes());
+        }
+        let name = b"f.bin\0";
+        let name_ref = e.len();
+        e.extend_from_slice(&[0; 8]);
+        e.extend_from_slice(&1u32.to_ne_bytes()); // dev
+        e.extend_from_slice(&1u32.to_ne_bytes()); // VREG
+        e.extend_from_slice(&42u64.to_ne_bytes()); // ino
+        e.extend_from_slice(&1u32.to_ne_bytes()); // links
+        e.extend_from_slice(&16384u64.to_ne_bytes()); // alloc
+        if ext & libc::ATTR_CMNEXT_CLONEID != 0 {
+            e.extend_from_slice(&42u64.to_ne_bytes());
+        }
+        if ext & libc::ATTR_CMNEXT_EXT_FLAGS != 0 {
+            e.extend_from_slice(&flags.to_ne_bytes());
+        }
+        let off = (e.len() - name_ref) as i32;
+        e[name_ref..name_ref + 4].copy_from_slice(&off.to_ne_bytes());
+        e[name_ref + 4..name_ref + 8].copy_from_slice(&(name.len() as u32).to_ne_bytes());
+        e.extend_from_slice(name);
+        let len = e.len() as u32;
+        e[..4].copy_from_slice(&len.to_ne_bytes());
+        e
+    }
+
+    /// With --clones, a record without the requested clone flags (a volume
+    /// that skips them) leaves the file's clone state unknown.
+    #[test]
+    fn omitted_clone_flags_are_unknown() {
+        let (d, fd, _) = synthetic("omitted-flags", 0, 0);
+        let parse_rec = |ext, flags, clones| parse(&fd, &file_record(ext, flags), clones, &mut false).unwrap();
+        let both = libc::ATTR_CMNEXT_CLONEID | libc::ATTR_CMNEXT_EXT_FLAGS;
+        assert!(parse_rec(0, 0, true).may_share);
+        assert!(!parse_rec(0, 0, false).may_share);
+        assert!(!parse_rec(both, 0, true).may_share);
+        assert!(parse_rec(both, EF_MAY_SHARE_BLOCKS, true).may_share);
+        assert_eq!(parse_rec(both, EF_SHARES_ALL_BLOCKS, true).clone, Some(42));
+        assert_eq!(parse_rec(0, 0, true).alloc, 16384);
         std::fs::remove_dir_all(&d).unwrap();
     }
 
