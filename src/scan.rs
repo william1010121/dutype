@@ -155,7 +155,6 @@ mod platform {
 mod platform {
     use std::ffi::OsStr;
     use std::fs::{self, Metadata};
-    use std::io;
     use std::path::{Path, PathBuf};
 
     pub fn allocated(m: &Metadata) -> u64 {
