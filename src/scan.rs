@@ -8,7 +8,7 @@ use std::fs::{self, Metadata};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 pub struct Node {
     pub name: Box<str>,
@@ -25,8 +25,8 @@ pub struct Node {
     /// (which may even collide with a sibling's real name).
     pub lossy: bool,
     /// File: it may share blocks with another file (an APFS clone, now or
-    /// once), so deleting it alone may free less than its size. Dir: some
-    /// file below it may.
+    /// once, or a file with shared extents under `--clones` on Linux), so deleting
+    /// it alone may free less than its size. Dir: some file below it may.
     pub clone: bool,
     pub dir: Option<Box<DirInfo>>,
 }
@@ -53,8 +53,9 @@ pub struct CloneInfo {
     /// Bytes of complete groups (every link and clone of them inside) whose
     /// lowest common ancestor is in this subtree. Set by [`crate::account`].
     pub group_free: u64,
-    /// Bytes of clones in this subtree whose family is already counted at
-    /// another member. Set by [`crate::account`].
+    /// Bytes of clones in this subtree whose family (or, with `--clones` on Linux,
+    /// whose shared extent) is already counted at another file. Set by
+    /// [`crate::account`].
     pub dup: u64,
     /// Files of this dir with hard links or clone siblings, by child index.
     pub shared: Box<[Shared]>,
@@ -69,9 +70,13 @@ impl CloneInfo {
     }
 }
 
+/// Physical ranges `(start, len)` of a file's shared extents, sorted.
+pub type Extents = Box<[(u64, u64)]>;
+
 /// A file of a [`DirInfo`] that shares blocks with other files: hard links
-/// (same inode) or members of an APFS full-clone family (same clone id).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// (same inode), members of an APFS full-clone family (same clone id) or,
+/// with `--clones` on Linux, files with shared extents (same physical ranges).
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Shared {
     /// Index of the file in `children`.
     pub idx: u32,
@@ -79,7 +84,8 @@ pub struct Shared {
     pub key: (u64, u64),
     pub is_clone: bool,
     pub ino: u64,
-    pub nlink: u64,
+    /// Link count (saturated; 32 bits keep this record at 48 bytes).
+    pub nlink: u32,
     /// Inodes in the clone family on the whole volume, read by
     /// [`crate::account`] once the family has two members in the tree: 0
     /// while unknown, 1 when it cannot be read (the family is then never
@@ -89,6 +95,37 @@ pub struct Shared {
     /// Set by [`crate::account`]: the family is counted at another member,
     /// so this file adds nothing to deduplicated sizes.
     pub dup: bool,
+    /// `--clones` on Linux reflink filesystems: the file's shared extents.
+    pub reflink: Option<Box<Reflink>>,
+}
+
+/// The shared extents of a file (`--clones` on btrfs, XFS, bcachefs).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Reflink {
+    /// Physical ranges of the extents flagged `FIEMAP_EXTENT_SHARED`.
+    /// Comparable between files on the same device.
+    pub extents: Extents,
+    /// Set by [`crate::account`]: bytes of these extents counted at another
+    /// file, left out of deduplicated sizes.
+    pub dup: u64,
+    /// The file also shares extents whose physical size is unknown
+    /// (compressed on btrfs), so none of it is known to be freeable.
+    pub opaque: bool,
+}
+
+impl Reflink {
+    /// Bytes in shared extents (a range listed twice counts twice).
+    pub fn bytes(&self) -> u64 {
+        self.extents.iter().map(|&(_, len)| len).sum()
+    }
+
+    /// Bytes of a file of `size` bytes in no shared extent.
+    pub fn private(&self, size: u64) -> u64 {
+        match self.opaque {
+            true => 0,
+            false => size.saturating_sub(self.bytes()),
+        }
+    }
 }
 
 impl Node {
@@ -122,6 +159,7 @@ impl Node {
     }
 
     /// Lower bound of the bytes deleting this would free (not additive).
+    /// For a file with shared blocks this is 0; see [`DirInfo::child_freeable`].
     pub fn freeable(&self) -> u64 {
         match &self.dir {
             Some(d) => d.free_base + d.group_free(),
@@ -189,7 +227,18 @@ impl DirInfo {
         let c = &self.children[i];
         match self.shared_of(i) {
             Some(s) if s.dup => 0,
+            Some(Shared { reflink: Some(r), .. }) => c.size.saturating_sub(r.dup),
             _ => c.dedup(),
+        }
+    }
+
+    /// Freeable bytes of child `i` (see [`Node::freeable`]): a file whose
+    /// only sharing is shared extents (Linux `--clones`) frees its other bytes.
+    pub fn child_freeable(&self, i: usize) -> u64 {
+        let c = &self.children[i];
+        match self.shared_of(i) {
+            Some(Shared { reflink: Some(r), .. }) if !c.hardlink => r.private(c.size),
+            _ => c.freeable(),
         }
     }
 
@@ -240,6 +289,74 @@ impl DirInfo {
     }
 }
 
+/// The filesystem of a scan root, as far as shared blocks go (see
+/// `platform::fs_kind`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+// Each platform's `fs_kind` returns only some of these.
+#[allow(dead_code)]
+pub enum FsKind {
+    /// macOS: any volume may hold APFS clones.
+    MacOs,
+    Btrfs,
+    Xfs,
+    Bcachefs,
+    Ocfs2,
+    Zfs,
+    /// Blocks may be shared, but which way is unknown (`statfs` failed;
+    /// Windows, where hard links are not identified).
+    Unknown,
+    /// No shared blocks (ext4, NTFS, ...).
+    Other,
+}
+
+impl FsKind {
+    /// Files there may share blocks (APFS clones, reflinks, ZFS block
+    /// cloning), so without detecting them nothing is known to be freeable.
+    pub fn may_share_blocks(self) -> bool {
+        self != FsKind::Other
+    }
+
+    /// The filesystems whose shared extents `--clones` reads with FIEMAP.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn reflinks(self) -> Option<ReflinkFs> {
+        match self {
+            FsKind::Btrfs => Some(ReflinkFs::Btrfs),
+            FsKind::Xfs => Some(ReflinkFs::Xfs),
+            FsKind::Bcachefs => Some(ReflinkFs::Bcachefs),
+            _ => None,
+        }
+    }
+}
+
+/// A Linux filesystem whose shared extents `--clones` reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReflinkFs {
+    Btrfs,
+    Xfs,
+    Bcachefs,
+}
+
+impl ReflinkFs {
+    pub fn label(self) -> &'static str {
+        match self {
+            ReflinkFs::Btrfs => "btrfs",
+            ReflinkFs::Xfs => "xfs",
+            ReflinkFs::Bcachefs => "bcachefs",
+        }
+    }
+
+    /// Non-zero code for [`Progress::reflink_fs`] and the cache.
+    pub fn code(self) -> u8 {
+        self as u8 + 1
+    }
+
+    pub fn from_code(c: u8) -> Option<ReflinkFs> {
+        [ReflinkFs::Btrfs, ReflinkFs::Xfs, ReflinkFs::Bcachefs]
+            .get(usize::from(c).checked_sub(1)?)
+            .copied()
+    }
+}
+
 #[derive(Default)]
 pub struct Progress {
     pub files: AtomicU64,
@@ -249,6 +366,9 @@ pub struct Progress {
     pub clone_ids: AtomicBool,
     /// With --clones, some files' clone flags could not be read.
     pub clone_gaps: AtomicBool,
+    /// With `--clones`, the Linux reflink filesystem whose shared extents
+    /// were read ([`ReflinkFs::code`]; 0: none, e.g. ext4 or not Linux).
+    pub reflink_fs: AtomicU8,
     /// Set to stop a running scan early (the result is then incomplete).
     pub cancel: AtomicBool,
     /// Request (`--private`): read the APFS private size of partial clones.
@@ -293,7 +413,7 @@ impl PrivateSizes {
 
 #[cfg(unix)]
 mod platform {
-    use super::{Entry, ReadStats};
+    use super::{Entry, FsKind, ReadStats};
     use std::ffi::OsStr;
     use std::fs::Metadata;
     use std::io;
@@ -304,6 +424,11 @@ mod platform {
 
     #[cfg(target_os = "macos")]
     pub(super) mod bulk;
+
+    #[cfg(target_os = "linux")]
+    mod fiemap;
+    #[cfg(target_os = "linux")]
+    pub use fiemap::{Probed, SharedExtentProbe};
 
     /// Entries of the directory `path`: from `getattrlistbulk` on macOS when
     /// the volume supports it, else [`super::read_entries_std`].
@@ -359,38 +484,39 @@ mod platform {
         }
     }
 
-    /// Files on the filesystem of `root` may share blocks (APFS clones,
-    /// reflinks on btrfs, XFS, bcachefs, OCFS2 or ZFS block cloning), so
-    /// without shared-block detection nothing is known to be freeable.
-    pub fn may_share_blocks(root: &Path) -> bool {
+    /// The filesystem of `root` (one `statfs` on Linux; every macOS volume
+    /// counts as one with APFS clones).
+    pub fn fs_kind(root: &Path) -> FsKind {
         #[cfg(target_os = "macos")]
         {
             let _ = root;
-            true
+            FsKind::MacOs
         }
         #[cfg(target_os = "linux")]
         {
-            const REFLINK_FS: [u64; 5] = [
-                0x9123_683e, // btrfs
-                0x5846_5342, // XFS
-                0xca45_1a4e, // bcachefs
-                0x7461_636f, // OCFS2
-                0x2fc1_2fc1, // ZFS
-            ];
             let Ok(cpath) = std::ffi::CString::new(root.as_os_str().as_bytes()) else {
-                return true;
+                return FsKind::Unknown;
             };
             let mut st = std::mem::MaybeUninit::<libc::statfs>::uninit();
+            // SAFETY: `cpath` is NUL-terminated; statfs fills `st` on success.
             if unsafe { libc::statfs(cpath.as_ptr(), st.as_mut_ptr()) } != 0 {
-                return true;
+                return FsKind::Unknown;
             }
-            let kind = unsafe { st.assume_init() }.f_type as u64 & 0xffff_ffff;
-            REFLINK_FS.contains(&kind)
+            // SAFETY: statfs succeeded. f_type is signed on some targets;
+            // the magics are 32-bit.
+            match unsafe { st.assume_init() }.f_type as u64 & 0xffff_ffff {
+                0x9123_683e => FsKind::Btrfs,
+                0x5846_5342 => FsKind::Xfs,
+                0xca45_1a4e => FsKind::Bcachefs,
+                0x7461_636f => FsKind::Ocfs2,
+                0x2fc1_2fc1 => FsKind::Zfs,
+                _ => FsKind::Other,
+            }
         }
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
             let _ = root;
-            false
+            FsKind::Other
         }
     }
 
@@ -479,7 +605,7 @@ mod platform {
 
 #[cfg(not(unix))]
 mod platform {
-    use super::{Entry, ReadStats};
+    use super::{Entry, FsKind, ReadStats};
     use std::ffi::OsStr;
     use std::fs::{self, Metadata};
     use std::io;
@@ -507,8 +633,8 @@ mod platform {
 
     /// Hard links are not identified here (and ReFS can clone blocks), so
     /// nothing is known to be freeable.
-    pub fn may_share_blocks(_: &Path) -> bool {
-        true
+    pub fn fs_kind(_: &Path) -> FsKind {
+        FsKind::Unknown
     }
 
     pub fn allocated(m: &Metadata) -> u64 {
@@ -641,7 +767,7 @@ pub fn clone_refcnt(path: &Path) -> Option<u32> {
 /// `--cross-fs` the scan may enter other filesystems, so on Linux (where
 /// only some filesystems share blocks) it is then always assumed.
 pub fn may_share_blocks(root: &Path, one_fs: bool) -> bool {
-    platform::may_share_blocks(root) || (!one_fs && cfg!(target_os = "linux"))
+    platform::fs_kind(root).may_share_blocks() || (!one_fs && cfg!(target_os = "linux"))
 }
 
 struct Ctx<'a> {
@@ -803,6 +929,14 @@ fn scan_root(
     root_dev: Option<u64>,
 ) -> std::io::Result<Node> {
     let meta = fs::metadata(root)?;
+    // Only the root's filesystem is checked: with `--cross-fs` the scan may
+    // enter filesystems whose shared blocks cannot be read, so it reads none
+    // (and, like any Linux `--cross-fs` scan, gives no freeable bound).
+    #[cfg(target_os = "linux")]
+    let reflink_fs = match clones && one_fs {
+        true => platform::fs_kind(root).reflinks(),
+        false => None,
+    };
     let ctx = Ctx {
         progress,
         root,
@@ -839,11 +973,176 @@ fn scan_root(
     let parent = root.parent().map(file_name_of).unwrap_or_default();
     let own_size = platform::allocated(&meta);
     let mut node = scan_dir(root, file_name_of(root).into(), &parent, inherited, own_size, &ctx);
+    // Only a probed tree reports its extents as read (a file root is not:
+    // it may share blocks, so nothing about it is freeable for sure).
+    #[cfg(target_os = "linux")]
+    if let Some(fs) = reflink_fs
+        && !progress.cancel.load(Ordering::Relaxed)
+    {
+        read_shared_extents(&mut node, root, progress);
+        progress.reflink_fs.store(fs.code(), Ordering::Relaxed);
+    }
     node.name = name;
     if clones {
         crate::account::account(&mut node, Some(root));
     }
     Ok(node)
+}
+
+/// `--clones` on a reflink filesystem: read every file's shared extents
+/// (FIEMAP: an open, a stat and an ioctl per file with blocks) in a pass of
+/// its own after the scan, in parallel, so `scan_dir` adds no syscall per
+/// entry. Files that share (or may share) blocks are marked and get the
+/// `Shared` records [`crate::account`] works from.
+#[cfg(target_os = "linux")]
+fn read_shared_extents(root: &mut Node, base: &Path, progress: &Progress) {
+    // Dirs holding files with blocks (child indices from the root), and per
+    // file: (dir, child index, path on disk).
+    let mut dirs: Vec<Vec<u32>> = Vec::new();
+    let mut jobs: Vec<(u32, u32, Option<PathBuf>)> = Vec::new();
+    collect_files(root, base, &mut Vec::new(), &mut dirs, &mut jobs);
+    let probed: Vec<io::Result<platform::Probed>> = jobs
+        .par_iter()
+        .map_init(platform::SharedExtentProbe::new, |p, (_, _, path)| {
+            // A cancelled scan is thrown away: stop probing.
+            if progress.cancel.load(Ordering::Relaxed) {
+                return Ok(platform::Probed::default());
+            }
+            match path {
+                Some(path) => p.probe(path, &progress.cancel),
+                // A non-UTF-8 name that cannot be resolved.
+                None => Err(io::ErrorKind::NotFound.into()),
+            }
+        })
+        .collect();
+    let mut failed = 0;
+    let mut probed = probed.into_iter();
+    for group in jobs.chunk_by(|a, b| a.0 == b.0) {
+        let path = &dirs[group[0].0 as usize];
+        let mut n: &mut Node = root;
+        for &i in path {
+            n = &mut n.dir.as_mut().expect("a dir").children[i as usize];
+        }
+        let d = n.dir.as_mut().expect("a dir");
+        let mut shared = d
+            .clones
+            .as_mut()
+            .map(|c| std::mem::take(&mut c.shared))
+            .unwrap_or_default()
+            .into_vec();
+        let (mut freed, mut marked, mut gaps) = (0, false, 0);
+        for ((_, idx, _), r) in group.iter().zip(probed.by_ref()) {
+            // A file that cannot be read, or shares only extents of unknown
+            // size, may share blocks: it frees nothing for sure.
+            let (reflink, id) = match r {
+                Ok(p) => match p.extents {
+                    Some(extents) => {
+                        let r = Reflink {
+                            extents,
+                            dup: 0,
+                            opaque: p.opaque,
+                        };
+                        (Some(Box::new(r)), p.id)
+                    }
+                    None if p.opaque => (None, p.id),
+                    None => continue,
+                },
+                // A gap in the detection, reported as partial.
+                Err(_) => {
+                    gaps += 1;
+                    (None, (0, 0))
+                }
+            };
+            let c = &mut d.children[*idx as usize];
+            if !c.clone && !c.hardlink {
+                freed += c.size;
+            }
+            c.clone = true;
+            marked = true;
+            let link = shared.iter_mut().find(|s| s.idx == *idx);
+            let Some(reflink) = reflink else {
+                // A hard link that may share blocks: never a complete group.
+                if let Some(s) = link {
+                    s.refcnt = 0;
+                }
+                continue;
+            };
+            match link {
+                // A hard link: its record already holds the inode.
+                Some(s) => s.reflink = Some(reflink),
+                None => shared.push(Shared {
+                    idx: *idx,
+                    key: id,
+                    is_clone: false,
+                    ino: id.1,
+                    nlink: 1,
+                    refcnt: 1,
+                    dup: false,
+                    reflink: Some(reflink),
+                }),
+            }
+        }
+        shared.sort_unstable_by_key(|s| s.idx);
+        d.clones_mut().shared = shared.into_boxed_slice();
+        d.trim_clones();
+        // The dir and its ancestors: marked, and without those files'
+        // bytes in the plain freeable bytes.
+        if marked {
+            mark_sharing(root, path, freed, gaps);
+            failed += gaps;
+        }
+    }
+    if failed > 0 {
+        progress.clone_gaps.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Files with blocks below `node` (at `base` on disk), for
+/// [`read_shared_extents`].
+#[cfg(target_os = "linux")]
+fn collect_files(
+    node: &Node,
+    base: &Path,
+    path: &mut Vec<u32>,
+    dirs: &mut Vec<Vec<u32>>,
+    jobs: &mut Vec<(u32, u32, Option<PathBuf>)>,
+) {
+    let id = dirs.len() as u32;
+    let mut any = false;
+    for (i, c) in node.children().iter().enumerate() {
+        if !c.is_dir() && c.size > 0 {
+            jobs.push((id, i as u32, resolve_child(base, c)));
+            any = true;
+        }
+    }
+    if any {
+        dirs.push(path.clone());
+    }
+    for (i, c) in node.children().iter().enumerate() {
+        if c.is_dir()
+            && let Some(p) = resolve_child(base, c)
+        {
+            path.push(i as u32);
+            collect_files(c, &p, path, dirs, jobs);
+            path.pop();
+        }
+    }
+}
+
+/// Mark `node` and the dirs down `path` as holding files that may share
+/// blocks, taking `freed` bytes of such files out of their plain freeable
+/// bytes and adding `gaps` files that could not be probed.
+#[cfg(target_os = "linux")]
+fn mark_sharing(node: &mut Node, path: &[u32], freed: u64, gaps: u64) {
+    node.clone = true;
+    let d = node.dir.as_mut().expect("a dir");
+    d.free_base -= freed;
+    if gaps > 0 {
+        d.clones_mut().gaps += gaps;
+    }
+    if let Some((&i, rest)) = path.split_first() {
+        mark_sharing(&mut d.children[i as usize], rest, freed, gaps);
+    }
 }
 
 fn scan_dir(
@@ -949,9 +1248,10 @@ fn scan_dir(
                 key,
                 is_clone,
                 ino: e.ino,
-                nlink: e.nlink,
+                nlink: e.nlink.min(u32::MAX as u64) as u32,
                 refcnt,
                 dup: false,
+                reflink: None,
             });
         }
         let clone = e.clone.is_some() || e.may_share;
@@ -1122,6 +1422,14 @@ mod record_private_tests {
         assert_eq!(got.0.len(), 1);
         let key: PathBuf = ["d", "\\xff"].iter().collect();
         assert_eq!(got.get(&key), Some(1));
+    }
+}
+
+#[test]
+fn shared_records_stay_small() {
+    // One per hard-linked file: uv and pnpm trees have hundreds of thousands.
+    if cfg!(target_pointer_width = "64") {
+        assert_eq!(std::mem::size_of::<Shared>(), 48);
     }
 }
 
@@ -1443,6 +1751,7 @@ mod bulk_tests {
             shares: true,
             size_mode: crate::report::SizeMode::Du,
             private: Some(&table),
+            reflink_fs: None,
         };
         let r = serde_json::to_value(crate::report::build(&node, &d, &meta, 20)).unwrap();
         assert_eq!(r["accounting"]["private"], true);
@@ -1577,5 +1886,176 @@ pub(crate) mod test_support {
             }
             _ => panic!("private size {got}, expected {want}"),
         }
+    }
+}
+
+/// `--clones` on a real reflink filesystem. Set `DUTYPE_REFLINK_TEST_DIR`
+/// to a writable directory on btrfs, XFS (`mkfs.xfs -m reflink=1`) or
+/// bcachefs to run them; they are skipped otherwise.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) mod reflink_tests {
+    use super::*;
+    use std::process::Command;
+
+    pub fn fixture(name: &str) -> Option<PathBuf> {
+        let base = std::env::var_os("DUTYPE_REFLINK_TEST_DIR")?;
+        let d = PathBuf::from(base).join(format!("dutype-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(d.join("sub")).unwrap();
+        Some(d)
+    }
+
+    pub fn reflink_copy(from: &Path, to: &Path) {
+        let ok = Command::new("cp").arg("--reflink=always").arg(from).arg(to).status();
+        assert!(ok.unwrap().success(), "cp --reflink=always failed");
+    }
+
+    pub fn scan_reflinks(d: &Path) -> (Node, Option<ReflinkFs>) {
+        let progress = Progress::default();
+        let node = scan_excluding(d, true, true, &progress, None).unwrap();
+        (node, ReflinkFs::from_code(progress.reflink_fs.load(Ordering::Relaxed)))
+    }
+
+    fn du_bytes(d: &Path) -> u64 {
+        let out = Command::new("du").arg("-skx").arg(d).output().unwrap();
+        let kib: u64 = String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        kib * 1024
+    }
+
+    /// The issue #5 fixture with reflinks: an 8 MiB file, three reflinked
+    /// copies, 1 MiB of one of them overwritten, and a hard link.
+    #[test]
+    fn shared_extents_count_once() {
+        use std::io::{Seek, Write};
+        const M: u64 = 1 << 20;
+        let Some(d) = fixture("extents") else { return };
+        fs::write(d.join("a"), vec![7u8; 8 << 20]).unwrap();
+        fs::File::open(d.join("a")).unwrap().sync_all().unwrap();
+        for c in ["c1", "c2", "sub/c3"] {
+            reflink_copy(&d.join("a"), &d.join(c));
+        }
+        let mut f = fs::OpenOptions::new().write(true).open(d.join("sub/c3")).unwrap();
+        f.seek(std::io::SeekFrom::Start(0)).unwrap();
+        f.write_all(&vec![9u8; 1 << 20]).unwrap();
+        f.sync_all().unwrap();
+        fs::hard_link(d.join("a"), d.join("sub/hl")).unwrap();
+
+        let (node, fs_kind) = scan_reflinks(&d);
+        assert!(fs_kind.is_some(), "not a reflink filesystem");
+        assert_eq!(node.size, du_bytes(&d));
+        let own = node.size - 32 * M; // the directories' own blocks
+        // One 8 MiB extent shared four times, plus c3's own 1 MiB.
+        assert_eq!(node.dedup(), own + 9 * M);
+        // Shared extents are never freeable; c3's own MiB is.
+        assert_eq!(node.freeable(), own + M);
+        let sub = node.children().iter().position(|c| &*c.name == "sub").unwrap();
+        let sub_dir = node.children()[sub].dir.as_ref().unwrap();
+        let c3 = sub_dir.children.iter().position(|c| &*c.name == "c3").unwrap();
+        assert_eq!(sub_dir.child_freeable(c3), M);
+        // Subdirs are read first, so sub/hl carries the hard link's bytes;
+        // c1 (the shortest, smallest path holding them) keeps the extent.
+        let dir = node.dir.as_ref().unwrap();
+        let at = |name: &str| dir.children.iter().position(|c| &*c.name == name).unwrap();
+        assert_eq!(dir.child_dedup(at("c1")), 8 * M);
+        assert_eq!(dir.child_dedup(at("c2")), 0);
+        assert_eq!(sub_dir.child_dedup(c3), M);
+
+        // Parallel scans credit the same files every time.
+        let dedups = |n: &Node| {
+            let mut v = vec![];
+            walk(n, &mut PathBuf::new(), &mut |c, p| {
+                v.push((p.to_path_buf(), c.dedup()));
+                true
+            });
+            v
+        };
+        let first = dedups(&node);
+        for _ in 0..5 {
+            assert_eq!(dedups(&scan_reflinks(&d).0), first);
+        }
+        // Without --clones nothing changes from du, and freeable cannot be
+        // bounded there.
+        let plain = scan_excluding(&d, true, false, &Progress::default(), None).unwrap();
+        assert_eq!((plain.size, plain.dedup()), (node.size, node.size));
+        assert!(may_share_blocks(&d, true));
+        assert_eq!(platform::fs_kind(&d).reflinks(), fs_kind);
+        // With --cross-fs, nothing is read (other filesystems could not be).
+        let progress = Progress::default();
+        let cross = scan_excluding(&d, false, true, &progress, None).unwrap();
+        assert_eq!(
+            (cross.dedup(), progress.reflink_fs.load(Ordering::Relaxed)),
+            (cross.size, 0)
+        );
+        // A file that cannot be opened (mode 000; root may still open it) is
+        // a gap in the detection and is never freeable.
+        let locked = d.join("sub/locked");
+        fs::write(&locked, vec![1u8; 1 << 20]).unwrap();
+        fs::set_permissions(&locked, std::os::unix::fs::PermissionsExt::from_mode(0o000)).unwrap();
+        if fs::File::open(&locked).is_err() {
+            let progress = Progress::default();
+            let n = scan_excluding(&d, true, true, &progress, None).unwrap();
+            assert_eq!((n.clone_gaps(), n.errors()), (1, 0));
+            assert!(progress.clone_gaps.load(Ordering::Relaxed));
+            let sub = n.children().iter().find(|c| &*c.name == "sub").unwrap();
+            let sd = sub.dir.as_ref().unwrap();
+            let i = sd.children.iter().position(|c| &*c.name == "locked").unwrap();
+            assert!(sd.children[i].clone && sd.child_freeable(i) == 0);
+        }
+        fs::remove_file(&locked).unwrap();
+        // A file root is not probed, so it does not claim extents were read.
+        let progress = Progress::default();
+        let file = scan_excluding(&d.join("c1"), true, true, &progress, None).unwrap();
+        assert_eq!((file.clone, progress.reflink_fs.load(Ordering::Relaxed)), (true, 0));
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// The FIEMAP pass stops probing once the scan is cancelled.
+    #[test]
+    fn extent_pass_honours_cancel() {
+        let Some(d) = fixture("cancel") else { return };
+        fs::write(d.join("a"), vec![5u8; 1 << 20]).unwrap();
+        fs::File::open(d.join("a")).unwrap().sync_all().unwrap();
+        reflink_copy(&d.join("a"), &d.join("b"));
+        let plain = || scan_excluding(&d, true, false, &Progress::default(), None).unwrap();
+        let marked = |n: &Node| n.children().iter().filter(|c| c.clone).count();
+        let cancelled = Progress::default();
+        cancelled.cancel.store(true, Ordering::Relaxed);
+        let mut n = plain();
+        read_shared_extents(&mut n, &d, &cancelled);
+        assert_eq!(marked(&n), 0);
+        let mut n = plain();
+        read_shared_extents(&mut n, &d, &Progress::default());
+        assert_eq!(marked(&n), 2);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// btrfs compression: shared extents are encoded, report their logical
+    /// length and are left out of the ranges; such files are never freeable.
+    #[test]
+    fn compressed_shared_extents_are_not_freeable() {
+        let Some(d) = fixture("compressed") else { return };
+        if platform::fs_kind(&d) != FsKind::Btrfs {
+            return fs::remove_dir_all(&d).unwrap();
+        }
+        let z = d.join("z");
+        fs::create_dir(&z).unwrap();
+        // New files in a `+c` directory are compressed.
+        assert!(Command::new("chattr").arg("+c").arg(&z).status().unwrap().success());
+        fs::write(z.join("a"), "compressible ".repeat(1 << 20)).unwrap();
+        fs::File::open(z.join("a")).unwrap().sync_all().unwrap();
+        reflink_copy(&z.join("a"), &z.join("b"));
+        let (node, _) = scan_reflinks(&d);
+        let z = node.children().iter().find(|c| &*c.name == "z").unwrap();
+        let files: u64 = z.children().iter().map(|c| c.size).sum();
+        assert!(files > 0);
+        // Counted in full (not deduplicated), and not freeable.
+        assert_eq!(z.dedup(), z.size);
+        assert_eq!(z.freeable(), z.size - files);
+        fs::remove_dir_all(&d).unwrap();
     }
 }

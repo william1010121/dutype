@@ -65,19 +65,24 @@ struct Args {
     /// Ignore a cached scan: scan again and update the cache (implies --cache)
     #[arg(long)]
     refresh: bool,
-    /// Detect APFS clones (macOS): count each clone family once (dedup
-    /// sizes, the TUI's `c` key) and give a lower bound of what deleting
-    /// each item frees. Makes scans slower
+    /// Detect shared blocks: APFS clones (macOS) or, on Linux btrfs / XFS /
+    /// bcachefs, reflinked and snapshot-shared extents. Counts them once
+    /// (dedup sizes, the TUI's `c` key) and gives a lower bound of what
+    /// deleting each item frees. Makes scans slower
     ///
-    /// Only full clones are deduplicated (a clone modified since counts in
-    /// full); APFS snapshots are not considered; families are relative to the
-    /// scanned tree. Without it, on macOS, freeable_min_bytes is null, and
-    /// hard-linked files never count as freeable (with it, they count where
-    /// all their links are inside).
-    #[arg(long)]
+    /// APFS: only full clones are deduplicated (a clone modified since counts
+    /// in full); APFS snapshots are not considered; families are relative to
+    /// the scanned tree. Linux: one FIEMAP ioctl per file; every shared
+    /// physical byte counts once and shared extents are never freeable;
+    /// compressed btrfs extents are counted in full; not with --cross-fs.
+    /// Without it, on macOS and on Linux reflink filesystems,
+    /// freeable_min_bytes is null, and hard-linked files never count as
+    /// freeable (with it, they count where all their links are inside).
+    #[arg(long, visible_alias = "reflinks")]
     clones: bool,
     /// Size to show and sort by: `du` (allocated, like `du -skx`) or
-    /// `dedup` (each APFS clone family counted once; implies --clones)
+    /// `dedup` (each APFS clone family or shared extent counted once;
+    /// implies --clones)
     #[arg(long, value_enum, default_value_t = report::SizeMode::Du, value_name = "MODE")]
     size_mode: report::SizeMode,
     /// Also read the APFS private size of partial clones (files that may
@@ -170,6 +175,7 @@ fn run(args: Args) -> Result<(), String> {
                     private_sizes: progress.private_sizes.load(Ordering::Relaxed),
                     private_missing: progress.private_missing.load(Ordering::Relaxed),
                     privates: progress.take_private(),
+                    reflink_fs: scan::ReflinkFs::from_code(progress.reflink_fs.load(Ordering::Relaxed)),
                 };
                 if use_cache && let Err(e) = cache::save(&path, one_fs, &snap) {
                     eprintln!("dutype: cannot write cache: {e}");
@@ -188,9 +194,11 @@ fn run(args: Args) -> Result<(), String> {
             shares: scan::may_share_blocks(&path, one_fs),
             size_mode: args.size_mode,
             private: snap.private_table(),
+            reflink_fs: snap.reflink_fs,
         };
         if let Some(cat) = only {
-            let known = report::freeable_known(snap.clones && snap.clone_ids, meta.shares);
+            let detected = report::detected(snap.clones, snap.clone_ids, snap.reflink_fs);
+            let known = report::freeable_known(detected, meta.shares);
             let items = report::find(root, &path, cat, args.top, args.size_mode, known, meta.private);
             if args.json {
                 let doc = serde_json::json!({
@@ -258,6 +266,7 @@ fn run(args: Args) -> Result<(), String> {
                         private_sizes: done.private_sizes,
                         private_missing: done.private_missing,
                         privates: std::mem::take(&mut done.privates),
+                        reflink_fs: done.reflink_fs,
                     }
                 }
             };
@@ -267,6 +276,7 @@ fn run(args: Args) -> Result<(), String> {
             };
             let snap_root_dev = snap.root_dev;
             let (clone_ids, clone_gaps) = (snap.clone_ids, snap.clone_gaps);
+            let snap_reflink_fs = snap.reflink_fs;
             let snap_clones = snap.clones;
             private |= snap.private;
             let (private_sizes, private_missing) = (snap.private_sizes, snap.private_missing);
@@ -275,6 +285,7 @@ fn run(args: Args) -> Result<(), String> {
             app.cached_at = snap.cached_at;
             app.root_dev = snap_root_dev;
             (app.clone_ids, app.clone_gaps) = (clone_ids, clone_gaps);
+            app.reflink_fs = snap_reflink_fs;
             app.clones = snap_clones;
             app.shares = scan::may_share_blocks(&path, one_fs);
             app.private = private;
@@ -323,6 +334,7 @@ struct Done {
     private_sizes: bool,
     private_missing: bool,
     privates: scan::PrivateSizes,
+    reflink_fs: Option<scan::ReflinkFs>,
 }
 
 /// Run `scan` on a thread while drawing the progress screen (`private`:
@@ -381,6 +393,7 @@ fn scan_with_progress<T: Send + 'static>(
             private_sizes: progress.private_sizes.load(Ordering::Relaxed),
             private_missing: progress.private_missing.load(Ordering::Relaxed),
             privates: progress.take_private(),
+            reflink_fs: scan::ReflinkFs::from_code(progress.reflink_fs.load(Ordering::Relaxed)),
         },
     )))
 }
@@ -473,6 +486,7 @@ fn save_tree(app: &mut App, one_fs: bool) -> Option<std::io::Error> {
     let (clones, clone_gaps) = (app.clones, app.clone_gaps);
     let (private, private_sizes, private_missing) = (app.private, app.private_sizes, app.private_missing);
     let privates = std::mem::take(&mut app.privates);
+    let reflink_fs = app.reflink_fs;
     // A cache holds the tree in du order, whatever the TUI shows.
     let (result, privates) = app.in_du_order(|root| {
         let snap = Snapshot {
@@ -488,6 +502,7 @@ fn save_tree(app: &mut App, one_fs: bool) -> Option<std::io::Error> {
             private_sizes,
             private_missing,
             privates,
+            reflink_fs,
         };
         let result = cache::save(&root_path, one_fs, &snap).err();
         *root = snap.root;

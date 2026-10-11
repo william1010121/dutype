@@ -323,7 +323,11 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     let shared = cur.size - cur.dedup();
     if shared > 0 {
         left.push(Span::styled(
-            format!(" clones: −{} shared ", human(shared)),
+            format!(
+                " {}: −{} shared ",
+                if app.reflink_fs.is_some() { "reflinks" } else { "clones" },
+                human(shared)
+            ),
             Style::new().fg(Color::Indexed(117)),
         ));
     }
@@ -588,7 +592,10 @@ fn draw_details(f: &mut Frame, app: &App, area: Rect) {
     let mut space = vec![
         label("frees"),
         Span::styled(
-            app.freeable(node).map_or("?".into(), |b| format!("≥ {}", human(b))),
+            // A file's freeable bytes can depend on its record in the parent.
+            app.freeable(node)
+                .map(|_| cur.dir.as_ref().map_or(0, |d| d.child_freeable(i)))
+                .map_or("?".into(), |b| format!("≥ {}", human(b))),
             Style::new().fg(TEXT),
         ),
     ];

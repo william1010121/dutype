@@ -129,6 +129,9 @@ pub struct App {
     pub private_missing: bool,
     /// The private sizes (see [`crate::scan::PrivateSizes`]).
     pub privates: crate::scan::PrivateSizes,
+    /// The scan root is on a Linux reflink filesystem (whose shared extents
+    /// `--clones` reads).
+    pub reflink_fs: Option<crate::scan::ReflinkFs>,
     /// Size shown and sorted by (`c` toggles).
     pub size_mode: SizeMode,
     pub last_key: Option<(String, &'static str)>,
@@ -178,6 +181,7 @@ impl App {
             private_sizes: false,
             private_missing: false,
             privates: Default::default(),
+            reflink_fs: None,
             size_mode: SizeMode::Du,
             last_key: None,
         };
@@ -436,7 +440,10 @@ impl App {
     pub fn freeable(&self, n: &Node) -> Option<u64> {
         crate::report::freeable_of(
             n,
-            crate::report::freeable_known(self.clones && self.clone_ids, self.shares),
+            crate::report::freeable_known(
+                crate::report::detected(self.clones, self.clone_ids, self.reflink_fs),
+                self.shares,
+            ),
         )
     }
 
@@ -510,17 +517,18 @@ impl App {
                 }
             }
             KeyCode::Char('c') if !self.clones => {
-                self.status = Some("restart with --clones to count APFS clones once".into());
+                self.status = Some("restart with --clones to count clones (APFS) or reflinks (btrfs, XFS) once".into());
             }
             KeyCode::Char('c') => {
                 self.set_size_mode(match self.size_mode {
                     SizeMode::Du => SizeMode::Dedup,
                     SizeMode::Dedup => SizeMode::Du,
                 });
-                self.status = Some(match (self.size_mode, self.clone_ids) {
-                    (SizeMode::Dedup, true) => "sizes: APFS clones counted once".into(),
-                    (SizeMode::Dedup, false) => "sizes: clones counted once (none detectable here)".into(),
-                    (SizeMode::Du, _) => "sizes: allocated, like du".into(),
+                self.status = Some(match (self.size_mode, self.clone_ids, self.reflink_fs) {
+                    (SizeMode::Dedup, _, Some(fs)) => format!("sizes: shared {} extents counted once", fs.label()),
+                    (SizeMode::Dedup, true, None) => "sizes: APFS clones counted once".into(),
+                    (SizeMode::Dedup, false, None) => "sizes: clones counted once (none detectable here)".into(),
+                    (SizeMode::Du, ..) => "sizes: allocated, like du".into(),
                 });
             }
             KeyCode::Char('m') => {

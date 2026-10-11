@@ -121,6 +121,7 @@ dutype --json --category node_modules ~   # every node_modules with its size
 dutype --cache ~       # reuse the last scan of ~ (instant), save new ones
 dutype --refresh ~     # rescan and update the cache
 dutype --json --private ~/.cache/uv   # macOS: also what deleting each partial clone frees
+dutype --clones --size-mode dedup /data     # count clones / reflinked extents once
 ```
 
 With `--cache`, scans are saved in `~/.cache/dutype` (`$XDG_CACHE_HOME/dutype`,
@@ -139,7 +140,7 @@ you and is set to mode 0700, snapshots to 0600. `--json` reports `cached_at`
 | `←` `Backspace` | go up |
 | `Tab` | switch between the folder list and the breakdown |
 | `m` | categories ⇄ extensions |
-| `c` | sizes: allocated (like `du`) ⇄ deduplicated (APFS clones counted once; needs `--clones`) |
+| `c` | sizes: allocated (like `du`) ⇄ deduplicated (APFS clones or shared extents counted once; needs `--clones`) |
 | `o` | reveal in Finder / Explorer / file manager |
 | `y` | copy the selected path to the clipboard (OSC 52 over SSH) |
 | `r` | rescan the current folder only (fast; updates the `--cache`) |
@@ -167,8 +168,8 @@ Options:
       --mcp              Run as an MCP server on stdio, for LLM agents
       --cache            Reuse the last scan of this path if there is one, and save new scans (in ~/.cache/dutype, or $DUTYPE_CACHE_DIR)
       --refresh          Ignore a cached scan: scan again and update the cache (implies --cache)
-      --clones           Detect APFS clones (macOS): count each clone family once (dedup sizes, the TUI's `c` key) and give a lower bound of what deleting each item frees. Makes scans slower
-      --size-mode <MODE> Size to show and sort by: `du` (allocated, like `du -skx`) or `dedup` (each APFS clone family counted once; implies --clones) [default: du]
+      --clones           Detect shared blocks: APFS clones (macOS) or, on Linux btrfs / XFS / bcachefs, reflinked and snapshot-shared extents. Counts them once (dedup sizes, the TUI's `c` key) and gives a lower bound of what deleting each item frees. Makes scans slower [alias: --reflinks]
+      --size-mode <MODE> Size to show and sort by: `du` (allocated, like `du -skx`) or `dedup` (each APFS clone family or shared extent counted once; implies --clones) [default: du]
       --private          Also read the APFS private size of partial clones (macOS only; implies --clones)
 ```
 
@@ -233,10 +234,45 @@ Known limitations:
   hint, so freeable can be lower than what deleting really frees.
 - With `--cache`, clone families are as they were at scan time: changes
   outside a rescanned folder are not seen until a full rescan (`R`).
-- Shared blocks on other filesystems (btrfs/XFS reflinks, ZFS block cloning)
-  are not detected yet: with `--clones` they report
-  `clone_detection: "unsupported"`, dedup equals the `du` size and
-  `freeable_min_bytes` is `null`.
+- ZFS block cloning and OCFS2 reflinks are not detected: with `--clones` they
+  report `clone_detection: "unsupported"`, dedup equals the `du` size and
+  `freeable_min_bytes` is `null`. btrfs, XFS and bcachefs: see below.
+
+### Linux reflinks (btrfs, XFS, bcachefs)
+
+`cp --reflink`, deduplication tools and btrfs snapshots share extents between
+files the same way. With `--clones` (alias `--reflinks`; MCP: `clones: true`),
+when the scan root is on btrfs, XFS (`reflink=1`) or bcachefs, dutype reads
+every file's extent map (`FS_IOC_FIEMAP`, one ioctl per file: about 3–6×
+slower on a warm cache, still several times faster than `btrfs filesystem du`)
+and finds the physical ranges shared with other files. Then:
+
+- **dedup** counts every shared physical byte once, like the "Set shared"
+  column of `btrfs filesystem du`. Each shared range stays with one file
+  (same rule: the shortest path, then the alphabetically first), so folder
+  sizes add up and are the same on every scan. Partial overlaps, such as a
+  copy with a few blocks rewritten, are handled.
+- **freeable** counts only bytes in no shared extent: Linux keeps no
+  reference count that says whether every other user of an extent (a file
+  outside the folder, a snapshot) would go too.
+- `accounting.clone_detection` is `"fiemap"`, with the caveat
+  `snapshots-counted-as-shared` on btrfs: data a snapshot also holds is
+  shared, so deleting the live copy frees nothing until the snapshot goes.
+- A file that cannot be opened (no read permission) cannot be probed: it
+  counts in full and is never freeable, and `clone_detection` becomes
+  `"fiemap-partial"` (caveat `shared-extents-missing-for-some-files`).
+- Compressed btrfs extents report their uncompressed length, not where
+  their bytes are, so shared ones are counted in full (never deduplicated)
+  and their files are never freeable (`compressed-extents-not-deduplicated`).
+
+Without `--clones`, sizes on these filesystems are plain `du` sizes,
+`clone_detection` is `"off"` and `freeable_min_bytes` is null (any file may
+share extents, so no lower bound can be given; the same holds on OCFS2 and
+ZFS, and for any Linux scan with `--cross-fs`). ext4 and other filesystems
+without shared blocks report numbers either way (`"unsupported"` with
+`--clones`). The filesystem is detected once, at the scan root; with
+`--cross-fs` the scan may enter filesystems that cannot be probed, so shared
+extents are not read at all (dedup equals the `du` size).
 
 ## Categories
 
@@ -305,9 +341,11 @@ candidates) and the biggest files, with absolute paths and byte sizes (here
 ```
 
 `size_bytes` is always the `du` size. With `--clones`, `dedup_bytes` counts
-each APFS clone family once and `freeable_min_bytes` is a lower bound of what
-deleting the item frees (see [APFS clones](#apfs-clones); without `--clones`
-it is `null` on macOS); children, special dirs, files and
+each APFS clone family (or, on Linux, each shared extent) once and
+`freeable_min_bytes` is a lower bound of what deleting the item frees (see
+[APFS clones](#apfs-clones) and
+[Linux reflinks](#linux-reflinks-btrfs-xfs-bcachefs); without `--clones` it
+is `null` on macOS and on btrfs / XFS / bcachefs); children, special dirs, files and
 `--category` items carry the same fields plus `clone` (the item is, or holds,
 a file that may share blocks). `--size-mode dedup` ranks the lists by
 `dedup_bytes`.

@@ -26,12 +26,14 @@ fn tools() -> Value {
                 (node_modules, Python envs, .git, build output, caches, ...). Returns totals, \
                 every category's share, the biggest children, the biggest special \
                 directories (cleanup candidates) and the biggest files. Sizes are bytes \
-                allocated on disk (size_bytes, like du). With clones: true (slower), on APFS \
-                dedup_bytes counts each clone family once and freeable_min_bytes is a lower \
-                bound of what deleting an item frees; without it freeable_min_bytes is null on \
-                macOS and leaves out hard-linked files. With private: true \
-                (macOS/APFS; implies clones), files that may share blocks but are not full \
-                clones get private_bytes: what deleting that file alone frees right now. See \
+                allocated on disk (size_bytes, like du). With clones: true (slower), \
+                dedup_bytes counts each APFS clone family (macOS) or each shared extent \
+                (Linux btrfs/XFS/bcachefs reflinks and snapshots) once and \
+                freeable_min_bytes is a lower bound of what deleting an item frees; without \
+                it freeable_min_bytes is null on macOS and on those Linux filesystems, and \
+                leaves out hard-linked files. With private: true (macOS/APFS; implies \
+                clones), files that may share blocks but are not full clones get \
+                private_bytes: what deleting that file alone frees right now. See \
                 accounting. Read-only.",
             "inputSchema": {
                 "type": "object",
@@ -40,7 +42,7 @@ fn tools() -> Value {
                     "top": {"type": "integer", "minimum": 1, "maximum": 500, "default": 20, "description": "Length of each list."},
                     "cross_fs": {"type": "boolean", "default": false, "description": "Descend into other mounted filesystems."},
                     "refresh": {"type": "boolean", "default": false, "description": "Rescan even if a cached scan exists (only matters with dutype --mcp --cache; see cached_at in the result)."},
-                    "clones": {"type": "boolean", "default": false, "description": "Detect APFS clones (macOS; makes the scan slower): fills dedup_bytes and freeable_min_bytes."},
+                    "clones": {"type": "boolean", "default": false, "description": "Detect shared blocks (makes the scan slower): APFS clones on macOS, shared extents (reflinks, snapshots; one FIEMAP ioctl per file) on Linux btrfs/XFS/bcachefs. Fills dedup_bytes and freeable_min_bytes."},
                     "size_mode": {"type": "string", "enum": ["du", "dedup"], "default": "du", "description": "Rank lists by allocated size (du) or by size with APFS clones counted once (dedup; implies clones)."},
                     "private": {"type": "boolean", "default": false, "description": "Also read the APFS private size (private_bytes) of partial clones: bytes freed immediately if that file alone is deleted; affected by APFS snapshots, never summed into folders. Slower; implies clones; macOS only (elsewhere accepted, no values; see accounting.private)."}
                 },
@@ -142,6 +144,7 @@ fn call_tool(name: &str, args: &Value, opts: CacheOpts) -> Result<Value, String>
             shares,
             size_mode,
             private: snap.private_table(),
+            reflink_fs: snap.reflink_fs,
         };
         match category {
             None => serde_json::to_value(report::build(&snap.root, &path, &meta, top.unwrap_or(20))),
@@ -156,7 +159,7 @@ fn call_tool(name: &str, args: &Value, opts: CacheOpts) -> Result<Value, String>
                     c,
                     top.unwrap_or(50),
                     size_mode,
-                    report::freeable_known(snap.clones && snap.clone_ids, shares),
+                    report::freeable_known(report::detected(snap.clones, snap.clone_ids, snap.reflink_fs), shares),
                     meta.private,
                 ),
             })),
@@ -199,6 +202,7 @@ fn call_tool(name: &str, args: &Value, opts: CacheOpts) -> Result<Value, String>
             private_sizes: progress.private_sizes.load(Ordering::Relaxed),
             private_missing: progress.private_missing.load(Ordering::Relaxed),
             privates: progress.take_private(),
+            reflink_fs: scan::ReflinkFs::from_code(progress.reflink_fs.load(Ordering::Relaxed)),
         };
         let value = render(&snap);
         if use_cache {
