@@ -42,6 +42,8 @@ hand-edited (`allow-dirty = ["ci"]`): if you run `dist generate`, keep its
 - Nothing in `scan_dir` may add a syscall, lock or heap allocation per
   directory entry. Classification must use names the scan already read.
 - Progress counters are updated once per directory, never per file.
+  A huge directory may show progress while it is read only through its
+  thread's `Progress::pending` slot (once per bulk batch or 4096 entries).
 - Top-N collection must check `TopN::accepts` before building a `PathBuf`.
 - Changes to `scan.rs` or `category.rs` lookups need a before/after number
   from `bench/run.sh` or hyperfine in the PR description.

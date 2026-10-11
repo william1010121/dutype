@@ -359,8 +359,13 @@ impl ReflinkFs {
 
 #[derive(Default)]
 pub struct Progress {
+    /// Files and bytes of the directories read so far, added once per
+    /// directory; [`Self::shown_files`] also counts those still being read.
     pub files: AtomicU64,
     pub bytes: AtomicU64,
+    /// Files and bytes already read from huge directories still being read
+    /// (opaque: read through [`Self::shown_files`]).
+    pub pending: PendingSlots,
     pub errors: AtomicU64,
     /// Some directory reported APFS clone flags.
     pub clone_ids: AtomicBool,
@@ -383,7 +388,58 @@ pub struct Progress {
     pub found: Mutex<Vec<(PathBuf, u64)>>,
 }
 
+/// One per thread, on its own cache line: a huge directory's progress is
+/// added to the reading thread's slot, so it never contends with other
+/// threads on the shared counters. Slots may wrap: only their sum matters.
+#[derive(Default)]
+#[repr(align(128))]
+struct Pending {
+    files: AtomicU64,
+    bytes: AtomicU64,
+}
+
+pub struct PendingSlots(Box<[Pending]>);
+
+impl Default for PendingSlots {
+    /// A slot per rayon worker, plus one for any other thread.
+    fn default() -> Self {
+        PendingSlots((0..=rayon::current_num_threads()).map(|_| Pending::default()).collect())
+    }
+}
+
+impl PendingSlots {
+    fn mine(&self) -> &Pending {
+        let last = self.0.len() - 1;
+        &self.0[rayon::current_thread_index().map_or(last, |i| i.min(last))]
+    }
+    fn add(&self, files: u64, bytes: u64) {
+        let slot = self.mine();
+        slot.files.fetch_add(files, Ordering::Relaxed);
+        slot.bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+    fn sum(&self, field: impl Fn(&Pending) -> &AtomicU64) -> u64 {
+        self.0
+            .iter()
+            .fold(0u64, |n, s| n.wrapping_add(field(s).load(Ordering::Relaxed)))
+    }
+}
+
 impl Progress {
+    /// Files to show while scanning: those of finished directories plus
+    /// those read so far from directories still being read.
+    pub fn shown_files(&self) -> u64 {
+        self.files
+            .load(Ordering::Relaxed)
+            .wrapping_add(self.pending.sum(|s| &s.files))
+    }
+
+    /// Bytes to show while scanning (see [`Self::shown_files`]).
+    pub fn shown_bytes(&self) -> u64 {
+        self.bytes
+            .load(Ordering::Relaxed)
+            .wrapping_add(self.pending.sum(|s| &s.bytes))
+    }
+
     /// The private sizes the scan found (see [`PrivateSizes`]).
     pub fn take_private(&self) -> PrivateSizes {
         PrivateSizes(std::mem::take(&mut *self.found.lock().unwrap()).into_iter().collect())
@@ -730,9 +786,9 @@ pub(crate) struct ReadStats {
     /// `(raw name, bytes)`: APFS private sizes of the partial clones read
     /// (`--private`; empty, so not allocated, otherwise).
     pub private: Vec<(OsString, u64)>,
-    /// Files (and their allocated bytes) already added to the progress
-    /// counters while a huge directory was being read; `scan_dir` adds
-    /// only the rest.
+    /// Files (and their allocated bytes) added to this thread's pending
+    /// progress while a huge directory was being read; `scan_dir` takes
+    /// them back out when it counts the directory.
     pub reported_files: u64,
     pub reported_bytes: u64,
 }
@@ -742,16 +798,16 @@ pub(crate) struct ReadStats {
 const REPORT_EVERY: usize = 4096;
 
 impl ReadStats {
-    /// Add the files among `entries` (read from a directory that is still
-    /// being read) to the progress counters now, so a huge flat directory
-    /// does not freeze the progress screen until it is fully read.
+    /// Show the files among `entries` (read from a directory that is still
+    /// being read) now, so a huge flat directory does not freeze the
+    /// progress screen until it is fully read. They go to this thread's
+    /// pending slot; the shared counters stay once per directory.
     fn report(&mut self, progress: &Progress, entries: &[Entry]) {
         let (files, bytes) = entries
             .iter()
             .filter(|e| !e.dir)
             .fold((0, 0), |(n, b), e| (n + 1, b + e.alloc));
-        progress.files.fetch_add(files, Ordering::Relaxed);
-        progress.bytes.fetch_add(bytes, Ordering::Relaxed);
+        progress.pending.add(files, bytes);
         self.reported_files += files;
         self.reported_bytes += bytes;
     }
@@ -1293,14 +1349,13 @@ fn scan_dir(
             dir: None,
         });
     }
-    // Minus what the reader reported early. Bytes reported early may count
-    // a hard link again, so the difference can be negative: it wraps.
-    ctx.progress
-        .files
-        .fetch_add(file_entries - reported_files, Ordering::Relaxed);
-    ctx.progress
-        .bytes
-        .fetch_add(file_bytes.wrapping_sub(reported_bytes), Ordering::Relaxed);
+    ctx.progress.files.fetch_add(file_entries, Ordering::Relaxed);
+    ctx.progress.bytes.fetch_add(file_bytes, Ordering::Relaxed);
+    // What the reader showed early is counted now: take it back out.
+    if reported_files > 0 {
+        let neg = |n: u64| n.wrapping_neg();
+        ctx.progress.pending.add(neg(reported_files), neg(reported_bytes));
+    }
 
     let mut cats = vec![0u64; reg.len()].into_boxed_slice();
     cats[effective.unwrap_or(reg.other()).index()] += own_size;
@@ -1522,8 +1577,10 @@ mod progress_tests {
             // Bulk reads may report the last batch too: nothing is left for
             // `scan_dir` then.
             assert!(stats.reported_files > 0 && stats.reported_files <= n as u64);
-            assert_eq!(progress.files.load(Ordering::Relaxed), stats.reported_files);
-            assert_eq!(progress.bytes.load(Ordering::Relaxed), stats.reported_bytes);
+            // Shown, but not in the shared counters, which stay once per dir.
+            assert_eq!(progress.shown_files(), stats.reported_files);
+            assert_eq!(progress.shown_bytes(), stats.reported_bytes);
+            assert_eq!(progress.files.load(Ordering::Relaxed), 0);
         };
         read(true);
         read(false);
@@ -1539,6 +1596,9 @@ mod progress_tests {
             .sum();
         assert_eq!(progress.files.load(Ordering::Relaxed), n as u64 + 1);
         assert_eq!(progress.bytes.load(Ordering::Relaxed), file_bytes);
+        // Nothing pending is left once the scan is done.
+        assert_eq!(progress.shown_files(), n as u64 + 1);
+        assert_eq!(progress.shown_bytes(), file_bytes);
         fs::remove_dir_all(&d).unwrap();
     }
 }
