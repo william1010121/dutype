@@ -162,7 +162,7 @@ fn parse(fd: &Fd, d: &[u8]) -> Option<Entry> {
     let name = OsStr::from_bytes(raw.strip_suffix(&[0]).unwrap_or(raw));
     let need = libc::ATTR_CMN_DEVID | libc::ATTR_CMN_OBJTYPE | libc::ATTR_CMN_FILEID;
     if common & need != need {
-        return None;
+        return lstat_at(fd, name);
     }
     // dev_t is signed; widen it like `MetadataExt::dev` does.
     let dev = c.u32()? as i32 as u64;
@@ -224,4 +224,44 @@ fn lstat_at(fd: &Fd, name: &OsStr) -> Option<Entry> {
         dev: st.st_dev as u64,
         link: (!dir && st.st_nlink > 1).then_some((st.st_dev as u64, st.st_ino)),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_common_attrs_fall_back_to_lstat() {
+        let d = std::env::temp_dir().join(format!("dutype-bulk-attrs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("f.bin"), vec![1u8; 10_000]).unwrap();
+        let cpath = CString::new(d.as_os_str().as_bytes()).unwrap();
+        let fd = Fd(unsafe { libc::open(cpath.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY) });
+        assert!(fd.0 >= 0);
+        // An entry with a name but no ATTR_CMN_FILEID: length, returned set,
+        // then the name's attrreference pointing just past itself.
+        let name = b"f.bin\0";
+        let mut e = Vec::new();
+        let common =
+            libc::ATTR_CMN_RETURNED_ATTRS | libc::ATTR_CMN_NAME | libc::ATTR_CMN_DEVID | libc::ATTR_CMN_OBJTYPE;
+        for w in [
+            0,
+            common,
+            0,
+            0,
+            libc::ATTR_FILE_LINKCOUNT | libc::ATTR_FILE_ALLOCSIZE,
+            0,
+        ] {
+            e.extend_from_slice(&w.to_ne_bytes());
+        }
+        e.extend_from_slice(&8i32.to_ne_bytes());
+        e.extend_from_slice(&(name.len() as u32).to_ne_bytes());
+        e.extend_from_slice(name);
+        let len = e.len() as u32;
+        e[..4].copy_from_slice(&len.to_ne_bytes());
+        let got = parse(&fd, &e).expect("entry kept");
+        assert_eq!(Some(got), lstat_at(&fd, OsStr::new("f.bin")));
+        std::fs::remove_dir_all(&d).unwrap();
+    }
 }
