@@ -385,8 +385,10 @@ mod platform {
         false
     }
 
+    /// Hard links are not identified here (and ReFS can clone blocks), so
+    /// nothing is known to be freeable.
     pub fn may_share_blocks(_: &Path) -> bool {
-        false
+        true
     }
 
     pub fn allocated(m: &Metadata) -> u64 {
@@ -501,8 +503,9 @@ pub fn clone_refcnt(path: &Path) -> Option<u32> {
     platform::clone_refcnt(path)
 }
 
-/// Files below `root` may share blocks, so a freeable lower bound needs
-/// shared-block detection. Checked once, for the root's filesystem; with
+/// Files below `root` may share blocks (or links that cannot be told apart,
+/// on Windows), so a freeable lower bound needs shared-block detection.
+/// Checked once, for the root's filesystem; with
 /// `--cross-fs` the scan may enter other filesystems, so on Linux (where
 /// only some filesystems share blocks) it is then always assumed.
 pub fn may_share_blocks(root: &Path, one_fs: bool) -> bool {
@@ -934,7 +937,7 @@ mod share_tests {
             assert!(may_share_blocks(&tmp, false));
         }
         if cfg!(windows) {
-            assert!(!may_share_blocks(&tmp, false));
+            assert!(may_share_blocks(&tmp, true));
         }
     }
 }
@@ -1013,6 +1016,20 @@ mod bulk_tests {
         let node = scan_excluding(&d, true, false, &progress, None).unwrap();
         assert!(!progress.clone_ids.load(Ordering::Relaxed));
         assert_eq!(node.dedup(), node.size);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// --clones on APFS with only dirs: detection works (dirs report the
+    /// flags), and a tree without files has known freeable bytes anyway.
+    #[test]
+    fn dirs_only_tree_reports_detection() {
+        let d = std::env::temp_dir().join(format!("dutype-bulk-dirs-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(d.join("a/b")).unwrap();
+        let progress = Progress::default();
+        let node = scan_excluding(&d, true, true, &progress, None).unwrap();
+        assert!(progress.clone_ids.load(Ordering::Relaxed));
+        assert_eq!(crate::report::freeable_of(&node, false), Some(node.freeable()));
         fs::remove_dir_all(&d).unwrap();
     }
 

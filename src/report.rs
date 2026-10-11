@@ -42,6 +42,12 @@ pub struct Meta {
     pub size_mode: SizeMode,
 }
 
+/// `n`'s freeable bytes, when known: always for a subtree without files
+/// (only dirs' own blocks), else when `known` (see [`freeable_known`]).
+pub fn freeable_of(n: &Node, known: bool) -> Option<u64> {
+    (known || n.files() == 0).then(|| n.freeable())
+}
+
 /// Whether a lower bound of freed bytes can be given: where files may share
 /// blocks (`shares`: APFS, btrfs, XFS, ...), only a scan that detected
 /// shared blocks (`--clones` on APFS) can tell.
@@ -189,7 +195,7 @@ impl Item {
             cat: n.cat,
             size: n.size,
             dedup,
-            freeable: known.then(|| n.freeable()),
+            freeable: freeable_of(n, known),
             clone: n.clone,
         }
     }
@@ -286,7 +292,7 @@ pub fn build(root: &Node, root_path: &Path, meta: &Meta, top: usize) -> Report {
         size: human(root.size),
         dedup_bytes: dedup,
         clone_shared_bytes: root.size - dedup,
-        freeable_min_bytes: known.then(|| root.freeable()),
+        freeable_min_bytes: freeable_of(root, known),
         accounting: accounting(meta),
         files: root.files(),
         scan_seconds: (meta.elapsed.as_secs_f64() * 1000.0).round() / 1000.0,
@@ -311,7 +317,7 @@ pub fn build(root: &Node, root_path: &Path, meta: &Meta, top: usize) -> Report {
                     special: c.special.then(|| c.cat.label()),
                     top_categories: shares(&c.cats(), c.size, 3),
                     dedup_bytes: dedup,
-                    freeable_min_bytes: known.then(|| c.freeable()),
+                    freeable_min_bytes: freeable_of(c, known),
                     clone: c.clone,
                 }
             })

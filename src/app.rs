@@ -380,7 +380,10 @@ impl App {
     /// Lower bound of what deleting `n` frees, if it can be known (see
     /// [`crate::report::freeable_known`]).
     pub fn freeable(&self, n: &Node) -> Option<u64> {
-        crate::report::freeable_known(self.clones && self.clone_ids, self.shares).then(|| n.freeable())
+        crate::report::freeable_of(
+            n,
+            crate::report::freeable_known(self.clones && self.clone_ids, self.shares),
+        )
     }
 
     /// Size of child `i` of the current folder in the current mode.

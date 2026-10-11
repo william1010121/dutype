@@ -179,6 +179,10 @@ fn parse(fd: &Fd, d: &[u8], clones: bool, clone_ids: &mut bool) -> Option<Entry>
     let dir_attrs = c.u32()?;
     let file_attrs = c.u32()?;
     let ext_attrs = c.u32()?;
+    // Dirs report the flags too, so a tree of dirs only still counts.
+    if ext_attrs & libc::ATTR_CMNEXT_EXT_FLAGS != 0 {
+        *clone_ids = true;
+    }
     // ATTR_CMN_ERROR comes right after the returned set.
     let error = match common & ATTR_CMN_ERROR != 0 {
         true => c.u32()?,
@@ -244,9 +248,6 @@ fn parse(fd: &Fd, d: &[u8], clones: bool, clone_ids: &mut bool) -> Option<Entry>
         true => c.u64()?,
         false => 0,
     };
-    if ext_attrs & libc::ATTR_CMNEXT_EXT_FLAGS != 0 {
-        *clone_ids = true;
-    }
     Some(Entry {
         name: name.to_os_string(),
         dir: false,

@@ -206,7 +206,9 @@ clone, so no lower bound can be promised. On Linux, `freeable_min_bytes` is
 also `null` when the scanned root is on a filesystem with reflinks or block
 cloning (btrfs, XFS, bcachefs, OCFS2, ZFS; detected once, for the root) and
 always with `--cross-fs` (the scan may enter such a filesystem); on ext4 and
-other filesystems without shared blocks it accounts for hard links. A `--cache` snapshot made without `--clones` is not
+other filesystems without shared blocks it accounts for hard links. On
+Windows it is always `null` (hard links are not identified there). A folder
+without files always has a known value (its own blocks). A `--cache` snapshot made without `--clones` is not
 reused for a `--clones` run.
 
 Known limitations:
