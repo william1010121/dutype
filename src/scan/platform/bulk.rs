@@ -280,8 +280,8 @@ fn parse(fd: &Fd, d: &[u8], clones: bool, private: bool, stats: &mut ReadStats) 
     if private && partial {
         match private_size(fd, raw) {
             PrivateReply::Size(bytes) => stats.private.push((name.to_os_string(), bytes.min(alloc))),
-            PrivateReply::Missing => {}
-            PrivateReply::Unsupported => stats.private_missing = true,
+            PrivateReply::Gone => {}
+            PrivateReply::Unknown => stats.private_missing = true,
         }
     }
     Some(Entry {
@@ -333,18 +333,19 @@ fn lstat_at(fd: &Fd, name: &OsStr, clones: bool) -> Option<Entry> {
 #[derive(Debug, PartialEq)]
 enum PrivateReply {
     Size(u64),
-    /// Not for this file (gone, unreadable).
-    Missing,
-    /// The volume does not report the attribute.
-    Unsupported,
+    /// The file is gone (deleted since the directory was read).
+    Gone,
+    /// Not reported (no such attribute on the volume, no permission, an
+    /// I/O error): the scan's private sizes are incomplete.
+    Unknown,
 }
 
 /// Classify a `getattrlistat` reply for `ATTR_CMNEXT_PRIVATESIZE`.
 fn private_reply(rc: libc::c_int, errno: Option<i32>, returned: u32, value: u64) -> PrivateReply {
     match (rc, errno) {
         (0, _) if returned & libc::ATTR_CMNEXT_PRIVATESIZE != 0 => PrivateReply::Size(value),
-        (0, _) | (_, Some(libc::ENOTSUP | libc::EINVAL)) => PrivateReply::Unsupported,
-        _ => PrivateReply::Missing,
+        (_, Some(libc::ENOENT)) if rc != 0 => PrivateReply::Gone,
+        _ => PrivateReply::Unknown,
     }
 }
 
@@ -353,7 +354,7 @@ fn private_reply(rc: libc::c_int, errno: Option<i32>, returned: u32, value: u64)
 /// the bytes only this file holds.
 fn private_size(fd: &Fd, raw: &[u8]) -> PrivateReply {
     if raw.last() != Some(&0) {
-        return PrivateReply::Missing;
+        return PrivateReply::Unknown;
     }
     let mut list = libc::attrlist {
         bitmapcount: libc::ATTR_BIT_MAP_COUNT,
@@ -587,15 +588,17 @@ mod tests {
         std::fs::remove_dir_all(&d).unwrap();
     }
 
-    /// A volume that answers without the private-size attribute is not
-    /// reported as having private sizes; a vanished file just has none.
+    /// Any lookup that does not give a size makes the scan's private sizes
+    /// incomplete, except for a file that vanished meanwhile.
     #[test]
     fn private_reply_kinds() {
         let size = libc::ATTR_CMNEXT_PRIVATESIZE;
         assert_eq!(private_reply(0, None, size, 7), PrivateReply::Size(7));
-        assert_eq!(private_reply(0, None, 0, 0), PrivateReply::Unsupported);
-        assert_eq!(private_reply(-1, Some(libc::ENOTSUP), 0, 0), PrivateReply::Unsupported);
-        assert_eq!(private_reply(-1, Some(libc::ENOENT), 0, 0), PrivateReply::Missing);
+        assert_eq!(private_reply(0, None, 0, 0), PrivateReply::Unknown);
+        assert_eq!(private_reply(-1, Some(libc::ENOTSUP), 0, 0), PrivateReply::Unknown);
+        assert_eq!(private_reply(-1, Some(libc::EACCES), 0, 0), PrivateReply::Unknown);
+        assert_eq!(private_reply(-1, Some(libc::EIO), 0, 0), PrivateReply::Unknown);
+        assert_eq!(private_reply(-1, Some(libc::ENOENT), 0, 0), PrivateReply::Gone);
     }
 
     #[test]

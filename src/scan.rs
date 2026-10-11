@@ -599,7 +599,8 @@ pub(crate) struct ReadStats {
     /// Private sizes were requested and the volume returned the clone flags
     /// that pick out partial clones (APFS).
     pub private_sizes: bool,
-    /// The volume did not report the private size of a partial clone.
+    /// A partial clone's private size was not reported (no such attribute,
+    /// no permission, an I/O error).
     pub private_missing: bool,
     /// `(raw name, bytes)`: APFS private sizes of the partial clones read
     /// (`--private`; empty, so not allocated, otherwise).
@@ -696,13 +697,30 @@ fn display_name(n: OsString) -> (Box<str>, bool) {
 }
 
 /// Add the private sizes read in the directory `path` to the scan's, by
-/// path relative to the root with the names the tree uses.
+/// path relative to the root with the names the tree uses. A non-UTF-8
+/// name on the way renders like some valid name could, so such a size is
+/// left out (and the scan's sizes marked incomplete) rather than risk
+/// showing it on another file.
 fn record_private(path: &Path, found: Vec<(OsString, u64)>, ctx: &Ctx) {
-    let mut rel = PathBuf::new();
-    for c in path.strip_prefix(ctx.root).unwrap_or(Path::new("")) {
-        rel.push(&*display_name(c.to_os_string()).0);
+    let rel = path.strip_prefix(ctx.root).unwrap_or(Path::new(""));
+    let Some(rel) = rel.to_str().map(PathBuf::from) else {
+        ctx.progress.private_missing.store(true, Ordering::Relaxed);
+        return;
+    };
+    let mut lossy = false;
+    let found: Vec<_> = found
+        .into_iter()
+        .filter_map(|(n, b)| match n.to_str() {
+            Some(n) => Some((rel.join(n), b)),
+            None => {
+                lossy = true;
+                None
+            }
+        })
+        .collect();
+    if lossy {
+        ctx.progress.private_missing.store(true, Ordering::Relaxed);
     }
-    let found = found.into_iter().map(|(n, b)| (rel.join(&*display_name(n).0), b));
     ctx.progress.found.lock().unwrap().extend(found);
 }
 
@@ -1071,6 +1089,40 @@ impl<T: Ord> TopN<T> {
         let mut v: Vec<T> = self.heap.into_iter().map(|Reverse(t)| t).collect();
         v.sort_by(|a, b| b.cmp(a));
         v
+    }
+}
+
+/// A private size found under a non-UTF-8 name is left out: its rendering
+/// could equal a valid sibling's name.
+#[cfg(all(test, unix))]
+mod record_private_tests {
+    use super::*;
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    #[test]
+    fn lossy_names_are_left_out() {
+        let progress = Progress::default();
+        let root = Path::new("/r");
+        let ctx = Ctx {
+            progress: &progress,
+            root,
+            root_dev: 0,
+            one_fs: true,
+            clones: true,
+            seen_inodes: Mutex::new(FxHashSet::default()),
+            exclude: None,
+        };
+        let raw = |b: &[u8]| OsStr::from_bytes(b).to_os_string();
+        record_private(&root.join("d"), vec![(raw(b"\\xff"), 1)], &ctx);
+        assert!(!progress.private_missing.load(Ordering::Relaxed));
+        record_private(&root.join("d"), vec![(raw(b"\xff"), 2)], &ctx);
+        assert!(progress.private_missing.load(Ordering::Relaxed));
+        record_private(&root.join(OsStr::from_bytes(b"\xfe")), vec![(raw(b"f"), 3)], &ctx);
+        let got = progress.take_private();
+        assert_eq!(got.0.len(), 1);
+        let key: PathBuf = ["d", "\\xff"].iter().collect();
+        assert_eq!(got.get(&key), Some(1));
     }
 }
 
