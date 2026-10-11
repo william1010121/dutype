@@ -322,7 +322,6 @@ mod platform {
             return r;
         }
         let first = out.len();
-        let _ = private;
         let mut r = super::read_entries_std(path, cancel, out);
         // On macOS any volume may share blocks (APFS clones, server-side
         // copies); without bulk flags a file's clone state is unknown.
@@ -330,6 +329,8 @@ mod platform {
             let gaps = unknown_clone_state(&mut out[first..]);
             if let Ok(stats) = &mut r {
                 stats.clone_gaps += gaps;
+                // Any of them may be a partial clone of unknown private size.
+                stats.private_missing |= private && gaps > 0;
             }
         }
         r
@@ -880,9 +881,7 @@ fn scan_dir(
     if stats.private_sizes {
         ctx.progress.private_sizes.store(true, Ordering::Relaxed);
     }
-    // A file whose clone flags could not be read may be a partial clone
-    // whose private size is then unknown.
-    if stats.private_missing || (ctx.progress.private && stats.clone_gaps > 0) {
+    if stats.private_missing {
         ctx.progress.private_missing.store(true, Ordering::Relaxed);
     }
     if !stats.private.is_empty() {
