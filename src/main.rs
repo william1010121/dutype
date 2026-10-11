@@ -164,7 +164,7 @@ fn run(args: Args) -> Result<(), String> {
                 print(&serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?);
                 print("\n");
             } else {
-                print(&report::find_to_text(cat, &items));
+                print(&report::find_to_text(cat, &items, args.size_mode));
             }
         } else {
             let r = report::build(

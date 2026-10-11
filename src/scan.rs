@@ -726,17 +726,19 @@ fn scan_dir(
     }
 }
 
-/// Like [`walk`], but `f` also gets the nodes between `node` and the visited
-/// one (outermost first), e.g. to resolve real paths.
+/// Like [`walk`], but `f` also gets the visited node's deduplicated size
+/// (see [`DirInfo::child_dedup`]) and the nodes between `node` and it
+/// (outermost first), e.g. to resolve real paths.
 pub fn walk_with_ancestors<'a>(
     node: &'a Node,
     rel: &mut PathBuf,
     ancestors: &mut Vec<&'a Node>,
-    f: &mut impl FnMut(&'a Node, &Path, &[&'a Node]) -> bool,
+    f: &mut impl FnMut(&'a Node, u64, &Path, &[&'a Node]) -> bool,
 ) {
-    for c in node.children() {
+    let Some(d) = node.dir.as_deref() else { return };
+    for (i, c) in d.children.iter().enumerate() {
         rel.push(&*c.name);
-        if f(c, rel, ancestors) && c.is_dir() {
+        if f(c, d.child_dedup(i), rel, ancestors) && c.is_dir() {
             ancestors.push(c);
             walk_with_ancestors(c, rel, ancestors, f);
             ancestors.pop();

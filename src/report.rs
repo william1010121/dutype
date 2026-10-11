@@ -382,17 +382,49 @@ pub fn find(root: &Node, root_path: &Path, cat: Category, top: usize, mode: Size
     list.into_sorted().into_iter().map(|i| i.entry(root_path)).collect()
 }
 
-pub fn find_to_text(cat: Category, items: &[Entry]) -> String {
+/// Text for [`find`]'s items, showing the sizes they were ranked by.
+pub fn find_to_text(cat: Category, items: &[Entry], mode: SizeMode) -> String {
     use std::fmt::Write as _;
-    let total: u64 = items.iter().map(|e| e.size_bytes).sum();
+    let size = |e: &Entry| mode.pick(e.size_bytes, e.dedup_bytes);
+    let total: u64 = items.iter().map(size).sum();
     let mut out = format!(
-        "Largest {} ({} shown, {} total):\n",
+        "Largest {} ({} shown, {} total{}):\n",
         cat.label(),
         items.len(),
-        human(total)
+        human(total),
+        if mode == SizeMode::Dedup {
+            ", clones counted once"
+        } else {
+            ""
+        }
     );
     for e in items {
-        let _ = writeln!(out, "  {:>10}  {}", e.size, e.path);
+        let _ = writeln!(out, "  {:>10}  {}", human(size(e)), e.path);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::category::reg;
+
+    #[test]
+    fn category_text_shows_the_ranked_size() {
+        let item = |path: &str, size: u64, dedup: u64| Entry {
+            path: path.into(),
+            category: reg().other().label(),
+            size_bytes: size,
+            size: human(size),
+            dedup_bytes: dedup,
+            freeable_min_bytes: 0,
+            clone: dedup < size,
+        };
+        let items = [item("/a", 3 << 20, 3 << 20), item("/b", 2 << 20, 0)];
+        let du = find_to_text(reg().other(), &items, SizeMode::Du);
+        assert!(du.contains("5.0 MiB total)") && du.contains("2.0 MiB  /b"), "{du}");
+        let dedup = find_to_text(reg().other(), &items, SizeMode::Dedup);
+        assert!(dedup.contains("3.0 MiB total, clones counted once)"), "{dedup}");
+        assert!(dedup.contains("0 B  /b"), "{dedup}");
+    }
 }

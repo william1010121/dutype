@@ -587,25 +587,27 @@ impl App {
         };
         let base = self.fs_path();
         let cur = self.current();
+        let by_dedup = self.size_mode == SizeMode::Dedup;
         let mut top = TopN::new(POPUP_LIMIT);
         // The real path is resolved through the node chain (raw-name aware)
         // only for items that make the cut.
-        let mut push = |n: &Node, path: &Path, ancestors: &[&Node]| {
-            if top.accepts(|min: &(u64, PathBuf, Option<PathBuf>)| n.size > min.0) {
+        let mut push = |n: &Node, dedup: u64, path: &Path, ancestors: &[&Node]| {
+            let size = if by_dedup { dedup } else { n.size };
+            if top.accepts(|min: &(u64, PathBuf, Option<PathBuf>)| size > min.0) {
                 let fs = base
                     .as_deref()
                     .and_then(|b| crate::scan::resolve_chain(b, ancestors, n));
-                top.push((n.size, path.to_path_buf(), fs));
+                top.push((size, path.to_path_buf(), fs));
             }
         };
-        let title;
+        let mut title;
         match &item.key {
             // For directory kinds, list the special directories themselves.
             Key::Cat(c) if c.is_dir_kind() => {
                 title = format!("{} directories", c.label());
-                walk_with_ancestors(cur, &mut PathBuf::new(), &mut Vec::new(), &mut |n, p, a| {
+                walk_with_ancestors(cur, &mut PathBuf::new(), &mut Vec::new(), &mut |n, d, p, a| {
                     if n.special && n.cat == *c {
-                        push(n, p, a);
+                        push(n, d, p, a);
                         return false;
                     }
                     true
@@ -613,22 +615,25 @@ impl App {
             }
             Key::Cat(c) => {
                 title = format!("{} files", c.label());
-                walk_with_ancestors(cur, &mut PathBuf::new(), &mut Vec::new(), &mut |n, p, a| {
+                walk_with_ancestors(cur, &mut PathBuf::new(), &mut Vec::new(), &mut |n, d, p, a| {
                     if !n.is_dir() && n.cat == *c {
-                        push(n, p, a);
+                        push(n, d, p, a);
                     }
                     true
                 });
             }
             Key::Ext(e) => {
                 title = format!("*.{e} files");
-                walk_with_ancestors(cur, &mut PathBuf::new(), &mut Vec::new(), &mut |n, p, a| {
+                walk_with_ancestors(cur, &mut PathBuf::new(), &mut Vec::new(), &mut |n, d, p, a| {
                     if !n.is_dir() && ext_key(&n.name) == *e {
-                        push(n, p, a);
+                        push(n, d, p, a);
                     }
                     true
                 });
             }
+        }
+        if by_dedup {
+            title.push_str(" · clones counted once");
         }
         let items: Vec<_> = top.into_sorted().into_iter().map(|(s, p, fs)| (p, s, fs)).collect();
         let state = first_selected(items.len());
@@ -1121,7 +1126,29 @@ mod tests {
         assert_eq!(inside, ["copies", "plain", "orig"]);
         assert_eq!(names(&app), ["plain", "orig", "copies"]);
         assert_eq!(app.states[0].selected(), Some(2));
+
+        // A category popup ranks and shows dedup sizes too: the copies in
+        // "copies" add nothing once "orig" holds the family.
+        app.focus = Focus::Breakdown;
+        app.breakdown_state.select(Some(0));
+        app.open_popup();
+        let sizes = |app: &App| {
+            app.popup
+                .as_ref()
+                .unwrap()
+                .items
+                .iter()
+                .map(|i| i.1)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(sizes(&app), [6 << 20, 4 << 20, 0, 0]);
+        assert_eq!(app.popup.as_ref().unwrap().items[1].0, Path::new("orig"));
+        app.popup = None;
         app.set_size_mode(SizeMode::Du);
+        app.open_popup();
+        assert_eq!(sizes(&app), [6 << 20, 4 << 20, 4 << 20, 4 << 20]);
+        app.popup = None;
+        app.focus = Focus::Entries;
 
         // Rescan "copies" after a third clone appears there.
         let ok = Command::new("cp")
