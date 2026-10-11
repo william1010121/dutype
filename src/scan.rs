@@ -214,8 +214,20 @@ mod platform {
         if let Some(r) = bulk::read_entries(path, cancel, out, clones) {
             return r;
         }
-        let _ = clones;
-        super::read_entries_std(path, cancel, out)
+        let first = out.len();
+        let r = super::read_entries_std(path, cancel, out);
+        // On macOS any volume may share blocks (APFS clones, server-side
+        // copies); without bulk flags a file's clone state is unknown.
+        if clones && cfg!(target_os = "macos") {
+            unknown_clone_state(&mut out[first..]);
+        }
+        r
+    }
+
+    /// Files whose clone state could not be read: they may share blocks, so
+    /// they are never counted as freeable.
+    pub fn unknown_clone_state(entries: &mut [Entry]) {
+        entries.iter_mut().filter(|e| !e.dir).for_each(|e| e.may_share = true);
     }
 
     /// Files in the APFS full-clone family of the file at `path`, where the
@@ -888,6 +900,27 @@ mod escape_tests {
 #[cfg(test)]
 mod share_tests {
     use super::may_share_blocks;
+
+    /// Files from a reader without clone flags (with --clones on macOS) may
+    /// share blocks; dirs are left alone.
+    #[cfg(unix)]
+    #[test]
+    fn unknown_clone_state_marks_files() {
+        use super::{Entry, platform};
+        let entry = |name: &str, dir: bool| Entry {
+            name: name.into(),
+            dir,
+            alloc: 4096,
+            dev: 1,
+            ino: 2,
+            nlink: 1,
+            clone: None,
+            may_share: false,
+        };
+        let mut v = vec![entry("f", false), entry("d", true)];
+        platform::unknown_clone_state(&mut v);
+        assert_eq!((v[0].may_share, v[1].may_share), (true, false));
+    }
 
     /// APFS always may share blocks; with --cross-fs a Linux scan may enter a
     /// reflink filesystem, so it is assumed there too.

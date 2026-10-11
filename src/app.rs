@@ -307,11 +307,12 @@ impl App {
         let by_dedup = self.size_mode == SizeMode::Dedup;
         if by_dedup {
             sort_tree(&mut self.root, true);
-        } else {
-            for k in (0..self.stack.len()).rev() {
-                if let Some(dir) = node_at_mut(&mut self.root, &self.stack[..k]).dir.as_mut() {
-                    dir.sort_children(false);
-                }
+        }
+        // Ancestors' sizes changed; `sort_tree` skips those left without
+        // clones below.
+        for k in (0..self.stack.len()).rev() {
+            if let Some(dir) = node_at_mut(&mut self.root, &self.stack[..k]).dir.as_mut() {
+                dir.sort_children(by_dedup);
             }
         }
         // The subtree's old errors were replaced, not added to.
@@ -1206,6 +1207,49 @@ mod tests {
         assert_eq!(names(&app), ["plain", "orig", "copies"]);
         app.set_size_mode(SizeMode::Du);
         same(&app.root, &full(&root));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// In dedup mode, a rescan that removes the last clone below an
+    /// ancestor still re-sorts that ancestor by its new sizes.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn dedup_rescan_resorts_ancestors_without_clones() {
+        let root = temp("dedup-resort");
+        fs::create_dir_all(root.join("p")).unwrap();
+        fs::create_dir_all(root.join("q")).unwrap();
+        fs::write(root.join("p/x"), vec![1u8; 4 << 20]).unwrap();
+        let ok = std::process::Command::new("cp")
+            .arg("-c")
+            .arg(root.join("p/x"))
+            .arg(root.join("p/y"))
+            .status()
+            .unwrap();
+        assert!(ok.success());
+        fs::write(root.join("q/z"), vec![2u8; 6 << 20]).unwrap();
+        let mut app = App::new(full(&root), root.clone(), Duration::ZERO, 0);
+        (app.clones, app.clone_ids) = (true, true);
+        app.set_size_mode(SizeMode::Dedup);
+        let names = |app: &App| {
+            app.root
+                .children()
+                .iter()
+                .map(|c| c.name.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&app), ["q", "p"]);
+
+        // x and y become plain files (EF_MAY_SHARE_BLOCKS is sticky, so both
+        // are written anew): p (8 MiB, no clones) now beats q (6 MiB).
+        for f in ["p/x", "p/y"] {
+            fs::remove_file(root.join(f)).unwrap();
+            fs::write(root.join(f), vec![3u8; 4 << 20]).unwrap();
+        }
+        app.go_to(&["p".into()]);
+        let fresh = scan_subtree(&app.fs_path().unwrap(), true, true, &Progress::default(), None, None).unwrap();
+        app.replace_current(fresh, true);
+        assert!(!app.root.clone);
+        assert_eq!(names(&app), ["p", "q"]);
         fs::remove_dir_all(&root).unwrap();
     }
 
