@@ -134,6 +134,7 @@ fn call_tool(name: &str, args: &Value, opts: CacheOpts) -> Result<Value, String>
                     unreadable: snap.errors,
                     clones: snap.clones,
                     clone_ids: snap.clone_ids,
+                    clone_gaps: snap.clone_gaps,
                     shares,
                     size_mode,
                 },
@@ -182,6 +183,7 @@ fn call_tool(name: &str, args: &Value, opts: CacheOpts) -> Result<Value, String>
             root_dev,
             clones,
             clone_ids: progress.clone_ids.load(Ordering::Relaxed),
+            clone_gaps: progress.clone_gaps.load(Ordering::Relaxed),
         };
         let value = render(&snap);
         if use_cache {

@@ -28,6 +28,8 @@ pub struct Snapshot {
     pub clones: bool,
     /// The scan could see APFS clone families (see `Progress::clone_ids`).
     pub clone_ids: bool,
+    /// ... but not for every file (see `Progress::clone_gaps`).
+    pub clone_gaps: bool,
 }
 
 pub fn fnv1a(seed: u64, bytes: &[u8]) -> u64 {
@@ -202,7 +204,10 @@ fn write_to(file: &Path, root_path: &Path, snap: &Snapshot) -> io::Result<()> {
         w.varint(at.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()))?;
         w.varint(snap.scan_time.as_millis() as u64)?;
         w.varint(snap.errors)?;
-        w.0.write_all(&[snap.root_dev.is_some() as u8 | (snap.clone_ids as u8) << 1 | (snap.clones as u8) << 2])?;
+        w.0.write_all(&[snap.root_dev.is_some() as u8
+            | (snap.clone_ids as u8) << 1
+            | (snap.clones as u8) << 2
+            | (snap.clone_gaps as u8) << 3])?;
         w.varint(snap.root_dev.unwrap_or(0))?;
         w.bytes(root_path.as_os_str().as_encoded_bytes())?;
         w.node(&snap.root)?;
@@ -230,10 +235,11 @@ fn read_from(file: &Path, root_path: &Path) -> Option<Snapshot> {
     let scan_time = Duration::from_millis(r.varint()?);
     let errors = r.varint()?;
     let flags = *r.take(1)?.first()?;
-    if flags > 7 {
+    if flags > 15 {
         return None;
     }
     let (has_dev, clone_ids, clones) = (flags & 1 != 0, flags & 2 != 0, flags & 4 != 0);
+    let clone_gaps = flags & 8 != 0;
     let dev = r.varint()?;
     let root_dev = has_dev.then_some(dev);
     // A hash collision between two paths must not show the wrong tree.
@@ -253,6 +259,7 @@ fn read_from(file: &Path, root_path: &Path) -> Option<Snapshot> {
         root_dev,
         clones,
         clone_ids,
+        clone_gaps,
     })
 }
 
@@ -524,13 +531,17 @@ mod tests {
             root_dev: None,
             clones: true,
             clone_ids: progress.clone_ids.load(std::sync::atomic::Ordering::Relaxed),
+            clone_gaps: true,
         };
         assert_eq!(snap.clone_ids, cfg!(target_os = "macos"));
         let file = temp("shared-out").join("c.bin");
         write_to(&file, &src, &snap).unwrap();
         let back = read_from(&file, &src).unwrap();
         same(&snap.root, &back.root);
-        assert_eq!((back.clones, back.clone_ids), (snap.clones, snap.clone_ids));
+        assert_eq!(
+            (back.clones, back.clone_ids, back.clone_gaps),
+            (snap.clones, snap.clone_ids, snap.clone_gaps)
+        );
         assert!(answers(&back, true) && answers(&back, false));
         let plain = Snapshot { clones: false, ..back };
         write_to(&file, &src, &plain).unwrap();
@@ -556,6 +567,7 @@ mod tests {
             root_dev: None,
             clones: false,
             clone_ids: false,
+            clone_gaps: false,
         };
         let file = temp("shared-bad-out").join("c.bin");
         write_to(&file, &src, &snap).unwrap();
@@ -603,6 +615,7 @@ mod tests {
             root_dev: None,
             clones: false,
             clone_ids: false,
+            clone_gaps: false,
         };
         write_to(&file, &src, &snap(1)).unwrap();
         write_to(&file, &src, &snap(2)).unwrap();
@@ -624,6 +637,7 @@ mod tests {
             root_dev: None,
             clones: false,
             clone_ids: false,
+            clone_gaps: false,
         };
         write_to(&file, &src, &snap).unwrap();
         let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
@@ -654,6 +668,7 @@ mod tests {
             root_dev: None,
             clones: false,
             clone_ids: false,
+            clone_gaps: false,
         };
         // Snapshots in a directory others can write are not trusted on read.
         fs::write(dir.join("probe"), "x").unwrap();
@@ -696,6 +711,7 @@ mod tests {
             root_dev: Some(42),
             clones: false,
             clone_ids: false,
+            clone_gaps: false,
         };
 
         let file = temp("out").join("c.bin");
@@ -782,6 +798,7 @@ mod tests {
             root_dev,
             clones: false,
             clone_ids: false,
+            clone_gaps: false,
         };
         assert!(same_device(&on(Some(dev)), &src));
         assert!(!same_device(&on(Some(dev.wrapping_add(1))), &src));

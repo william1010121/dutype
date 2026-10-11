@@ -188,6 +188,8 @@ pub struct Progress {
     pub errors: AtomicU64,
     /// Some directory reported APFS clone flags.
     pub clone_ids: AtomicBool,
+    /// With --clones, some files' clone flags could not be read.
+    pub clone_gaps: AtomicBool,
     /// Set to stop a running scan early (the result is then incomplete).
     pub cancel: AtomicBool,
 }
@@ -216,19 +218,28 @@ mod platform {
             return r;
         }
         let first = out.len();
-        let r = super::read_entries_std(path, cancel, out);
+        let mut r = super::read_entries_std(path, cancel, out);
         // On macOS any volume may share blocks (APFS clones, server-side
         // copies); without bulk flags a file's clone state is unknown.
-        if clones && cfg!(target_os = "macos") {
-            unknown_clone_state(&mut out[first..]);
+        if clones
+            && cfg!(target_os = "macos")
+            && unknown_clone_state(&mut out[first..])
+            && let Ok(stats) = &mut r
+        {
+            stats.clone_gaps = true;
         }
         r
     }
 
     /// Files whose clone state could not be read: they may share blocks, so
-    /// they are never counted as freeable.
-    pub fn unknown_clone_state(entries: &mut [Entry]) {
-        entries.iter_mut().filter(|e| !e.dir).for_each(|e| e.may_share = true);
+    /// they are never counted as freeable. Whether there were any.
+    pub fn unknown_clone_state(entries: &mut [Entry]) -> bool {
+        let mut any = false;
+        for e in entries.iter_mut().filter(|e| !e.dir) {
+            e.may_share = true;
+            any = true;
+        }
+        any
     }
 
     /// Files in the APFS full-clone family of the file at `path`, where the
@@ -279,13 +290,14 @@ mod platform {
     }
 
     /// The file at `path` may share blocks with another (an APFS clone).
-    pub fn may_share(path: &Path) -> bool {
+    /// `None` when that cannot be read.
+    pub fn may_share(path: &Path) -> Option<bool> {
         #[cfg(target_os = "macos")]
         return bulk::may_share(path);
         #[cfg(not(target_os = "macos"))]
         {
             let _ = path;
-            false
+            None
         }
     }
 
@@ -382,8 +394,8 @@ mod platform {
         None
     }
 
-    pub fn may_share(_: &Path) -> bool {
-        false
+    pub fn may_share(_: &Path) -> Option<bool> {
+        None
     }
 
     /// Hard links are not identified here (and ReFS can clone blocks), so
@@ -475,6 +487,9 @@ pub(crate) struct ReadStats {
     pub errors: u64,
     /// The filesystem reported clone flags (APFS).
     pub clone_ids: bool,
+    /// With --clones, some files' clone flags could not be read (another
+    /// volume, a reader without them): those count as possibly shared.
+    pub clone_gaps: bool,
 }
 
 /// Reads `path` with `read_dir` + `lstat`, appending to `out`. Stops early
@@ -494,7 +509,7 @@ fn read_entries_std(path: &Path, cancel: &AtomicBool, out: &mut Vec<Entry>) -> i
     }
     Ok(ReadStats {
         errors,
-        clone_ids: false,
+        ..ReadStats::default()
     })
 }
 
@@ -652,6 +667,14 @@ fn scan_root(
     };
     let name: Box<str> = root.display().to_string().into();
     if !meta.is_dir() {
+        let shares = clones.then(|| platform::may_share(root)).flatten();
+        if clones {
+            let flag = match shares.is_some() {
+                true => &progress.clone_ids,
+                false => &progress.clone_gaps,
+            };
+            flag.store(true, Ordering::Relaxed);
+        }
         let cat = reg().classify_file(&name);
         return Ok(Node {
             name,
@@ -660,8 +683,9 @@ fn scan_root(
             special: false,
             hardlink: platform::hardlink_id(&meta).is_some(),
             lossy: false,
-            // Keeps a cloned file from looking freeable.
-            clone: clones && platform::may_share(root),
+            // Keeps a cloned file (or one of unknown state) from looking
+            // freeable.
+            clone: clones && shares != Some(false),
             dir: None,
         });
     }
@@ -688,11 +712,14 @@ fn scan_dir(
         true => ReadStats::default(),
         false => platform::read_entries(path, &ctx.progress.cancel, &mut entries, ctx.clones).unwrap_or(ReadStats {
             errors: 1,
-            clone_ids: false,
+            ..ReadStats::default()
         }),
     };
     if stats.clone_ids {
         ctx.progress.clone_ids.store(true, Ordering::Relaxed);
+    }
+    if stats.clone_gaps {
+        ctx.progress.clone_gaps.store(true, Ordering::Relaxed);
     }
     let mut errors = stats.errors;
     if errors > 0 {
@@ -924,7 +951,7 @@ mod share_tests {
             may_share: false,
         };
         let mut v = vec![entry("f", false), entry("d", true)];
-        platform::unknown_clone_state(&mut v);
+        assert!(platform::unknown_clone_state(&mut v));
         assert_eq!((v[0].may_share, v[1].may_share), (true, false));
     }
 
@@ -1130,6 +1157,11 @@ mod bulk_tests {
         assert_eq!(file("c1").freeable(), 0);
         assert_eq!(file("c3").freeable(), 0);
         assert_eq!(file("plain").freeable(), 1 << 20);
+        // ... and its clone flags count as detection.
+        let progress = Progress::default();
+        scan_excluding(&d.join("plain"), true, true, &progress, None).unwrap();
+        assert!(progress.clone_ids.load(Ordering::Relaxed));
+        assert!(!progress.clone_gaps.load(Ordering::Relaxed));
         fs::remove_dir_all(&d).unwrap();
     }
 

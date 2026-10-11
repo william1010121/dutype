@@ -37,6 +37,8 @@ pub struct Meta {
     pub clones: bool,
     /// ... and the filesystem reported them.
     pub clone_ids: bool,
+    /// ... but not for every file.
+    pub clone_gaps: bool,
     /// Files may share blocks there ([`crate::scan::may_share_blocks`]).
     pub shares: bool,
     pub size_mode: SizeMode,
@@ -63,7 +65,9 @@ pub struct Accounting {
     /// What the lists are ranked by.
     pub size_mode: SizeMode,
     /// `apfs-full`: identical APFS clones are detected (`dedup_bytes`,
-    /// `freeable_min_bytes`); `unsupported`: they are counted in full and
+    /// `freeable_min_bytes`); `apfs-partial`: the same, but some files'
+    /// clone flags could not be read (another volume): those are counted
+    /// in full and as possibly shared; `unsupported`: they are counted in full and
     /// `dedup_bytes` equals `size_bytes`; `off`: not looked for (no
     /// `--clones`), `dedup_bytes` equals `size_bytes`. Unless clones were
     /// detected, `freeable_min_bytes` is null where files may share blocks
@@ -76,15 +80,21 @@ fn accounting(meta: &Meta) -> Accounting {
     Accounting {
         size: "du-allocated",
         size_mode: meta.size_mode,
-        clone_detection: match (meta.clones, meta.clone_ids) {
-            (false, _) => "off",
-            (true, true) => "apfs-full",
-            (true, false) => "unsupported",
+        clone_detection: match (meta.clones, meta.clone_ids, meta.clone_gaps) {
+            (false, ..) => "off",
+            (true, true, false) => "apfs-full",
+            (true, true, true) => "apfs-partial",
+            (true, false, _) => "unsupported",
         },
-        caveats: match (meta.clones, meta.clone_ids) {
-            (false, _) => vec!["clones-not-detected", "snapshots-not-considered"],
-            (true, true) => vec!["partial-clones-not-deduplicated", "snapshots-not-considered"],
-            (true, false) => vec!["snapshots-not-considered"],
+        caveats: match (meta.clones, meta.clone_ids, meta.clone_gaps) {
+            (false, ..) => vec!["clones-not-detected", "snapshots-not-considered"],
+            (true, true, false) => vec!["partial-clones-not-deduplicated", "snapshots-not-considered"],
+            (true, true, true) => vec![
+                "partial-clones-not-deduplicated",
+                "clone-flags-missing-for-some-files",
+                "snapshots-not-considered",
+            ],
+            (true, false, _) => vec!["snapshots-not-considered"],
         },
     }
 }
@@ -437,6 +447,28 @@ pub fn find_to_text(cat: Category, items: &[Entry], mode: SizeMode) -> String {
 mod tests {
     use super::*;
     use crate::category::reg;
+
+    /// Detection is "apfs-full" only when every file's clone flags were read.
+    #[test]
+    fn clone_detection_states() {
+        let state = |clones, clone_ids, clone_gaps| {
+            let meta = Meta {
+                elapsed: Duration::ZERO,
+                cached_at: None,
+                unreadable: 0,
+                clones,
+                clone_ids,
+                clone_gaps,
+                shares: true,
+                size_mode: SizeMode::Du,
+            };
+            accounting(&meta).clone_detection
+        };
+        assert_eq!(state(false, false, false), "off");
+        assert_eq!(state(true, true, false), "apfs-full");
+        assert_eq!(state(true, true, true), "apfs-partial");
+        assert_eq!(state(true, false, true), "unsupported");
+    }
 
     #[test]
     fn category_text_shows_the_ranked_size() {

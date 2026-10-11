@@ -116,6 +116,8 @@ pub struct App {
     pub clones: bool,
     /// The scan could see APFS clone families.
     pub clone_ids: bool,
+    /// ... but some files' clone flags could not be read.
+    pub clone_gaps: bool,
     /// Files may share blocks on the scanned filesystem (see
     /// [`crate::scan::may_share_blocks`]).
     pub shares: bool,
@@ -162,6 +164,7 @@ impl App {
             root_dev: None,
             clones: false,
             clone_ids: false,
+            clone_gaps: false,
             shares: true,
             size_mode: SizeMode::Du,
             last_key: None,
@@ -269,9 +272,11 @@ impl App {
 
     /// Replace the current folder with a fresh scan of it, update every
     /// ancestor's totals and order, and keep the cursor on the same entries.
-    /// `clone_ids`: the rescan saw APFS clone flags (see `Progress::clone_ids`).
-    pub fn replace_current(&mut self, mut fresh: Node, clone_ids: bool) {
+    /// `clone_ids` / `clone_gaps`: what the rescan saw (see
+    /// `Progress::clone_ids` and `Progress::clone_gaps`).
+    pub fn replace_current(&mut self, mut fresh: Node, clone_ids: bool, clone_gaps: bool) {
         self.clone_ids |= clone_ids;
+        self.clone_gaps |= clone_gaps;
         let place = self.remember();
 
         let target = node_at_mut(&mut self.root, &self.stack);
@@ -858,7 +863,7 @@ mod tests {
             None,
         )
         .unwrap();
-        app.replace_current(fresh, false);
+        app.replace_current(fresh, false, false);
 
         same(&app.root, &full(&root));
         assert_eq!(app.location(), vec![Step::from("small"), Step::from("inner")]);
@@ -882,7 +887,7 @@ mod tests {
             None,
         )
         .unwrap();
-        app.replace_current(fresh, false);
+        app.replace_current(fresh, false, false);
         same(&app.root, &full(&root));
     }
 
@@ -915,12 +920,12 @@ mod tests {
         };
         for _ in 0..3 {
             let fresh = rescan(&app);
-            app.replace_current(fresh, false);
+            app.replace_current(fresh, false, false);
             assert_eq!(app.errors, 1);
         }
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
         let fresh = rescan(&app);
-        app.replace_current(fresh, false);
+        app.replace_current(fresh, false, false);
         assert_eq!(app.errors, 0);
     }
 
@@ -1203,7 +1208,9 @@ mod tests {
         // A rescan that sees clone flags makes the tree's detection known
         // (here as if the first scan had seen none).
         app.clone_ids = false;
-        app.replace_current(fresh, progress.clone_ids.load(std::sync::atomic::Ordering::Relaxed));
+        let saw = |f: &std::sync::atomic::AtomicBool| f.load(std::sync::atomic::Ordering::Relaxed);
+        app.replace_current(fresh, saw(&progress.clone_ids), saw(&progress.clone_gaps));
+        assert!(!app.clone_gaps);
         assert!(app.clone_ids);
         assert_eq!(app.root.dedup(), 10 << 20);
         assert_eq!(app.current().name.as_ref(), "copies");
@@ -1250,7 +1257,7 @@ mod tests {
         }
         app.go_to(&["p".into()]);
         let fresh = scan_subtree(&app.fs_path().unwrap(), true, true, &Progress::default(), None, None).unwrap();
-        app.replace_current(fresh, true);
+        app.replace_current(fresh, true, false);
         assert!(!app.root.clone);
         assert_eq!(names(&app), ["p", "q"]);
         fs::remove_dir_all(&root).unwrap();

@@ -151,6 +151,7 @@ fn run(args: Args) -> Result<(), String> {
                     root_dev,
                     clones,
                     clone_ids: progress.clone_ids.load(Ordering::Relaxed),
+                    clone_gaps: progress.clone_gaps.load(Ordering::Relaxed),
                 };
                 if use_cache && let Err(e) = cache::save(&path, one_fs, &snap) {
                     eprintln!("dutype: cannot write cache: {e}");
@@ -184,6 +185,7 @@ fn run(args: Args) -> Result<(), String> {
                     unreadable: snap.errors,
                     clones: snap.clones,
                     clone_ids: snap.clone_ids,
+                    clone_gaps: snap.clone_gaps,
                     shares: scan::may_share_blocks(&path, one_fs),
                     size_mode: args.size_mode,
                 },
@@ -221,7 +223,7 @@ fn run(args: Args) -> Result<(), String> {
                     let p = path.clone();
                     let scanned =
                         scan_with_progress(&mut terminal, &path, move |pr| scan::scan(&p, one_fs, clones, pr))?;
-                    let Some((root, scan_time, errors, clone_ids)) = scanned else {
+                    let Some((root, scan_time, errors, (clone_ids, clone_gaps))) = scanned else {
                         return Ok(());
                     };
                     Snapshot {
@@ -232,6 +234,7 @@ fn run(args: Args) -> Result<(), String> {
                         root_dev,
                         clones,
                         clone_ids,
+                        clone_gaps,
                     }
                 }
             };
@@ -240,12 +243,12 @@ fn run(args: Args) -> Result<(), String> {
                 false => None,
             };
             let snap_root_dev = snap.root_dev;
-            let clone_ids = snap.clone_ids;
+            let (clone_ids, clone_gaps) = (snap.clone_ids, snap.clone_gaps);
             let snap_clones = snap.clones;
             let mut app = App::new(snap.root, path.clone(), snap.scan_time, snap.errors);
             app.cached_at = snap.cached_at;
             app.root_dev = snap_root_dev;
-            app.clone_ids = clone_ids;
+            (app.clone_ids, app.clone_gaps) = (clone_ids, clone_gaps);
             app.clones = snap_clones;
             app.shares = scan::may_share_blocks(&path, one_fs);
             app.set_size_mode(size_mode);
@@ -282,13 +285,17 @@ fn run(args: Args) -> Result<(), String> {
     result
 }
 
+/// A finished scan: its result, time, unreadable entries and
+/// `(Progress::clone_ids, Progress::clone_gaps)`.
+type Scanned<T> = (T, Duration, u64, (bool, bool));
+
 /// Run `scan` on a thread while drawing the progress screen. `Ok(None)` when
 /// the user aborts with q / Esc.
 fn scan_with_progress<T: Send + 'static>(
     terminal: &mut ratatui::DefaultTerminal,
     path: &Path,
     scan: impl FnOnce(&Progress) -> std::io::Result<T> + Send + 'static,
-) -> Result<Option<(T, Duration, u64, bool)>, String> {
+) -> Result<Option<Scanned<T>>, String> {
     let io = |e: std::io::Error| e.to_string();
     let progress = Arc::new(Progress::default());
     let started = Instant::now();
@@ -328,7 +335,10 @@ fn scan_with_progress<T: Send + 'static>(
         root,
         started.elapsed(),
         progress.errors.load(Ordering::Relaxed),
-        progress.clone_ids.load(Ordering::Relaxed),
+        (
+            progress.clone_ids.load(Ordering::Relaxed),
+            progress.clone_gaps.load(Ordering::Relaxed),
+        ),
     )))
 }
 
@@ -386,9 +396,9 @@ fn rescan_current(
         return Ok(());
     }
     app.status = Some(match scanned {
-        Ok(Some((sub, took, _, clone_ids))) => {
+        Ok(Some((sub, took, _, (clone_ids, clone_gaps)))) => {
             // replace_current swaps in the subtree's own error count.
-            app.replace_current(sub, clone_ids);
+            app.replace_current(sub, clone_ids, clone_gaps);
             app.cached_at = None;
             let saved = use_cache.then(|| save_tree(app, one_fs)).flatten();
             match saved {
@@ -416,7 +426,7 @@ fn save_tree(app: &mut App, one_fs: bool) -> Option<std::io::Error> {
     };
     let root_path = app.root_path.clone();
     let (scan_time, errors, root_dev, clone_ids) = (app.scan_time, app.errors, app.root_dev, app.clone_ids);
-    let clones = app.clones;
+    let (clones, clone_gaps) = (app.clones, app.clone_gaps);
     // A cache holds the tree in du order, whatever the TUI shows.
     app.in_du_order(|root| {
         let snap = Snapshot {
@@ -427,6 +437,7 @@ fn save_tree(app: &mut App, one_fs: bool) -> Option<std::io::Error> {
             root_dev,
             clones,
             clone_ids,
+            clone_gaps,
         };
         let result = cache::save(&root_path, one_fs, &snap).err();
         *root = snap.root;

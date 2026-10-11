@@ -217,6 +217,9 @@ Known limitations:
   (a partial clone) is counted in full and never counted as freeable.
 - APFS local snapshots (Time Machine) are not considered: space they still
   reference is freed only once they expire.
+- With `--cross-fs`, files on a volume that does not report clone flags are
+  counted in full and as possibly shared; `clone_detection` is then
+  `"apfs-partial"`.
 - Dedup and freeable values are relative to the scanned tree: clone family
   members outside it make a family non-freeable.
 - A family's size is read on macOS 14 and later only; on older systems and on

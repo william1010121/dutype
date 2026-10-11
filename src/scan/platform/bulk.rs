@@ -129,7 +129,7 @@ fn read_all(
                 stats.errors += 1;
                 return Some(Ok(stats));
             };
-            match parse(fd, &data[at..at + len], clones, &mut stats.clone_ids) {
+            match parse(fd, &data[at..at + len], clones, &mut stats) {
                 Some(e) => out.push(e),
                 None => stats.errors += 1,
             }
@@ -171,8 +171,9 @@ impl Cursor<'_> {
 /// One entry, laid out as described in getattrlist(2): length, returned
 /// attribute set, then each returned attribute in bit order, group by group
 /// (common, dir, file, extended common). `None` for an entry with no
-/// usable name or metadata. Sets `clone_ids` when clone flags are reported.
-fn parse(fd: &Fd, d: &[u8], clones: bool, clone_ids: &mut bool) -> Option<Entry> {
+/// usable name or metadata. Sets `stats.clone_ids` when clone flags are
+/// reported, `stats.clone_gaps` when a file's are missing.
+fn parse(fd: &Fd, d: &[u8], clones: bool, stats: &mut ReadStats) -> Option<Entry> {
     let mut c = Cursor { d, at: 4 };
     let common = c.u32()?;
     let _vol = c.u32()?;
@@ -181,7 +182,7 @@ fn parse(fd: &Fd, d: &[u8], clones: bool, clone_ids: &mut bool) -> Option<Entry>
     let ext_attrs = c.u32()?;
     // Dirs report the flags too, so a tree of dirs only still counts.
     if ext_attrs & libc::ATTR_CMNEXT_EXT_FLAGS != 0 {
-        *clone_ids = true;
+        stats.clone_ids = true;
     }
     // ATTR_CMN_ERROR comes right after the returned set.
     let error = match common & ATTR_CMN_ERROR != 0 {
@@ -248,7 +249,10 @@ fn parse(fd: &Fd, d: &[u8], clones: bool, clone_ids: &mut bool) -> Option<Entry>
     // state unknown: it may share blocks.
     let flags = match ext_attrs & libc::ATTR_CMNEXT_EXT_FLAGS != 0 {
         true => c.u64()?,
-        false if clones => EF_MAY_SHARE_BLOCKS,
+        false if clones => {
+            stats.clone_gaps = true;
+            EF_MAY_SHARE_BLOCKS
+        }
         false => 0,
     };
     Some(Entry {
@@ -297,9 +301,9 @@ pub(in crate::scan) fn clone_refcnt(path: &Path) -> Option<u32> {
 }
 
 /// The file at `path` shares, or may share, blocks with another file.
-pub(in crate::scan) fn may_share(path: &Path) -> bool {
-    ext_attr::<u64>(path, libc::ATTR_CMNEXT_EXT_FLAGS)
-        .is_some_and(|f| f & (EF_MAY_SHARE_BLOCKS | EF_SHARES_ALL_BLOCKS) != 0)
+/// `None` when the volume does not report the flags.
+pub(in crate::scan) fn may_share(path: &Path) -> Option<bool> {
+    ext_attr::<u64>(path, libc::ATTR_CMNEXT_EXT_FLAGS).map(|f| f & (EF_MAY_SHARE_BLOCKS | EF_SHARES_ALL_BLOCKS) != 0)
 }
 
 /// One extended common attribute of `path` (not following a symlink).
@@ -386,9 +390,9 @@ mod tests {
     fn fallback_entry_may_share_with_clones() {
         let common = libc::ATTR_CMN_RETURNED_ATTRS | libc::ATTR_CMN_NAME | ATTR_CMN_ERROR;
         let (d, fd, e) = synthetic("fallback-clones", common, libc::EIO as u32);
-        let got = parse(&fd, &e, true, &mut false).expect("entry kept");
+        let got = parse(&fd, &e, true, &mut ReadStats::default()).expect("entry kept");
         assert!(got.may_share && got.clone.is_none());
-        assert!(!parse(&fd, &e, false, &mut false).unwrap().may_share);
+        assert!(!parse(&fd, &e, false, &mut ReadStats::default()).unwrap().may_share);
         std::fs::remove_dir_all(&d).unwrap();
     }
 
@@ -433,7 +437,11 @@ mod tests {
     #[test]
     fn omitted_clone_flags_are_unknown() {
         let (d, fd, _) = synthetic("omitted-flags", 0, 0);
-        let parse_rec = |ext, flags, clones| parse(&fd, &file_record(ext, flags), clones, &mut false).unwrap();
+        let parse_rec =
+            |ext, flags, clones| parse(&fd, &file_record(ext, flags), clones, &mut ReadStats::default()).unwrap();
+        let mut stats = ReadStats::default();
+        parse(&fd, &file_record(0, 0), true, &mut stats).unwrap();
+        assert!(stats.clone_gaps && !stats.clone_ids);
         let both = libc::ATTR_CMNEXT_CLONEID | libc::ATTR_CMNEXT_EXT_FLAGS;
         assert!(parse_rec(0, 0, true).may_share);
         assert!(!parse_rec(0, 0, false).may_share);
@@ -455,7 +463,7 @@ mod tests {
         let common =
             libc::ATTR_CMN_RETURNED_ATTRS | libc::ATTR_CMN_NAME | libc::ATTR_CMN_DEVID | libc::ATTR_CMN_OBJTYPE;
         let (d, fd, e) = synthetic("attrs", common, 0);
-        let got = parse(&fd, &e, false, &mut false).expect("entry kept");
+        let got = parse(&fd, &e, false, &mut ReadStats::default()).expect("entry kept");
         assert_eq!(Some(got), lstat_at(&fd, OsStr::new("f.bin"), false));
         std::fs::remove_dir_all(&d).unwrap();
     }
@@ -464,7 +472,7 @@ mod tests {
     fn entry_error_falls_back_to_lstat() {
         let common = libc::ATTR_CMN_RETURNED_ATTRS | libc::ATTR_CMN_NAME | ATTR_CMN_ERROR;
         let (d, fd, e) = synthetic("error", common, libc::EIO as u32);
-        let got = parse(&fd, &e, false, &mut false).expect("entry kept");
+        let got = parse(&fd, &e, false, &mut ReadStats::default()).expect("entry kept");
         assert_eq!(Some(got), lstat_at(&fd, OsStr::new("f.bin"), false));
         std::fs::remove_dir_all(&d).unwrap();
     }

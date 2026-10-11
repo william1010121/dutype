@@ -65,6 +65,8 @@ space.
 - `dedup_bytes`: size with each clone family counted once; it adds up like
   `size_bytes`. `clone_shared_bytes = size_bytes - dedup_bytes`.
 - `accounting.clone_detection` is `"apfs-full"` when clones were detected,
+  `"apfs-partial"` when some files' clone flags could not be read (another
+  volume; those count in full and as possibly shared),
   `"unsupported"` when `--clones` was given but the filesystem has no clone
   information (then `dedup_bytes == size_bytes` and only hard links make
   `freeable_min_bytes` smaller), `"off"` without `--clones`. `accounting.caveats` lists what is
