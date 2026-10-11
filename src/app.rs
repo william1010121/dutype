@@ -275,8 +275,13 @@ impl App {
     /// `clone_ids` / `clone_gaps`: what the rescan saw (see
     /// `Progress::clone_ids` and `Progress::clone_gaps`).
     pub fn replace_current(&mut self, mut fresh: Node, clone_ids: bool, clone_gaps: bool) {
-        self.clone_ids |= clone_ids;
-        self.clone_gaps |= clone_gaps;
+        // A rescan of the root replaces what the tree saw; below it adds.
+        if self.stack.is_empty() {
+            (self.clone_ids, self.clone_gaps) = (clone_ids, clone_gaps);
+        } else {
+            self.clone_ids |= clone_ids;
+            self.clone_gaps |= clone_gaps;
+        }
         let place = self.remember();
 
         let target = node_at_mut(&mut self.root, &self.stack);
@@ -1211,6 +1216,16 @@ mod tests {
         let saw = |f: &std::sync::atomic::AtomicBool| f.load(std::sync::atomic::Ordering::Relaxed);
         app.replace_current(fresh, saw(&progress.clone_ids), saw(&progress.clone_gaps));
         assert!(!app.clone_gaps);
+
+        // At the root, a rescan replaces the coverage state instead.
+        app.clone_gaps = true;
+        while !app.stack.is_empty() {
+            app.leave();
+        }
+        let fresh = scan_subtree(&root, true, true, &Progress::default(), None, None).unwrap();
+        app.replace_current(fresh, true, false);
+        assert!(app.clone_ids && !app.clone_gaps);
+        app.go_to(&["copies".into()]);
         assert!(app.clone_ids);
         assert_eq!(app.root.dedup(), 10 << 20);
         assert_eq!(app.current().name.as_ref(), "copies");
