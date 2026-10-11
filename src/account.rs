@@ -285,7 +285,7 @@ mod tests {
     }
 
     fn scan(p: &Path) -> Node {
-        scan_excluding(p, true, &Progress::default(), None).unwrap()
+        scan_excluding(p, true, true, &Progress::default(), None).unwrap()
     }
 
     /// A hard link frees its blocks only where every link is inside.

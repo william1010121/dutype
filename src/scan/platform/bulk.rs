@@ -26,7 +26,9 @@ thread_local! {
     static BUF: RefCell<Vec<u64>> = RefCell::new(vec![0; BUF_WORDS]);
 }
 
-fn attr_list() -> libc::attrlist {
+/// What `getattrlistbulk` returns; with `clones`, also the APFS clone
+/// identity (otherwise exactly the plain scan's request, at its speed).
+fn attr_list(clones: bool) -> libc::attrlist {
     libc::attrlist {
         bitmapcount: libc::ATTR_BIT_MAP_COUNT,
         reserved: 0,
@@ -45,7 +47,10 @@ fn attr_list() -> libc::attrlist {
         // attributes. Not ATTR_CMNEXT_CLONE_REFCNT: APFS serializes that
         // lookup across threads, which made parallel scans 2x slower; it is
         // read per family instead (see `clone_refcnt`).
-        forkattr: libc::ATTR_CMNEXT_CLONEID | libc::ATTR_CMNEXT_EXT_FLAGS,
+        forkattr: match clones {
+            true => libc::ATTR_CMNEXT_CLONEID | libc::ATTR_CMNEXT_EXT_FLAGS,
+            false => 0,
+        },
     }
 }
 
@@ -63,6 +68,7 @@ pub(in crate::scan) fn read_entries(
     path: &Path,
     cancel: &AtomicBool,
     out: &mut Vec<Entry>,
+    clones: bool,
 ) -> Option<io::Result<ReadStats>> {
     let Ok(cpath) = CString::new(path.as_os_str().as_bytes()) else {
         return Some(Err(io::ErrorKind::InvalidInput.into()));
@@ -73,16 +79,26 @@ pub(in crate::scan) fn read_entries(
         return Some(Err(io::Error::last_os_error()));
     }
     let fd = Fd(fd);
-    BUF.with_borrow_mut(|buf| read_all(&fd, buf, cancel, out))
+    BUF.with_borrow_mut(|buf| read_all(&fd, buf, cancel, out, clones))
 }
 
-fn read_all(fd: &Fd, buf: &mut [u64], cancel: &AtomicBool, out: &mut Vec<Entry>) -> Option<io::Result<ReadStats>> {
-    let mut list = attr_list();
+fn read_all(
+    fd: &Fd,
+    buf: &mut [u64],
+    cancel: &AtomicBool,
+    out: &mut Vec<Entry>,
+    clones: bool,
+) -> Option<io::Result<ReadStats>> {
+    let mut list = attr_list(clones);
     let mut stats = ReadStats::default();
     let mut first = true;
     loop {
         let bytes = std::mem::size_of_val(buf);
-        let options = libc::FSOPT_ATTR_CMN_EXTENDED as u64;
+        let options = if clones {
+            libc::FSOPT_ATTR_CMN_EXTENDED as u64
+        } else {
+            0
+        };
         let n = unsafe { libc::getattrlistbulk(fd.0, (&raw mut list).cast(), buf.as_mut_ptr().cast(), bytes, options) };
         if n < 0 {
             let err = io::Error::last_os_error();
@@ -356,6 +372,12 @@ mod tests {
         let len = e.len() as u32;
         e[..4].copy_from_slice(&len.to_ne_bytes());
         (d, fd, e)
+    }
+
+    #[test]
+    fn plain_request_has_no_extended_attributes() {
+        assert_eq!(attr_list(false).forkattr, 0);
+        assert_ne!(attr_list(true).forkattr, 0);
     }
 
     #[test]

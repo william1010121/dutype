@@ -112,6 +112,8 @@ pub struct App {
     pub show_keys: bool,
     /// Device of the scan root when the tree was built (None: unknown).
     pub root_dev: Option<u64>,
+    /// The scan looked for APFS clones (`--clones`).
+    pub clones: bool,
     /// The scan could see APFS clone families.
     pub clone_ids: bool,
     /// Size shown and sorted by (`c` toggles).
@@ -155,6 +157,7 @@ impl App {
             status: None,
             show_keys: false,
             root_dev: None,
+            clones: false,
             clone_ids: false,
             size_mode: SizeMode::Du,
             last_key: None,
@@ -367,6 +370,12 @@ impl App {
         out
     }
 
+    /// Lower bound of what deleting `n` frees, if it can be known (see
+    /// [`crate::report::freeable_known`]).
+    pub fn freeable(&self, n: &Node) -> Option<u64> {
+        crate::report::freeable_known(self.clones).then(|| n.freeable())
+    }
+
     /// Size of child `i` of the current folder in the current mode.
     pub fn shown_size(&self, dir: &Node, i: usize) -> u64 {
         match (self.size_mode, &dir.dir) {
@@ -435,6 +444,9 @@ impl App {
                     Focus::Entries => Focus::Breakdown,
                     Focus::Breakdown => Focus::Entries,
                 }
+            }
+            KeyCode::Char('c') if !self.clones => {
+                self.status = Some("restart with --clones to count APFS clones once".into());
             }
             KeyCode::Char('c') => {
                 self.set_size_mode(match self.size_mode {
@@ -794,7 +806,7 @@ mod tests {
     }
 
     fn full(root: &Path) -> Node {
-        scan_excluding(root, true, &Progress::default(), None).unwrap()
+        scan_excluding(root, true, true, &Progress::default(), None).unwrap()
     }
 
     fn same(a: &Node, b: &Node) {
@@ -830,6 +842,7 @@ mod tests {
         let fresh = scan_subtree(
             &app.current_path(),
             true,
+            true,
             &Progress::default(),
             app.inherited_category(),
             None,
@@ -852,6 +865,7 @@ mod tests {
         fs::write(root.join("node_modules/pkg/extra.js"), vec![0u8; 5_000]).unwrap();
         let fresh = scan_subtree(
             &app.current_path(),
+            true,
             true,
             &Progress::default(),
             app.inherited_category(),
@@ -882,6 +896,7 @@ mod tests {
             scan_subtree(
                 &app.current_path(),
                 true,
+                true,
                 &Progress::default(),
                 app.inherited_category(),
                 None,
@@ -907,7 +922,7 @@ mod tests {
         fs::create_dir_all(root.join("a")).unwrap();
         fs::create_dir_all(root.join("b")).unwrap();
         fs::write(root.join("a/f.bin"), vec![0u8; 50_000]).unwrap();
-        let sub = |p: &str| scan_subtree(&root.join(p), true, &Progress::default(), None, None).unwrap();
+        let sub = |p: &str| scan_subtree(&root.join(p), true, true, &Progress::default(), None, None).unwrap();
         assert!(!sub("a").hardlink);
         fs::hard_link(root.join("a/f.bin"), root.join("b/f.bin")).unwrap();
         assert!(sub("b").hardlink);
@@ -926,7 +941,7 @@ mod tests {
         fs::write(root.join("x/y/z.txt"), "z").unwrap();
         let progress = Progress::default();
         progress.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-        let node = scan_excluding(&root, true, &progress, None).unwrap();
+        let node = scan_excluding(&root, true, true, &progress, None).unwrap();
         assert!(node.children().is_empty());
     }
 
@@ -963,7 +978,7 @@ mod tests {
         fs::create_dir_all(root.join("d")).unwrap();
         std::os::unix::fs::symlink(root.join("target"), root.join("link")).unwrap();
         fs::write(root.join("f.txt"), "x").unwrap();
-        let sub = |p: &str| scan_subtree(&root.join(p), true, &Progress::default(), None, None);
+        let sub = |p: &str| scan_subtree(&root.join(p), true, true, &Progress::default(), None, None);
         assert!(sub("d").is_ok());
         assert!(sub("link").is_err());
         assert!(sub("f.txt").is_err());
@@ -978,11 +993,11 @@ mod tests {
         let root = temp("mount");
         fs::create_dir_all(root.join("d")).unwrap();
         let dev = crate::scan::device_of(&root).unwrap();
-        let sub = |dev| scan_subtree(&root.join("d"), true, &Progress::default(), None, Some(dev));
+        let sub = |dev| scan_subtree(&root.join("d"), true, true, &Progress::default(), None, Some(dev));
         assert!(sub(dev).is_ok());
         assert!(sub(dev.wrapping_add(1)).is_err());
         // --cross-fs: no device check.
-        assert!(scan_subtree(&root.join("d"), false, &Progress::default(), None, Some(dev + 1)).is_ok());
+        assert!(scan_subtree(&root.join("d"), false, true, &Progress::default(), None, Some(dev + 1)).is_ok());
     }
 
     /// Non-UTF-8 names (allowed on Linux) are scanned, not reported as
@@ -999,7 +1014,7 @@ mod tests {
         let node = full(&root);
         assert_eq!(node.errors(), 0);
         assert_eq!(node.files(), 1);
-        let excluded = scan_excluding(&root, true, &Progress::default(), Some(&weird)).unwrap();
+        let excluded = scan_excluding(&root, true, true, &Progress::default(), Some(&weird)).unwrap();
         assert_eq!((excluded.files(), excluded.errors()), (0, 0));
         // TUI paths for filesystem operations resolve the raw name.
         let mut app = App::new(full(&root), root.clone(), Duration::ZERO, 0);
@@ -1099,6 +1114,19 @@ mod tests {
         }
         fs::write(root.join("plain/p"), vec![2u8; 6 << 20]).unwrap();
         let mut app = App::new(full(&root), root.clone(), Duration::ZERO, 0);
+
+        // Without --clones, `c` only says how to get dedup sizes, and what
+        // deleting frees is unknown on macOS.
+        app.handle_key(KeyEvent::from(KeyCode::Char('c')));
+        assert_eq!(app.size_mode, SizeMode::Du);
+        assert!(app.status.as_deref().unwrap().contains("--clones"));
+        assert_eq!(app.freeable(&app.root), None);
+        app.clones = true;
+        app.handle_key(KeyEvent::from(KeyCode::Char('c')));
+        assert_eq!(app.size_mode, SizeMode::Dedup);
+        assert_eq!(app.freeable(&app.root), Some(10 << 20));
+        app.handle_key(KeyEvent::from(KeyCode::Char('c')));
+        assert_eq!(app.size_mode, SizeMode::Du);
         let names = |app: &App| {
             app.root
                 .children()
@@ -1160,7 +1188,7 @@ mod tests {
         assert!(ok.success());
         app.set_size_mode(SizeMode::Dedup);
         app.go_to(&["copies".into()]);
-        let fresh = scan_subtree(&app.fs_path().unwrap(), true, &Progress::default(), None, None).unwrap();
+        let fresh = scan_subtree(&app.fs_path().unwrap(), true, true, &Progress::default(), None, None).unwrap();
         app.replace_current(fresh);
         assert_eq!(app.root.dedup(), 10 << 20);
         assert_eq!(app.current().name.as_ref(), "copies");

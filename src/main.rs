@@ -65,13 +65,17 @@ struct Args {
     /// Ignore a cached scan: scan again and update the cache (implies --cache)
     #[arg(long)]
     refresh: bool,
-    /// Size to show and sort by: `du` (allocated, like `du -skx`) or
-    /// `dedup` (each APFS clone family counted once). `c` toggles it in the TUI
+    /// Detect APFS clones (macOS): count each clone family once (dedup
+    /// sizes, the TUI's `c` key) and give a lower bound of what deleting
+    /// each item frees. Makes scans slower
     ///
     /// Only full clones are deduplicated (a clone modified since counts in
     /// full); APFS snapshots are not considered; families are relative to the
-    /// scanned tree. --report / --json also give a lower bound of what
-    /// deleting each item frees (freeable_min_bytes).
+    /// scanned tree. Without it, on macOS, freeable_min_bytes is null.
+    #[arg(long)]
+    clones: bool,
+    /// Size to show and sort by: `du` (allocated, like `du -skx`) or
+    /// `dedup` (each APFS clone family counted once; implies --clones)
     #[arg(long, value_enum, default_value_t = report::SizeMode::Du, value_name = "MODE")]
     size_mode: report::SizeMode,
 }
@@ -123,9 +127,10 @@ fn run(args: Args) -> Result<(), String> {
         eprintln!("dutype: cannot create cache directory: {e}");
     }
     let one_fs = !args.cross_fs;
+    let clones = args.clones || args.size_mode == report::SizeMode::Dedup;
     let cached = || {
         (use_cache && !args.refresh)
-            .then(|| cache::load(&path, one_fs))
+            .then(|| cache::load(&path, one_fs, clones))
             .flatten()
     };
 
@@ -136,13 +141,15 @@ fn run(args: Args) -> Result<(), String> {
                 let progress = Progress::default();
                 let started = Instant::now();
                 let root_dev = scan::device_of(&path).ok();
-                let root = scan::scan(&path, one_fs, &progress).map_err(|e| format!("{}: {e}", path.display()))?;
+                let root =
+                    scan::scan(&path, one_fs, clones, &progress).map_err(|e| format!("{}: {e}", path.display()))?;
                 let snap = Snapshot {
                     root,
                     cached_at: None,
                     scan_time: started.elapsed(),
                     errors: progress.errors.load(Ordering::Relaxed),
                     root_dev,
+                    clones,
                     clone_ids: progress.clone_ids.load(Ordering::Relaxed),
                 };
                 if use_cache && let Err(e) = cache::save(&path, one_fs, &snap) {
@@ -153,7 +160,7 @@ fn run(args: Args) -> Result<(), String> {
         };
         let root = &snap.root;
         if let Some(cat) = only {
-            let items = report::find(root, &path, cat, args.top, args.size_mode);
+            let items = report::find(root, &path, cat, args.top, args.size_mode, snap.clones);
             if args.json {
                 let doc = serde_json::json!({
                     "path": path.display().to_string(),
@@ -174,6 +181,7 @@ fn run(args: Args) -> Result<(), String> {
                     elapsed: snap.scan_time,
                     cached_at: snap.cached_at,
                     unreadable: snap.errors,
+                    clones: snap.clones,
                     clone_ids: snap.clone_ids,
                     size_mode: args.size_mode,
                 },
@@ -198,8 +206,9 @@ fn run(args: Args) -> Result<(), String> {
         let mut location = Vec::new();
         // Status to show after a full rescan (e.g. why `r` became `R`).
         let mut carried_status: Option<String> = None;
-        // `c` survives a full rescan.
+        // `c` survives a full rescan; so does clone detection from a cache.
         let mut size_mode = args.size_mode;
+        let mut clones = clones;
         loop {
             // The root's device when a fresh tree is scanned (measured before
             // the scan); a cached tree carries its own. `r` compares against it.
@@ -208,7 +217,8 @@ fn run(args: Args) -> Result<(), String> {
                 Some(s) => s,
                 None => {
                     let p = path.clone();
-                    let scanned = scan_with_progress(&mut terminal, &path, move |pr| scan::scan(&p, one_fs, pr))?;
+                    let scanned =
+                        scan_with_progress(&mut terminal, &path, move |pr| scan::scan(&p, one_fs, clones, pr))?;
                     let Some((root, scan_time, errors, clone_ids)) = scanned else {
                         return Ok(());
                     };
@@ -218,6 +228,7 @@ fn run(args: Args) -> Result<(), String> {
                         scan_time,
                         errors,
                         root_dev,
+                        clones,
                         clone_ids,
                     }
                 }
@@ -228,10 +239,12 @@ fn run(args: Args) -> Result<(), String> {
             };
             let snap_root_dev = snap.root_dev;
             let clone_ids = snap.clone_ids;
+            let snap_clones = snap.clones;
             let mut app = App::new(snap.root, path.clone(), snap.scan_time, snap.errors);
             app.cached_at = snap.cached_at;
             app.root_dev = snap_root_dev;
             app.clone_ids = clone_ids;
+            app.clones = snap_clones;
             app.set_size_mode(size_mode);
             app.show_keys = args.show_keys;
             app.go_to(&location);
@@ -257,6 +270,7 @@ fn run(args: Args) -> Result<(), String> {
             location = app.location();
             carried_status = app.status.take();
             size_mode = app.size_mode;
+            clones = app.clones;
             // Free the old tree off the UI thread; it can take a while.
             std::thread::spawn(move || drop(app));
         }
@@ -358,8 +372,9 @@ fn rescan_current(
     }
     let inherited = app.inherited_category();
     let t = target.clone();
+    let clones = app.clones;
     let scanned = scan_with_progress(terminal, &target, move |pr| {
-        scan::scan_subtree(&t, one_fs, pr, inherited, root_dev)
+        scan::scan_subtree(&t, one_fs, clones, pr, inherited, root_dev)
     });
     if let Ok(Some((sub, ..))) = &scanned
         && sub.hardlink
@@ -398,6 +413,7 @@ fn save_tree(app: &mut App, one_fs: bool) -> Option<std::io::Error> {
     };
     let root_path = app.root_path.clone();
     let (scan_time, errors, root_dev, clone_ids) = (app.scan_time, app.errors, app.root_dev, app.clone_ids);
+    let clones = app.clones;
     // A cache holds the tree in du order, whatever the TUI shows.
     app.in_du_order(|root| {
         let snap = Snapshot {
@@ -406,6 +422,7 @@ fn save_tree(app: &mut App, one_fs: bool) -> Option<std::io::Error> {
             scan_time,
             errors,
             root_dev,
+            clones,
             clone_ids,
         };
         let result = cache::save(&root_path, one_fs, &snap).err();

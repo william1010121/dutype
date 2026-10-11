@@ -33,8 +33,17 @@ pub struct Meta {
     pub elapsed: Duration,
     pub cached_at: Option<SystemTime>,
     pub unreadable: u64,
+    /// The scan looked for APFS clones (`--clones`).
+    pub clones: bool,
+    /// ... and the filesystem reported them.
     pub clone_ids: bool,
     pub size_mode: SizeMode,
+}
+
+/// Whether a lower bound of freed bytes can be given: on macOS, any file may
+/// be an APFS clone, so only a scan that looked for clones can tell.
+pub fn freeable_known(clones: bool) -> bool {
+    clones || !cfg!(target_os = "macos")
 }
 
 /// How sizes were counted, so agents know what the numbers mean.
@@ -46,7 +55,9 @@ pub struct Accounting {
     pub size_mode: SizeMode,
     /// `apfs-full`: identical APFS clones are detected (`dedup_bytes`,
     /// `freeable_min_bytes`); `unsupported`: they are counted in full and
-    /// `dedup_bytes` equals `size_bytes`.
+    /// `dedup_bytes` equals `size_bytes`; `off`: not looked for (no
+    /// `--clones`), `dedup_bytes` equals `size_bytes` and, on macOS,
+    /// `freeable_min_bytes` is null.
     pub clone_detection: &'static str,
     pub caveats: Vec<&'static str>,
 }
@@ -55,11 +66,15 @@ fn accounting(meta: &Meta) -> Accounting {
     Accounting {
         size: "du-allocated",
         size_mode: meta.size_mode,
-        clone_detection: if meta.clone_ids { "apfs-full" } else { "unsupported" },
-        caveats: if meta.clone_ids {
-            vec!["partial-clones-not-deduplicated", "snapshots-not-considered"]
-        } else {
-            vec!["snapshots-not-considered"]
+        clone_detection: match (meta.clones, meta.clone_ids) {
+            (false, _) => "off",
+            (true, true) => "apfs-full",
+            (true, false) => "unsupported",
+        },
+        caveats: match (meta.clones, meta.clone_ids) {
+            (false, _) => vec!["clones-not-detected", "snapshots-not-considered"],
+            (true, true) => vec!["partial-clones-not-deduplicated", "snapshots-not-considered"],
+            (true, false) => vec!["snapshots-not-considered"],
         },
     }
 }
@@ -74,8 +89,9 @@ pub struct Report {
     pub dedup_bytes: u64,
     /// `size_bytes - dedup_bytes`: bytes that are clones of other files.
     pub clone_shared_bytes: u64,
-    /// Lower bound of what deleting the whole folder would free.
-    pub freeable_min_bytes: u64,
+    /// Lower bound of what deleting the whole folder would free; null when
+    /// it cannot be known (macOS without `--clones`).
+    pub freeable_min_bytes: Option<u64>,
     pub accounting: Accounting,
     pub files: u64,
     pub scan_seconds: f64,
@@ -116,7 +132,7 @@ pub struct Child {
     /// Up to three biggest categories inside this child.
     pub top_categories: Vec<CategoryShare>,
     pub dedup_bytes: u64,
-    pub freeable_min_bytes: u64,
+    pub freeable_min_bytes: Option<u64>,
     /// It is, or holds, a file that may share blocks with others (APFS clones).
     pub clone: bool,
 }
@@ -128,7 +144,7 @@ pub struct Entry {
     pub size_bytes: u64,
     pub size: String,
     pub dedup_bytes: u64,
-    pub freeable_min_bytes: u64,
+    pub freeable_min_bytes: Option<u64>,
     pub clone: bool,
 }
 
@@ -157,19 +173,19 @@ struct Item {
     cat: Category,
     size: u64,
     dedup: u64,
-    freeable: u64,
+    freeable: Option<u64>,
     clone: bool,
 }
 
 impl Item {
-    fn of(n: &Node, dedup: u64, rel: &Path, mode: SizeMode) -> Item {
+    fn of(n: &Node, dedup: u64, rel: &Path, mode: SizeMode, known: bool) -> Item {
         Item {
             rank: mode.pick(n.size, dedup),
             rel: rel.to_path_buf(),
             cat: n.cat,
             size: n.size,
             dedup,
-            freeable: n.freeable(),
+            freeable: known.then(|| n.freeable()),
             clone: n.clone,
         }
     }
@@ -236,6 +252,7 @@ pub fn ranked_children(root: &Node, mode: SizeMode) -> Vec<usize> {
 }
 
 pub fn build(root: &Node, root_path: &Path, meta: &Meta, top: usize) -> Report {
+    let known = freeable_known(meta.clones);
     let cats = root.cats();
     let mode = meta.size_mode;
 
@@ -251,7 +268,7 @@ pub fn build(root: &Node, root_path: &Path, meta: &Meta, top: usize) -> Report {
         };
         let rank = mode.pick(n.size, dedup);
         if list.accepts(|min: &Item| rank > min.rank) {
-            list.push(Item::of(n, dedup, p, mode));
+            list.push(Item::of(n, dedup, p, mode, known));
         }
         // Nested special dirs only occur inside weak ones (huggingface/ inside
         // .cache/); both are reported.
@@ -265,7 +282,7 @@ pub fn build(root: &Node, root_path: &Path, meta: &Meta, top: usize) -> Report {
         size: human(root.size),
         dedup_bytes: dedup,
         clone_shared_bytes: root.size - dedup,
-        freeable_min_bytes: root.freeable(),
+        freeable_min_bytes: known.then(|| root.freeable()),
         accounting: accounting(meta),
         files: root.files(),
         scan_seconds: (meta.elapsed.as_secs_f64() * 1000.0).round() / 1000.0,
@@ -290,7 +307,7 @@ pub fn build(root: &Node, root_path: &Path, meta: &Meta, top: usize) -> Report {
                     special: c.special.then(|| c.cat.label()),
                     top_categories: shares(&c.cats(), c.size, 3),
                     dedup_bytes: dedup,
-                    freeable_min_bytes: c.freeable(),
+                    freeable_min_bytes: known.then(|| c.freeable()),
                     clone: c.clone,
                 }
             })
@@ -309,12 +326,13 @@ pub fn to_text(r: &Report, root: &Node) -> String {
         r.path, r.size, r.files, r.scan_seconds
     );
     if r.clone_shared_bytes > 0 {
+        let frees = r.freeable_min_bytes.map(human).unwrap_or_else(|| "?".into());
         let _ = writeln!(
             out,
             "(APFS clones: {} counted once is {}; deleting it all frees at least {})",
             r.size,
             human(r.dedup_bytes),
-            human(r.freeable_min_bytes)
+            frees
         );
     }
     if let Some(at) = r.cached_at {
@@ -364,7 +382,9 @@ pub fn to_text(r: &Report, root: &Node) -> String {
 
 /// Largest items of one category below `root`: the matching special dirs for
 /// directory categories (e.g. every node_modules), files otherwise.
-pub fn find(root: &Node, root_path: &Path, cat: Category, top: usize, mode: SizeMode) -> Vec<Entry> {
+/// `clones`: the scan looked for APFS clones (see [`freeable_known`]).
+pub fn find(root: &Node, root_path: &Path, cat: Category, top: usize, mode: SizeMode, clones: bool) -> Vec<Entry> {
+    let known = freeable_known(clones);
     let mut list = TopN::new(top);
     let want_dirs = cat.is_dir_kind();
     walk(root, &mut PathBuf::new(), &mut |n, dedup, p| {
@@ -375,7 +395,7 @@ pub fn find(root: &Node, root_path: &Path, cat: Category, top: usize, mode: Size
         };
         let rank = mode.pick(n.size, dedup);
         if hit && list.accepts(|min: &Item| rank > min.rank) {
-            list.push(Item::of(n, dedup, p, mode));
+            list.push(Item::of(n, dedup, p, mode, known));
         }
         !(hit && want_dirs)
     });
@@ -417,7 +437,7 @@ mod tests {
             size_bytes: size,
             size: human(size),
             dedup_bytes: dedup,
-            freeable_min_bytes: 0,
+            freeable_min_bytes: None,
             clone: dedup < size,
         };
         let items = [item("/a", 3 << 20, 3 << 20), item("/b", 2 << 20, 0)];

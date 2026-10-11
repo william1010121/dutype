@@ -587,7 +587,10 @@ fn draw_details(f: &mut Frame, app: &App, area: Rect) {
     // files elsewhere stay); "dedup": clones of each other counted once.
     let mut space = vec![
         label("frees"),
-        Span::styled(format!("≥ {}", human(node.freeable())), Style::new().fg(TEXT)),
+        Span::styled(
+            app.freeable(node).map_or("?".into(), |b| format!("≥ {}", human(b))),
+            Style::new().fg(TEXT),
+        ),
     ];
     if dedup != node.size {
         space.push(Span::styled(

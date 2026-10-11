@@ -207,11 +207,14 @@ mod platform {
 
     /// Entries of the directory `path`: from `getattrlistbulk` on macOS when
     /// the volume supports it, else [`super::read_entries_std`].
-    pub fn read_entries(path: &Path, cancel: &AtomicBool, out: &mut Vec<Entry>) -> io::Result<ReadStats> {
+    /// With `clones`, also APFS clone identity (macOS); without it, the same
+    /// request as a plain scan.
+    pub fn read_entries(path: &Path, cancel: &AtomicBool, out: &mut Vec<Entry>, clones: bool) -> io::Result<ReadStats> {
         #[cfg(target_os = "macos")]
-        if let Some(r) = bulk::read_entries(path, cancel, out) {
+        if let Some(r) = bulk::read_entries(path, cancel, out, clones) {
             return r;
         }
+        let _ = clones;
         super::read_entries_std(path, cancel, out)
     }
 
@@ -318,7 +321,12 @@ mod platform {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::AtomicBool;
 
-    pub fn read_entries(path: &Path, cancel: &AtomicBool, out: &mut Vec<Entry>) -> io::Result<ReadStats> {
+    pub fn read_entries(
+        path: &Path,
+        cancel: &AtomicBool,
+        out: &mut Vec<Entry>,
+        _clones: bool,
+    ) -> io::Result<ReadStats> {
         super::read_entries_std(path, cancel, out)
     }
 
@@ -446,6 +454,8 @@ struct Ctx<'a> {
     progress: &'a Progress,
     root_dev: u64,
     one_fs: bool,
+    /// Detect APFS clones (`--clones`).
+    clones: bool,
     seen_inodes: Mutex<FxHashSet<(u64, u64)>>,
     /// A directory never to descend into (dutype's own cache), as (name, full path).
     exclude: Option<(OsString, PathBuf)>,
@@ -499,13 +509,20 @@ fn file_name_of(p: &Path) -> String {
 
 /// Scan `root`. dutype's own cache directory is always skipped, so `--cache`
 /// writing a snapshot under the scanned tree never changes the totals.
-pub fn scan(root: &Path, one_fs: bool, progress: &Progress) -> std::io::Result<Node> {
+/// `clones` also reads APFS clone identity (`--clones`), which costs time.
+pub fn scan(root: &Path, one_fs: bool, clones: bool, progress: &Progress) -> std::io::Result<Node> {
     let cache_dir = crate::cache::dir().and_then(|d| fs::canonicalize(d).ok());
-    scan_excluding(root, one_fs, progress, cache_dir.as_deref())
+    scan_excluding(root, one_fs, clones, progress, cache_dir.as_deref())
 }
 
-pub fn scan_excluding(root: &Path, one_fs: bool, progress: &Progress, exclude: Option<&Path>) -> std::io::Result<Node> {
-    scan_root(root, one_fs, progress, exclude, None, None)
+pub fn scan_excluding(
+    root: &Path,
+    one_fs: bool,
+    clones: bool,
+    progress: &Progress,
+    exclude: Option<&Path>,
+) -> std::io::Result<Node> {
+    scan_root(root, one_fs, clones, progress, exclude, None, None)
 }
 
 /// Rescan one directory of an existing tree. `inherited` is the special
@@ -519,6 +536,7 @@ pub fn scan_excluding(root: &Path, one_fs: bool, progress: &Progress, exclude: O
 pub fn scan_subtree(
     path: &Path,
     one_fs: bool,
+    clones: bool,
     progress: &Progress,
     inherited: Option<Category>,
     root_dev: Option<u64>,
@@ -530,7 +548,15 @@ pub fn scan_subtree(
         return Err(std::io::Error::other("now on another filesystem"));
     }
     let cache_dir = crate::cache::dir().and_then(|d| fs::canonicalize(d).ok());
-    scan_root(path, one_fs, progress, cache_dir.as_deref(), inherited, root_dev)
+    scan_root(
+        path,
+        one_fs,
+        clones,
+        progress,
+        cache_dir.as_deref(),
+        inherited,
+        root_dev,
+    )
 }
 
 /// Device id of `path` (0 where the platform has none).
@@ -546,6 +572,7 @@ pub fn is_real_dir(path: &Path) -> bool {
 fn scan_root(
     root: &Path,
     one_fs: bool,
+    clones: bool,
     progress: &Progress,
     exclude: Option<&Path>,
     inherited: Option<Category>,
@@ -556,6 +583,7 @@ fn scan_root(
         progress,
         root_dev: root_dev.unwrap_or_else(|| platform::device(&meta)),
         one_fs,
+        clones,
         seen_inodes: Mutex::new(FxHashSet::default()),
         exclude: exclude.and_then(|p| Some((p.file_name()?.to_os_string(), p.to_path_buf()))),
     };
@@ -570,7 +598,7 @@ fn scan_root(
             hardlink: platform::hardlink_id(&meta).is_some(),
             lossy: false,
             // Keeps a cloned file from looking freeable.
-            clone: platform::may_share(root),
+            clone: clones && platform::may_share(root),
             dir: None,
         });
     }
@@ -595,7 +623,7 @@ fn scan_dir(
     // A cancelled scan stops descending; its partial result is discarded.
     let stats = match ctx.progress.cancel.load(Ordering::Relaxed) {
         true => ReadStats::default(),
-        false => platform::read_entries(path, &ctx.progress.cancel, &mut entries).unwrap_or(ReadStats {
+        false => platform::read_entries(path, &ctx.progress.cancel, &mut entries, ctx.clones).unwrap_or(ReadStats {
             errors: 1,
             clone_ids: false,
         }),
@@ -853,7 +881,7 @@ mod bulk_tests {
             let (mut a, mut b) = (Vec::new(), Vec::new());
             assert_eq!(read_entries_std(&dir, &cancel, &mut a).unwrap().errors, 0);
             assert_eq!(
-                platform::bulk::read_entries(&dir, &cancel, &mut b)
+                platform::bulk::read_entries(&dir, &cancel, &mut b, true)
                     .unwrap()
                     .unwrap()
                     .errors,
@@ -868,10 +896,29 @@ mod bulk_tests {
         fs::remove_dir_all(&d).unwrap();
     }
 
+    /// Without --clones the bulk request is the plain one: no clone data,
+    /// no clone accounting.
+    #[test]
+    fn clones_off_reads_no_clone_data() {
+        let d = tree("off");
+        let cancel = AtomicBool::new(false);
+        let mut v = Vec::new();
+        let stats = platform::bulk::read_entries(&d, &cancel, &mut v, false)
+            .unwrap()
+            .unwrap();
+        assert!(!stats.clone_ids);
+        assert!(v.iter().all(|e| e.clone.is_none() && !e.may_share));
+        let progress = Progress::default();
+        let node = scan_excluding(&d, true, false, &progress, None).unwrap();
+        assert!(!progress.clone_ids.load(Ordering::Relaxed));
+        assert_eq!(node.dedup(), node.size);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
     #[test]
     fn total_matches_du() {
         let d = tree("du");
-        let node = scan_excluding(&d, true, &Progress::default(), None).unwrap();
+        let node = scan_excluding(&d, true, true, &Progress::default(), None).unwrap();
         let out = Command::new("/usr/bin/du").arg("-skx").arg(&d).output().unwrap();
         let kib: u64 = String::from_utf8_lossy(&out.stdout)
             .split_whitespace()
@@ -910,7 +957,7 @@ mod bulk_tests {
         fs::hard_link(d.join("a"), d.join("sub/hl")).unwrap();
 
         let progress = Progress::default();
-        let node = scan_excluding(&d, true, &progress, None).unwrap();
+        let node = scan_excluding(&d, true, true, &progress, None).unwrap();
         assert!(progress.clone_ids.load(Ordering::Relaxed), "APFS on macOS 14+ expected");
         let out = Command::new("/usr/bin/du").arg("-skx").arg(&d).output().unwrap();
         let kib: u64 = String::from_utf8_lossy(&out.stdout)
@@ -937,7 +984,7 @@ mod bulk_tests {
         let first = dedups(&node);
         for _ in 0..5 {
             assert_eq!(
-                dedups(&scan_excluding(&d, true, &Progress::default(), None).unwrap()),
+                dedups(&scan_excluding(&d, true, true, &Progress::default(), None).unwrap()),
                 first
             );
         }
@@ -952,13 +999,13 @@ mod bulk_tests {
                 .unwrap()
                 .success()
         );
-        let sub = scan_excluding(&d.join("sub"), true, &Progress::default(), None).unwrap();
+        let sub = scan_excluding(&d.join("sub"), true, true, &Progress::default(), None).unwrap();
         assert_eq!((sub.size, sub.dedup(), sub.freeable()), (16 << 20, 8 << 20, 0));
 
         // A single file as the root: a clone (full or partial) frees nothing
         // for sure, a plain file all of it.
         fs::write(d.join("plain"), vec![1u8; 1 << 20]).unwrap();
-        let file = |n: &str| scan_excluding(&d.join(n), true, &Progress::default(), None).unwrap();
+        let file = |n: &str| scan_excluding(&d.join(n), true, true, &Progress::default(), None).unwrap();
         assert_eq!(file("c1").freeable(), 0);
         assert_eq!(file("c3").freeable(), 0);
         assert_eq!(file("plain").freeable(), 1 << 20);
@@ -968,7 +1015,7 @@ mod bulk_tests {
     #[test]
     fn missing_dir_is_an_error() {
         let mut v = Vec::new();
-        let r = platform::bulk::read_entries(Path::new("/nonexistent-dutype"), &AtomicBool::new(false), &mut v);
+        let r = platform::bulk::read_entries(Path::new("/nonexistent-dutype"), &AtomicBool::new(false), &mut v, true);
         assert!(r.unwrap().is_err());
     }
 }

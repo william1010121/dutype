@@ -23,6 +23,9 @@ pub struct Snapshot {
     /// Device of the root when the tree was scanned. A snapshot whose root is
     /// now on another device (remounted) is stale and not loaded.
     pub root_dev: Option<u64>,
+    /// The scan looked for APFS clones (`--clones`). A snapshot without
+    /// them cannot answer a request that wants them.
+    pub clones: bool,
     /// The scan could see APFS clone families (see `Progress::clone_ids`).
     pub clone_ids: bool,
 }
@@ -142,8 +145,9 @@ fn inside_cache_dir(root: &Path) -> bool {
         .is_some_and(|d| root.starts_with(d))
 }
 
-/// The cached scan of `root`, if there is a valid one.
-pub fn load(root: &Path, one_fs: bool) -> Option<Snapshot> {
+/// The cached scan of `root`, if there is a valid one (and, if `clones`
+/// is asked for, one that looked for APFS clones).
+pub fn load(root: &Path, one_fs: bool, clones: bool) -> Option<Snapshot> {
     if inside_cache_dir(root) {
         return None;
     }
@@ -153,7 +157,13 @@ pub fn load(root: &Path, one_fs: bool) -> Option<Snapshot> {
     if !platform::is_private(file.parent()?) || !platform::is_private(&file) {
         return None;
     }
-    read_from(&file, root).filter(|snap| same_device(snap, root))
+    read_from(&file, root).filter(|snap| same_device(snap, root) && answers(snap, clones))
+}
+
+/// The snapshot can answer a request with or without `--clones`: one that
+/// did not look for clones cannot answer one that wants them.
+pub fn answers(snap: &Snapshot, clones: bool) -> bool {
+    snap.clones || !clones
 }
 
 /// The snapshot's root is still on the device it was scanned on (a root
@@ -192,7 +202,7 @@ fn write_to(file: &Path, root_path: &Path, snap: &Snapshot) -> io::Result<()> {
         w.varint(at.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()))?;
         w.varint(snap.scan_time.as_millis() as u64)?;
         w.varint(snap.errors)?;
-        w.0.write_all(&[snap.root_dev.is_some() as u8 | (snap.clone_ids as u8) << 1])?;
+        w.0.write_all(&[snap.root_dev.is_some() as u8 | (snap.clone_ids as u8) << 1 | (snap.clones as u8) << 2])?;
         w.varint(snap.root_dev.unwrap_or(0))?;
         w.bytes(root_path.as_os_str().as_encoded_bytes())?;
         w.node(&snap.root)?;
@@ -220,10 +230,10 @@ fn read_from(file: &Path, root_path: &Path) -> Option<Snapshot> {
     let scan_time = Duration::from_millis(r.varint()?);
     let errors = r.varint()?;
     let flags = *r.take(1)?.first()?;
-    if flags > 3 {
+    if flags > 7 {
         return None;
     }
-    let (has_dev, clone_ids) = (flags & 1 != 0, flags & 2 != 0);
+    let (has_dev, clone_ids, clones) = (flags & 1 != 0, flags & 2 != 0, flags & 4 != 0);
     let dev = r.varint()?;
     let root_dev = has_dev.then_some(dev);
     // A hash collision between two paths must not show the wrong tree.
@@ -241,6 +251,7 @@ fn read_from(file: &Path, root_path: &Path) -> Option<Snapshot> {
         scan_time,
         errors,
         root_dev,
+        clones,
         clone_ids,
     })
 }
@@ -506,11 +517,12 @@ mod tests {
         }
         let progress = Progress::default();
         let snap = Snapshot {
-            root: scan(&src, true, &progress).unwrap(),
+            root: scan(&src, true, true, &progress).unwrap(),
             cached_at: None,
             scan_time: Duration::ZERO,
             errors: 0,
             root_dev: None,
+            clones: true,
             clone_ids: progress.clone_ids.load(std::sync::atomic::Ordering::Relaxed),
         };
         assert_eq!(snap.clone_ids, cfg!(target_os = "macos"));
@@ -518,7 +530,12 @@ mod tests {
         write_to(&file, &src, &snap).unwrap();
         let back = read_from(&file, &src).unwrap();
         same(&snap.root, &back.root);
-        assert_eq!(back.clone_ids, snap.clone_ids);
+        assert_eq!((back.clones, back.clone_ids), (snap.clones, snap.clone_ids));
+        assert!(answers(&back, true) && answers(&back, false));
+        let plain = Snapshot { clones: false, ..back };
+        write_to(&file, &src, &plain).unwrap();
+        let back = read_from(&file, &src).unwrap();
+        assert!(!back.clones && !answers(&back, true) && answers(&back, false));
         assert!(back.root.freeable() > 0);
         if cfg!(target_os = "macos") {
             assert_eq!(back.root.dedup(), back.root.size - (2 << 20));
@@ -532,11 +549,12 @@ mod tests {
         let src = temp("shared-bad");
         fs::write(src.join("plain"), vec![1u8; 8192]).unwrap();
         let mut snap = Snapshot {
-            root: scan(&src, true, &Progress::default()).unwrap(),
+            root: scan(&src, true, true, &Progress::default()).unwrap(),
             cached_at: None,
             scan_time: Duration::ZERO,
             errors: 0,
             root_dev: None,
+            clones: false,
             clone_ids: false,
         };
         let file = temp("shared-bad-out").join("c.bin");
@@ -563,9 +581,9 @@ mod tests {
         fs::write(root.join("a.pdf"), vec![1u8; 10_000]).unwrap();
         let cache = root.join(".cache").join("dutype");
         fs::create_dir_all(&cache).unwrap();
-        let before = crate::scan::scan_excluding(&root, true, &Progress::default(), Some(&cache)).unwrap();
+        let before = crate::scan::scan_excluding(&root, true, false, &Progress::default(), Some(&cache)).unwrap();
         fs::write(cache.join("snap.bin"), vec![2u8; 200_000]).unwrap();
-        let after = crate::scan::scan_excluding(&root, true, &Progress::default(), Some(&cache)).unwrap();
+        let after = crate::scan::scan_excluding(&root, true, false, &Progress::default(), Some(&cache)).unwrap();
         assert_eq!(before.size, after.size);
         assert_eq!(before.files(), after.files());
     }
@@ -578,11 +596,12 @@ mod tests {
         fs::write(src.join("a.txt"), "a").unwrap();
         let file = temp("replace-out").join("c.bin");
         let snap = |errors| Snapshot {
-            root: scan(&src, true, &Progress::default()).unwrap(),
+            root: scan(&src, true, true, &Progress::default()).unwrap(),
             cached_at: None,
             scan_time: Duration::ZERO,
             errors,
             root_dev: None,
+            clones: false,
             clone_ids: false,
         };
         write_to(&file, &src, &snap(1)).unwrap();
@@ -598,11 +617,12 @@ mod tests {
         let file = temp("perm-out").join("sub").join("c.bin");
         platform::create_private_dir(file.parent().unwrap()).unwrap();
         let snap = Snapshot {
-            root: scan(&src, true, &Progress::default()).unwrap(),
+            root: scan(&src, true, true, &Progress::default()).unwrap(),
             cached_at: None,
             scan_time: Duration::ZERO,
             errors: 0,
             root_dev: None,
+            clones: false,
             clone_ids: false,
         };
         write_to(&file, &src, &snap).unwrap();
@@ -627,11 +647,12 @@ mod tests {
 
         let src = fs::canonicalize(temp("excl-src")).unwrap();
         let snap = Snapshot {
-            root: scan(&src, true, &Progress::default()).unwrap(),
+            root: scan(&src, true, true, &Progress::default()).unwrap(),
             cached_at: None,
             scan_time: Duration::ZERO,
             errors: 0,
             root_dev: None,
+            clones: false,
             clone_ids: false,
         };
         // Snapshots in a directory others can write are not trusted on read.
@@ -666,13 +687,14 @@ mod tests {
         fs::write(src.join("movie.mp4"), vec![0u8; 20_000]).unwrap();
         fs::write(src.join("notes.pdf"), "pdf").unwrap();
         let src = fs::canonicalize(&src).unwrap();
-        let root = scan(&src, true, &Progress::default()).unwrap();
+        let root = scan(&src, true, true, &Progress::default()).unwrap();
         let snap = Snapshot {
             root,
             cached_at: None,
             scan_time: Duration::from_millis(1234),
             errors: 3,
             root_dev: Some(42),
+            clones: false,
             clone_ids: false,
         };
 
@@ -753,11 +775,12 @@ mod tests {
         // A snapshot from another device (root remounted since) is stale.
         let dev = crate::scan::device_of(&src).unwrap();
         let on = |root_dev| Snapshot {
-            root: scan(&src, true, &Progress::default()).unwrap(),
+            root: scan(&src, true, true, &Progress::default()).unwrap(),
             cached_at: None,
             scan_time: Duration::ZERO,
             errors: 0,
             root_dev,
+            clones: false,
             clone_ids: false,
         };
         assert!(same_device(&on(Some(dev)), &src));
