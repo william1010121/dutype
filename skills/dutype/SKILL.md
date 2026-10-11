@@ -56,7 +56,9 @@ the user how much a deletion frees. Without it, `freeable_min_bytes` is
 `null` on macOS and `accounting.clone_detection` is `"off"`. It is also
 `null` on Linux filesystems with reflinks (btrfs, XFS, bcachefs, OCFS2, ZFS)
 and with `--cross-fs`, and always on Windows: then no lower bound is known, so do not promise freed
-space.
+space. Without `--clones`, hard-linked files never count in
+`freeable_min_bytes` (it stays a lower bound, just a lower one); `--clones`
+also credits a hard-linked file to the folder holding all its links.
 
 - `freeable_min_bytes`: at least this much is freed by deleting the item.
   Use it, not `size_bytes`, when you tell the user how much a cleanup frees.

@@ -87,7 +87,11 @@ fn accounting(meta: &Meta) -> Accounting {
             (true, false, _) => "unsupported",
         },
         caveats: match (meta.clones, meta.clone_ids, meta.clone_gaps) {
-            (false, ..) => vec!["clones-not-detected", "snapshots-not-considered"],
+            (false, ..) => vec![
+                "clones-not-detected",
+                "hard-links-not-freeable",
+                "snapshots-not-considered",
+            ],
             (true, true, false) => vec!["partial-clones-not-deduplicated", "snapshots-not-considered"],
             (true, true, true) => vec![
                 "partial-clones-not-deduplicated",

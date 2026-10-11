@@ -3,7 +3,7 @@
 //! A cache is never trusted across dutype versions or category rule changes.
 
 use crate::category::{Category, reg};
-use crate::scan::{DirInfo, Node, Shared};
+use crate::scan::{CloneInfo, DirInfo, Node, Shared};
 use std::fs;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -227,7 +227,11 @@ fn write_to(file: &Path, root_path: &Path, snap: &Snapshot) -> io::Result<()> {
 
 fn read_from(file: &Path, root_path: &Path) -> Option<Snapshot> {
     let data = fs::read(file).ok()?;
-    let mut r = Reader { data: &data, pos: 0 };
+    let mut r = Reader {
+        data: &data,
+        pos: 0,
+        clones: false,
+    };
     if r.take(MAGIC.len())? != MAGIC || u64::from_le_bytes(r.take(8)?.try_into().ok()?) != reg().fingerprint {
         return None;
     }
@@ -240,6 +244,7 @@ fn read_from(file: &Path, root_path: &Path) -> Option<Snapshot> {
     }
     let (has_dev, clone_ids, clones) = (flags & 1 != 0, flags & 2 != 0, flags & 4 != 0);
     let clone_gaps = flags & 8 != 0;
+    r.clones = clones;
     let dev = r.varint()?;
     let root_dev = has_dev.then_some(dev);
     // A hash collision between two paths must not show the wrong tree.
@@ -250,7 +255,9 @@ fn read_from(file: &Path, root_path: &Path) -> Option<Snapshot> {
     if r.pos != data.len() {
         return None;
     }
-    crate::account::account(&mut root, Some(root_path));
+    if clones {
+        crate::account::account(&mut root, Some(root_path));
+    }
     Some(Snapshot {
         root,
         cached_at: Some(at),
@@ -306,9 +313,9 @@ impl<W: Write> Writer<W> {
             let child_errors: u64 = d.children.iter().map(Node::errors).sum();
             self.varint(d.errors.saturating_sub(child_errors))?;
             let child_gaps: u64 = d.children.iter().map(Node::clone_gaps).sum();
-            self.varint(d.clone_gaps.saturating_sub(child_gaps))?;
-            self.varint(d.shared.len() as u64)?;
-            for s in &d.shared {
+            self.varint(d.clone_gaps().saturating_sub(child_gaps))?;
+            self.varint(d.shared().len() as u64)?;
+            for s in d.shared() {
                 for v in [
                     s.idx as u64,
                     s.key.0,
@@ -329,6 +336,9 @@ impl<W: Write> Writer<W> {
 struct Reader<'a> {
     data: &'a [u8],
     pos: usize,
+    /// The snapshot looked for clones; without it, no dir may carry
+    /// clone gaps or shared-block records (a scan never makes them).
+    clones: bool,
 }
 
 impl Reader<'_> {
@@ -421,9 +431,10 @@ impl Reader<'_> {
             let own = size.checked_sub(child_bytes)?;
             cats[cat.index()] = cats[cat.index()].checked_add(own)?;
             let errors = errors.checked_add(self.varint()?)?;
-            let clone_gaps = gaps.checked_add(self.varint()?)?;
+            let own_gaps = self.varint()?;
+            let clone_gaps = gaps.checked_add(own_gaps)?;
             let shared_count = usize::try_from(self.varint()?).ok()?;
-            if shared_count > children.len() {
+            if shared_count > children.len() || (!self.clones && (own_gaps > 0 || shared_count > 0)) {
                 return None;
             }
             let mut shared = Vec::with_capacity(shared_count);
@@ -460,12 +471,15 @@ impl Reader<'_> {
                 cats,
                 files,
                 errors,
-                clone_gaps,
                 children,
                 free_base: free.checked_add(own)?,
-                group_free: 0,
-                dup: 0,
-                shared: shared.into_boxed_slice(),
+                clones: (!shared.is_empty() || clone_gaps > 0).then(|| {
+                    Box::new(CloneInfo {
+                        shared: shared.into_boxed_slice(),
+                        gaps: clone_gaps,
+                        ..CloneInfo::default()
+                    })
+                }),
             }))
         } else {
             None
@@ -498,7 +512,7 @@ mod tests {
             a.name
         );
         if let (Some(x), Some(y)) = (&a.dir, &b.dir) {
-            assert_eq!(x.shared, y.shared, "{}", a.name);
+            assert_eq!(x.shared(), y.shared(), "{}", a.name);
         }
         assert_eq!(a.children().len(), b.children().len());
         a.children().iter().zip(b.children()).for_each(|(x, y)| same(x, y));
@@ -549,14 +563,28 @@ mod tests {
             (snap.clones, snap.clone_ids, snap.clone_gaps)
         );
         assert!(answers(&back, true) && answers(&back, false));
-        let plain = Snapshot { clones: false, ..back };
-        write_to(&file, &src, &plain).unwrap();
-        let back = read_from(&file, &src).unwrap();
-        assert!(!back.clones && !answers(&back, true) && answers(&back, false));
-        assert!(back.root.freeable() > 0);
         if cfg!(target_os = "macos") {
             assert_eq!(back.root.dedup(), back.root.size - (2 << 20));
         }
+        // Without --clones there are no records to keep: hard links just
+        // never count as freeable, and a snapshot claiming otherwise is
+        // rejected.
+        let plain = Snapshot {
+            root: scan(&src, true, false, &Progress::default()).unwrap(),
+            clones: false,
+            clone_ids: false,
+            clone_gaps: false,
+            ..back
+        };
+        write_to(&file, &src, &plain).unwrap();
+        let again = read_from(&file, &src).unwrap();
+        assert!(!again.clones && !answers(&again, true) && answers(&again, false));
+        same(&plain.root, &again.root);
+        // The hard-linked file is counted (once) but never freeable.
+        assert_eq!(again.root.freeable(), again.root.size - (2 << 20));
+        let mislabeled = Snapshot { clones: false, ..snap };
+        write_to(&file, &src, &mislabeled).unwrap();
+        assert!(read_from(&file, &src).is_none());
     }
 
     /// A shared-block record must name a file flagged as sharing blocks:
@@ -571,7 +599,7 @@ mod tests {
             scan_time: Duration::ZERO,
             errors: 0,
             root_dev: None,
-            clones: false,
+            clones: true,
             clone_ids: false,
             clone_gaps: false,
         };
@@ -579,7 +607,7 @@ mod tests {
         write_to(&file, &src, &snap).unwrap();
         assert!(read_from(&file, &src).is_some());
         let d = snap.root.dir.as_mut().unwrap();
-        d.shared = vec![Shared {
+        d.clones_mut().shared = vec![Shared {
             idx: 0,
             key: (1, 2),
             is_clone: true,
@@ -614,7 +642,7 @@ mod tests {
         fs::write(src.join("a.txt"), "a").unwrap();
         let file = temp("replace-out").join("c.bin");
         let snap = |errors| Snapshot {
-            root: scan(&src, true, true, &Progress::default()).unwrap(),
+            root: scan(&src, true, false, &Progress::default()).unwrap(),
             cached_at: None,
             scan_time: Duration::ZERO,
             errors,
@@ -636,7 +664,7 @@ mod tests {
         let file = temp("perm-out").join("sub").join("c.bin");
         platform::create_private_dir(file.parent().unwrap()).unwrap();
         let snap = Snapshot {
-            root: scan(&src, true, true, &Progress::default()).unwrap(),
+            root: scan(&src, true, false, &Progress::default()).unwrap(),
             cached_at: None,
             scan_time: Duration::ZERO,
             errors: 0,
@@ -667,7 +695,7 @@ mod tests {
 
         let src = fs::canonicalize(temp("excl-src")).unwrap();
         let snap = Snapshot {
-            root: scan(&src, true, true, &Progress::default()).unwrap(),
+            root: scan(&src, true, false, &Progress::default()).unwrap(),
             cached_at: None,
             scan_time: Duration::ZERO,
             errors: 0,
@@ -708,7 +736,7 @@ mod tests {
         fs::write(src.join("movie.mp4"), vec![0u8; 20_000]).unwrap();
         fs::write(src.join("notes.pdf"), "pdf").unwrap();
         let src = fs::canonicalize(&src).unwrap();
-        let root = scan(&src, true, true, &Progress::default()).unwrap();
+        let root = scan(&src, true, false, &Progress::default()).unwrap();
         let snap = Snapshot {
             root,
             cached_at: None,
@@ -777,11 +805,13 @@ mod tests {
         let mut r = Reader {
             data: &[0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02],
             pos: 0,
+            clones: false,
         };
         assert_eq!(r.varint(), None);
         let mut r = Reader {
             data: &[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01],
             pos: 0,
+            clones: false,
         };
         assert_eq!(r.varint(), Some(u64::MAX));
 
@@ -797,7 +827,7 @@ mod tests {
         // A snapshot from another device (root remounted since) is stale.
         let dev = crate::scan::device_of(&src).unwrap();
         let on = |root_dev| Snapshot {
-            root: scan(&src, true, true, &Progress::default()).unwrap(),
+            root: scan(&src, true, false, &Progress::default()).unwrap(),
             cached_at: None,
             scan_time: Duration::ZERO,
             errors: 0,

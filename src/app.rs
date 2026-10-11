@@ -305,7 +305,10 @@ impl App {
             if let Some(dir) = node.dir.as_mut() {
                 shift(&mut dir.files, files_delta);
                 shift(&mut dir.errors, errors_delta);
-                shift(&mut dir.clone_gaps, gaps_delta);
+                if gaps_delta != 0 {
+                    shift(&mut dir.clones_mut().gaps, gaps_delta);
+                    dir.trim_clones();
+                }
                 shift(&mut dir.free_base, free_delta);
                 dir.cats.iter_mut().zip(&cats_delta).for_each(|(c, d)| shift(c, *d));
                 // Clones may have appeared or gone below.
@@ -313,7 +316,9 @@ impl App {
             }
         }
         // Clone families may span the old and new subtree and the rest.
-        crate::account::account(&mut self.root, Some(&self.root_path));
+        if self.clones {
+            crate::account::account(&mut self.root, Some(&self.root_path));
+        }
         let by_dedup = self.size_mode == SizeMode::Dedup;
         if by_dedup {
             sort_tree(&mut self.root, true);
@@ -1220,8 +1225,13 @@ mod tests {
 
         // Gaps follow the tree: a subtree that had files of unknown clone
         // state, rescanned with none, leaves no gap behind.
-        node_at_mut(&mut app.root, &app.stack).dir.as_mut().unwrap().clone_gaps = 2;
-        app.root.dir.as_mut().unwrap().clone_gaps = 2;
+        node_at_mut(&mut app.root, &app.stack)
+            .dir
+            .as_mut()
+            .unwrap()
+            .clones_mut()
+            .gaps = 2;
+        app.root.dir.as_mut().unwrap().clones_mut().gaps = 2;
         app.clone_gaps = true;
         let fresh = scan_subtree(&app.fs_path().unwrap(), true, true, &Progress::default(), None, None).unwrap();
         app.replace_current(fresh, true);

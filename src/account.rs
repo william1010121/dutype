@@ -2,8 +2,8 @@
 //! family counted once (`Node::dedup`) and lower bounds of what deleting a
 //! folder frees (`Node::freeable`).
 //!
-//! The scan records every file with hard links or clone siblings in its
-//! dir's `shared` list. This pass groups them (by inode for hard links, by
+//! With `--clones`, the scan records every file with hard links or clone
+//! siblings in its dir's `shared` list (without it, nothing runs here). This pass groups them (by inode for hard links, by
 //! clone id for clone families), then:
 //! - keeps one member of each clone family, picked by a stable rule (the
 //!   shortest path, then the smallest), and subtracts the others from the
@@ -163,9 +163,11 @@ fn collect(node: &mut Node, parent: u32, child: u32, depth: u32, dirs: &mut Vec<
         depth,
         first: members.len() as u32,
     });
-    d.dup = 0;
-    d.group_free = 0;
-    for (slot, s) in d.shared.iter().enumerate() {
+    if let Some(c) = d.clones.as_deref_mut() {
+        c.dup = 0;
+        c.group_free = 0;
+    }
+    for (slot, s) in d.shared().iter().enumerate() {
         members.push(Member {
             dir: id,
             slot: slot as u32,
@@ -179,7 +181,7 @@ fn collect(node: &mut Node, parent: u32, child: u32, depth: u32, dirs: &mut Vec<
         });
     }
     for (i, c) in d.children.iter_mut().enumerate() {
-        let stale = c.dir.as_ref().is_some_and(|d| d.dup != 0 || d.group_free != 0);
+        let stale = c.dir.as_ref().is_some_and(|d| d.dup() != 0 || d.group_free() != 0);
         if c.is_dir() && (c.hardlink || c.clone || stale) {
             collect(c, id, i as u32, depth + 1, dirs, members);
         }
@@ -191,12 +193,16 @@ fn apply(node: &mut Node, dirs: &[Dir], next: &mut usize, dup: &[u64], free: &[u
     let id = *next;
     *next += 1;
     let d = node.dir.as_deref_mut().expect("a collected dir");
-    d.dup = dup[id];
-    d.group_free = free[id];
-    let first = dirs[id].first as usize;
-    for (s, &(is_dup, refcnt)) in d.shared.iter_mut().zip(&out[first..]) {
-        s.dup = is_dup;
-        s.refcnt = refcnt;
+    if dup[id] != 0 || free[id] != 0 || d.clones.is_some() {
+        let c = d.clones_mut();
+        c.dup = dup[id];
+        c.group_free = free[id];
+        let first = dirs[id].first as usize;
+        for (s, &(is_dup, refcnt)) in c.shared.iter_mut().zip(&out[first..]) {
+            s.dup = is_dup;
+            s.refcnt = refcnt;
+        }
+        d.trim_clones();
     }
     while *next < dirs.len() && dirs[*next].parent as usize == id {
         let c = dirs[*next].child as usize;
@@ -240,7 +246,7 @@ fn dir_chain<'a>(root: &'a Node, path: &[u32]) -> (Vec<&'a Node>, &'a Node) {
 
 fn file_of<'a>(dir: &'a Node, m: &Member) -> &'a Node {
     let d = dir.dir.as_ref().expect("a dir");
-    &d.children[d.shared[m.slot as usize].idx as usize]
+    &d.children[d.shared()[m.slot as usize].idx as usize]
 }
 
 /// The on-disk path of a member.
@@ -320,6 +326,20 @@ mod tests {
         // Scanned alone, x/y holds one of two links.
         let y = scan(&d.join("x/y"));
         assert_eq!(y.freeable(), y.size - MIB);
+
+        // Without --clones no groups are recorded or accounted: a hard link
+        // never counts as freeable, even with every link inside.
+        let root = scan_excluding(&d, true, false, &Progress::default(), None).unwrap();
+        fn no_records(n: &Node) -> bool {
+            n.dir
+                .as_ref()
+                .is_none_or(|d| d.clones.is_none() && d.children.iter().all(no_records))
+        }
+        assert!(no_records(&root));
+        let x = child(&root, "x");
+        assert_eq!(x.freeable(), x.size - MIB);
+        assert_eq!(root.freeable(), root.size - 2 * MIB);
+        assert_eq!(root.dedup(), root.size);
         fs::remove_dir_all(&d).unwrap();
     }
 }
@@ -329,7 +349,7 @@ mod tests {
 mod synthetic {
     use super::account;
     use crate::category::reg;
-    use crate::scan::{DirInfo, Node, Shared};
+    use crate::scan::{CloneInfo, DirInfo, Node, Shared};
     use std::path::Path;
 
     const S: u64 = 4096;
@@ -382,10 +402,10 @@ mod synthetic {
                 errors: 0,
                 children,
                 free_base,
-                group_free: 0,
-                dup: 0,
-                shared: shared.into_boxed_slice(),
-                clone_gaps: 0,
+                clones: Some(Box::new(CloneInfo {
+                    shared: shared.into_boxed_slice(),
+                    ..CloneInfo::default()
+                })),
             })),
         }
     }
@@ -401,7 +421,7 @@ mod synthetic {
 
     fn set_refcnt(n: &mut Node, refcnt: u32) {
         if let Some(d) = n.dir.as_deref_mut() {
-            d.shared.iter_mut().for_each(|s| s.refcnt = refcnt);
+            d.clones_mut().shared.iter_mut().for_each(|s| s.refcnt = refcnt);
             d.children.iter_mut().for_each(|c| set_refcnt(c, refcnt));
         }
     }
@@ -409,7 +429,7 @@ mod synthetic {
     fn dups(n: &Node) -> Vec<(String, bool)> {
         let mut out = Vec::new();
         if let Some(d) = &n.dir {
-            for s in d.shared.iter() {
+            for s in d.shared() {
                 out.push((d.children[s.idx as usize].name.to_string(), s.dup));
             }
             d.children.iter().for_each(|c| out.extend(dups(c)));
@@ -460,7 +480,7 @@ mod synthetic {
         account(&mut root, Some(Path::new("/nonexistent-dutype-root")));
         assert_eq!(root.freeable(), S);
         let d = root.children()[0].dir.as_ref().unwrap();
-        assert!(d.shared.iter().all(|s| s.refcnt == 1));
+        assert!(d.shared().iter().all(|s| s.refcnt == 1));
     }
 
     /// A hard-linked file that may share blocks with another inode (a
@@ -472,7 +492,7 @@ mod synthetic {
             h.hardlink = true;
             let mut root = dir("root", vec![h]);
             let d = root.dir.as_deref_mut().unwrap();
-            d.shared = vec![Shared {
+            d.clones_mut().shared = vec![Shared {
                 idx: 0,
                 key: (1, 7),
                 is_clone: false,

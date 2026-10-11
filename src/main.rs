@@ -71,7 +71,9 @@ struct Args {
     ///
     /// Only full clones are deduplicated (a clone modified since counts in
     /// full); APFS snapshots are not considered; families are relative to the
-    /// scanned tree. Without it, on macOS, freeable_min_bytes is null.
+    /// scanned tree. Without it, on macOS, freeable_min_bytes is null, and
+    /// hard-linked files never count as freeable (with it, they count where
+    /// all their links are inside).
     #[arg(long)]
     clones: bool,
     /// Size to show and sort by: `du` (allocated, like `du -skx`) or

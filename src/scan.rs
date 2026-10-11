@@ -42,6 +42,14 @@ pub struct DirInfo {
     /// "Freeable" bytes that need no shared-block bookkeeping: the dirs' own
     /// blocks and files without hard links or clones, in this subtree.
     pub free_base: u64,
+    /// Shared-block state, only with --clones (and only where it is not
+    /// all empty), so a default scan costs one pointer per dir for it.
+    pub clones: Option<Box<CloneInfo>>,
+}
+
+/// The part of a [`DirInfo`] that only clone detection (`--clones`) uses.
+#[derive(Default)]
+pub struct CloneInfo {
     /// Bytes of complete groups (every link and clone of them inside) whose
     /// lowest common ancestor is in this subtree. Set by [`crate::account`].
     pub group_free: u64,
@@ -50,9 +58,15 @@ pub struct DirInfo {
     pub dup: u64,
     /// Files of this dir with hard links or clone siblings, by child index.
     pub shared: Box<[Shared]>,
-    /// Files in this subtree whose clone flags could not be read (with
-    /// --clones), so a subtree rescan can replace its share of the gaps.
-    pub clone_gaps: u64,
+    /// Files in this subtree whose clone flags could not be read, so a
+    /// subtree rescan can replace its share of the gaps.
+    pub gaps: u64,
+}
+
+impl CloneInfo {
+    fn is_empty(&self) -> bool {
+        self.group_free == 0 && self.dup == 0 && self.shared.is_empty() && self.gaps == 0
+    }
 }
 
 /// A file of a [`DirInfo`] that shares blocks with other files: hard links
@@ -93,7 +107,7 @@ impl Node {
 
     /// Files in this subtree whose clone flags could not be read.
     pub fn clone_gaps(&self) -> u64 {
-        self.dir.as_ref().map_or(0, |d| d.clone_gaps)
+        self.dir.as_ref().map_or(0, |d| d.clone_gaps())
     }
 
     pub fn files(&self) -> u64 {
@@ -102,13 +116,15 @@ impl Node {
 
     /// Size with each APFS clone family counted once (additive).
     pub fn dedup(&self) -> u64 {
-        self.dir.as_ref().map_or(self.size, |d| self.size.saturating_sub(d.dup))
+        self.dir
+            .as_ref()
+            .map_or(self.size, |d| self.size.saturating_sub(d.dup()))
     }
 
     /// Lower bound of the bytes deleting this would free (not additive).
     pub fn freeable(&self) -> u64 {
         match &self.dir {
-            Some(d) => d.free_base + d.group_free,
+            Some(d) => d.free_base + d.group_free(),
             None if self.hardlink || self.clone => 0,
             None => self.size,
         }
@@ -127,12 +143,45 @@ impl Node {
 }
 
 impl DirInfo {
+    /// Files of this dir with hard links or clone siblings (`--clones`).
+    pub fn shared(&self) -> &[Shared] {
+        self.clones.as_ref().map_or(&[], |c| &c.shared)
+    }
+
+    /// See [`CloneInfo::dup`].
+    pub fn dup(&self) -> u64 {
+        self.clones.as_ref().map_or(0, |c| c.dup)
+    }
+
+    /// See [`CloneInfo::group_free`].
+    pub fn group_free(&self) -> u64 {
+        self.clones.as_ref().map_or(0, |c| c.group_free)
+    }
+
+    /// See [`CloneInfo::gaps`].
+    pub fn clone_gaps(&self) -> u64 {
+        self.clones.as_ref().map_or(0, |c| c.gaps)
+    }
+
+    /// The clone state, created empty if there is none yet.
+    pub fn clones_mut(&mut self) -> &mut CloneInfo {
+        self.clones.get_or_insert_with(Box::default)
+    }
+
+    /// Drop the clone state if nothing is left in it.
+    pub fn trim_clones(&mut self) {
+        if self.clones.as_ref().is_some_and(|c| c.is_empty()) {
+            self.clones = None;
+        }
+    }
+
     /// The [`Shared`] record of child `i`, if it has one.
     pub fn shared_of(&self, i: usize) -> Option<&Shared> {
-        self.shared
+        let shared = self.shared();
+        shared
             .binary_search_by_key(&(i as u32), |s| s.idx)
             .ok()
-            .map(|k| &self.shared[k])
+            .map(|k| &shared[k])
     }
 
     /// Deduplicated size of child `i` (see [`Node::dedup`]).
@@ -147,7 +196,7 @@ impl DirInfo {
     /// Sort children biggest first by `key` (then by name), keeping
     /// `shared` pointing at the same files.
     pub fn sort_children(&mut self, by_dedup: bool) {
-        if self.shared.is_empty() && !by_dedup {
+        if self.shared().is_empty() && !by_dedup {
             self.children
                 .sort_unstable_by(|a, b| b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name)));
             return;
@@ -169,8 +218,11 @@ impl DirInfo {
         for (pos, &old) in order.iter().enumerate() {
             new_pos[old as usize] = pos as u32;
         }
-        for s in self.shared.iter_mut() {
-            s.idx = new_pos[s.idx as usize];
+        if let Some(c) = self.clones.as_deref_mut() {
+            for s in c.shared.iter_mut() {
+                s.idx = new_pos[s.idx as usize];
+            }
+            c.shared.sort_unstable_by_key(|s| s.idx);
         }
         // Apply the permutation in place, one cycle at a time (position
         // `pos` takes the child at `order[pos]`).
@@ -185,7 +237,6 @@ impl DirInfo {
                 pos = src;
             }
         }
-        self.shared.sort_unstable_by_key(|s| s.idx);
     }
 }
 
@@ -700,7 +751,9 @@ fn scan_root(
     let own_size = platform::allocated(&meta);
     let mut node = scan_dir(root, file_name_of(root).into(), &parent, inherited, own_size, &ctx);
     node.name = name;
-    crate::account::account(&mut node, Some(root));
+    if clones {
+        crate::account::account(&mut node, Some(root));
+    }
     Ok(node)
 }
 
@@ -765,6 +818,9 @@ fn scan_dir(
 
     // Progress is updated once per directory to keep atomics off the hot path.
     let (file_entries, mut file_bytes) = (files.len() as u64, 0);
+    // One allocation for the files instead of growing by doubling: the
+    // spare capacity would stay allocated for the life of the tree.
+    children.reserve_exact(files.len());
     let mut shared = Vec::new();
     let mut free_base = own_size;
     for (i, e) in files.into_iter().enumerate() {
@@ -774,7 +830,9 @@ fn scan_dir(
         let link = e.link();
         let size = ctx.alloc_size(e.alloc, link);
         file_bytes += size;
-        if link.is_some() || e.clone.is_some() {
+        // Groups are only accounted with --clones; without it a hard link
+        // simply never counts as freeable.
+        if ctx.clones && (link.is_some() || e.clone.is_some()) {
             let (key, is_clone, refcnt) = match e.clone {
                 Some(id) => ((e.dev, id), true, 0),
                 // A hard link that may share blocks (a partial clone, or
@@ -825,7 +883,7 @@ fn scan_dir(
             Some(d) => {
                 cats.iter_mut().zip(d.cats.iter()).for_each(|(a, b)| *a += b);
                 errors += d.errors;
-                clone_gaps += d.clone_gaps;
+                clone_gaps += d.clone_gaps();
                 free_base += d.free_base;
             }
             None => cats[c.cat.index()] += c.size,
@@ -837,10 +895,13 @@ fn scan_dir(
         errors,
         children,
         free_base,
-        group_free: 0,
-        dup: 0,
-        shared: shared.into_boxed_slice(),
-        clone_gaps,
+        clones: (!shared.is_empty() || clone_gaps > 0).then(|| {
+            Box::new(CloneInfo {
+                shared: shared.into_boxed_slice(),
+                gaps: clone_gaps,
+                ..CloneInfo::default()
+            })
+        }),
     };
     dir.sort_children(false);
 
@@ -937,6 +998,20 @@ mod escape_tests {
         assert_ne!(escape(b"d\xffir"), escape(b"d\xfeir"));
         assert_eq!(escape(b"d\xffir"), "d\\xffir");
         assert!(unescape("bad\\q").is_none());
+    }
+}
+
+#[cfg(test)]
+mod size_tests {
+    use super::{DirInfo, Node};
+
+    /// One node per file and one `DirInfo` per dir: their sizes are most of
+    /// a scan's memory. Clone state lives behind one pointer (`--clones`).
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn tree_nodes_stay_small() {
+        assert_eq!(std::mem::size_of::<Node>(), 40);
+        assert_eq!(std::mem::size_of::<DirInfo>(), 72);
     }
 }
 

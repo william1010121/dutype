@@ -29,7 +29,7 @@ fn tools() -> Value {
                 allocated on disk (size_bytes, like du). With clones: true (slower), on APFS \
                 dedup_bytes counts each clone family once and freeable_min_bytes is a lower \
                 bound of what deleting an item frees; without it freeable_min_bytes is null on \
-                macOS. See accounting. Read-only.",
+                macOS and leaves out hard-linked files. See accounting. Read-only.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
