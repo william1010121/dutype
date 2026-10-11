@@ -116,7 +116,12 @@ pub fn account(root: &mut Node, base: Option<&Path>) {
         // Every link of every inode here, and for a clone family every inode.
         let refcnt = g.iter().map(|m| m.refcnt).max().unwrap_or(0) as usize;
         let all_links = g.chunk_by(|a, b| a.ino == b.ino).all(|l| l.len() as u64 >= l[0].nlink);
-        let complete = all_links && (!is_clone || (refcnt >= 2 && n >= refcnt));
+        let complete = all_links
+            && match is_clone {
+                true => refcnt >= 2 && n >= refcnt,
+                // A link that may share blocks with another inode: never.
+                false => g.iter().all(|m| m.refcnt >= 1),
+            };
         if complete {
             // One copy: the bytes counted on the links of one inode.
             let bytes = g
@@ -455,6 +460,30 @@ mod synthetic {
         assert_eq!(root.freeable(), S);
         let d = root.children()[0].dir.as_ref().unwrap();
         assert!(d.shared.iter().all(|s| s.refcnt == 1));
+    }
+
+    /// A hard-linked file that may share blocks with another inode (a
+    /// partial clone) frees nothing for sure, even with all links inside.
+    #[test]
+    fn hard_link_that_may_share_is_never_freeable() {
+        for (refcnt, freed) in [(1, S), (0, 0)] {
+            let mut h = file("h", true);
+            h.hardlink = true;
+            let mut root = dir("root", vec![h]);
+            let d = root.dir.as_deref_mut().unwrap();
+            d.shared = vec![Shared {
+                idx: 0,
+                key: (1, 7),
+                is_clone: false,
+                ino: 7,
+                nlink: 1,
+                refcnt,
+                dup: false,
+            }]
+            .into_boxed_slice();
+            account(&mut root, None);
+            assert_eq!(root.freeable(), freed, "refcnt {refcnt}");
+        }
     }
 
     /// Results of an earlier pass do not leak into the next one.

@@ -66,7 +66,8 @@ pub struct Shared {
     /// Inodes in the clone family on the whole volume, read by
     /// [`crate::account`] once the family has two members in the tree: 0
     /// while unknown, 1 when it cannot be read (the family is then never
-    /// complete). 1 for a plain hard link.
+    /// complete). For a hard link: 1, or 0 when it may share blocks with
+    /// another inode (then its group is never complete).
     pub refcnt: u32,
     /// Set by [`crate::account`]: the family is counted at another member,
     /// so this file adds nothing to deduplicated sizes.
@@ -741,7 +742,9 @@ fn scan_dir(
         if link.is_some() || e.clone.is_some() {
             let (key, is_clone, refcnt) = match e.clone {
                 Some(id) => ((e.dev, id), true, 0),
-                None => ((e.dev, e.ino), false, 1),
+                // A hard link that may share blocks (a partial clone, or
+                // unknown): 0, so its group is never complete.
+                None => ((e.dev, e.ino), false, if e.may_share { 0 } else { 1 }),
             };
             shared.push(Shared {
                 idx: children.len() as u32,
