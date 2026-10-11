@@ -2,13 +2,13 @@
 //! the names and metadata of many entries, instead of `readdir` plus one
 //! `lstat` per entry. Sizes and identities match what `lstat` reports.
 
-use crate::scan::{Entry, ReadStats};
+use crate::scan::{Entry, Progress, ReadStats};
 use std::cell::RefCell;
 use std::ffi::{CString, OsStr};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 
 // Missing from libc 0.2 (values from the SDK's sys/attr.h and sys/vnode.h).
 const ATTR_CMN_ERROR: u32 = 0x2000_0000;
@@ -69,7 +69,7 @@ impl Drop for Fd {
 /// bulk reads (the caller then falls back to `read_dir`).
 pub(in crate::scan) fn read_entries(
     path: &Path,
-    cancel: &AtomicBool,
+    progress: &Progress,
     out: &mut Vec<Entry>,
     clones: bool,
     private: bool,
@@ -83,13 +83,13 @@ pub(in crate::scan) fn read_entries(
         return Some(Err(io::Error::last_os_error()));
     }
     let fd = Fd(fd);
-    BUF.with_borrow_mut(|buf| read_all(&fd, buf, cancel, out, clones, private))
+    BUF.with_borrow_mut(|buf| read_all(&fd, buf, progress, out, clones, private))
 }
 
 fn read_all(
     fd: &Fd,
     buf: &mut [u64],
-    cancel: &AtomicBool,
+    progress: &Progress,
     out: &mut Vec<Entry>,
     clones: bool,
     private: bool,
@@ -99,6 +99,8 @@ fn read_all(
     let private = clones && private;
     let mut stats = ReadStats::default();
     let mut first = true;
+    // Entries from `reported` on are not in the progress counters yet.
+    let (mut reported, mut first_batch) = (out.len(), true);
     loop {
         let bytes = std::mem::size_of_val(buf);
         let options = if clones {
@@ -142,9 +144,16 @@ fn read_all(
             }
             at += len;
         }
-        if cancel.load(Ordering::Relaxed) {
+        if progress.cancel.load(Ordering::Relaxed) {
             return Some(Ok(stats));
         }
+        // From a directory's second batch on, show its progress now. Most
+        // directories fit in one batch: `scan_dir` reports those, once.
+        if !first_batch {
+            stats.report(progress, &out[reported..]);
+            reported = out.len();
+        }
+        first_batch = false;
     }
 }
 

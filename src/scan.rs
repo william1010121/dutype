@@ -359,8 +359,13 @@ impl ReflinkFs {
 
 #[derive(Default)]
 pub struct Progress {
+    /// Files and bytes of the directories read so far, added once per
+    /// directory; [`Self::shown_files`] also counts those still being read.
     pub files: AtomicU64,
     pub bytes: AtomicU64,
+    /// Files and bytes already read from huge directories still being read
+    /// (opaque: read through [`Self::shown_files`]).
+    pub pending: PendingSlots,
     pub errors: AtomicU64,
     /// Some directory reported APFS clone flags.
     pub clone_ids: AtomicBool,
@@ -383,7 +388,58 @@ pub struct Progress {
     pub found: Mutex<Vec<(PathBuf, u64)>>,
 }
 
+/// One per thread, on its own cache line: a huge directory's progress is
+/// added to the reading thread's slot, so it never contends with other
+/// threads on the shared counters. Slots may wrap: only their sum matters.
+#[derive(Default)]
+#[repr(align(128))]
+struct Pending {
+    files: AtomicU64,
+    bytes: AtomicU64,
+}
+
+pub struct PendingSlots(Box<[Pending]>);
+
+impl Default for PendingSlots {
+    /// A slot per rayon worker, plus one for any other thread.
+    fn default() -> Self {
+        PendingSlots((0..=rayon::current_num_threads()).map(|_| Pending::default()).collect())
+    }
+}
+
+impl PendingSlots {
+    fn mine(&self) -> &Pending {
+        let last = self.0.len() - 1;
+        &self.0[rayon::current_thread_index().map_or(last, |i| i.min(last))]
+    }
+    fn add(&self, files: u64, bytes: u64) {
+        let slot = self.mine();
+        slot.files.fetch_add(files, Ordering::Relaxed);
+        slot.bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+    fn sum(&self, field: impl Fn(&Pending) -> &AtomicU64) -> u64 {
+        self.0
+            .iter()
+            .fold(0u64, |n, s| n.wrapping_add(field(s).load(Ordering::Relaxed)))
+    }
+}
+
 impl Progress {
+    /// Files to show while scanning: those of finished directories plus
+    /// those read so far from directories still being read.
+    pub fn shown_files(&self) -> u64 {
+        self.files
+            .load(Ordering::Relaxed)
+            .wrapping_add(self.pending.sum(|s| &s.files))
+    }
+
+    /// Bytes to show while scanning (see [`Self::shown_files`]).
+    pub fn shown_bytes(&self) -> u64 {
+        self.bytes
+            .load(Ordering::Relaxed)
+            .wrapping_add(self.pending.sum(|s| &s.bytes))
+    }
+
     /// The private sizes the scan found (see [`PrivateSizes`]).
     pub fn take_private(&self) -> PrivateSizes {
         PrivateSizes(std::mem::take(&mut *self.found.lock().unwrap()).into_iter().collect())
@@ -413,14 +469,13 @@ impl PrivateSizes {
 
 #[cfg(unix)]
 mod platform {
-    use super::{Entry, FsKind, ReadStats};
+    use super::{Entry, FsKind, Progress, ReadStats};
     use std::ffi::OsStr;
     use std::fs::Metadata;
     use std::io;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::MetadataExt;
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::AtomicBool;
 
     #[cfg(target_os = "macos")]
     pub(super) mod bulk;
@@ -437,17 +492,17 @@ mod platform {
     /// [`ReadStats::private`] (bulk reads only).
     pub fn read_entries(
         path: &Path,
-        cancel: &AtomicBool,
+        progress: &Progress,
         out: &mut Vec<Entry>,
         clones: bool,
         private: bool,
     ) -> io::Result<ReadStats> {
         #[cfg(target_os = "macos")]
-        if let Some(r) = bulk::read_entries(path, cancel, out, clones, private) {
+        if let Some(r) = bulk::read_entries(path, progress, out, clones, private) {
             return r;
         }
         let first = out.len();
-        let mut r = super::read_entries_std(path, cancel, out);
+        let mut r = super::read_entries_std(path, progress, out);
         // On macOS any volume may share blocks (APFS clones, server-side
         // copies); without bulk flags a file's clone state is unknown.
         if clones && cfg!(target_os = "macos") {
@@ -605,22 +660,21 @@ mod platform {
 
 #[cfg(not(unix))]
 mod platform {
-    use super::{Entry, FsKind, ReadStats};
+    use super::{Entry, FsKind, Progress, ReadStats};
     use std::ffi::OsStr;
     use std::fs::{self, Metadata};
     use std::io;
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::AtomicBool;
 
     /// No clone identity or private sizes here.
     pub fn read_entries(
         path: &Path,
-        cancel: &AtomicBool,
+        progress: &Progress,
         out: &mut Vec<Entry>,
         _clones: bool,
         _private: bool,
     ) -> io::Result<ReadStats> {
-        super::read_entries_std(path, cancel, out)
+        super::read_entries_std(path, progress, out)
     }
 
     pub fn clone_refcnt(_: &Path) -> Option<u32> {
@@ -732,27 +786,55 @@ pub(crate) struct ReadStats {
     /// `(raw name, bytes)`: APFS private sizes of the partial clones read
     /// (`--private`; empty, so not allocated, otherwise).
     pub private: Vec<(OsString, u64)>,
+    /// Files (and their allocated bytes) added to this thread's pending
+    /// progress while a huge directory was being read; `scan_dir` takes
+    /// them back out when it counts the directory.
+    pub reported_files: u64,
+    pub reported_bytes: u64,
+}
+
+/// `read_dir` entries read between early progress reports of a directory
+/// (bulk reads report per batch instead).
+const REPORT_EVERY: usize = 4096;
+
+impl ReadStats {
+    /// Show the files among `entries` (read from a directory that is still
+    /// being read) now, so a huge flat directory does not freeze the
+    /// progress screen until it is fully read. They go to this thread's
+    /// pending slot; the shared counters stay once per directory.
+    fn report(&mut self, progress: &Progress, entries: &[Entry]) {
+        let (files, bytes) = entries
+            .iter()
+            .filter(|e| !e.dir)
+            .fold((0, 0), |(n, b), e| (n + 1, b + e.alloc));
+        progress.pending.add(files, bytes);
+        self.reported_files += files;
+        self.reported_bytes += bytes;
+    }
 }
 
 /// Reads `path` with `read_dir` + `lstat`, appending to `out`. Stops early
-/// once `cancel` is set.
-fn read_entries_std(path: &Path, cancel: &AtomicBool, out: &mut Vec<Entry>) -> io::Result<ReadStats> {
-    let mut errors = 0;
+/// once `progress.cancel` is set.
+fn read_entries_std(path: &Path, progress: &Progress, out: &mut Vec<Entry>) -> io::Result<ReadStats> {
+    let mut stats = ReadStats::default();
+    let mut reported = out.len();
     for (i, e) in fs::read_dir(path)?.enumerate() {
-        // Huge flat directories: notice a cancel without reading them all.
-        if i % 256 == 255 && cancel.load(Ordering::Relaxed) {
+        // Huge flat directories: notice a cancel without reading them all,
+        // and show progress while they are read.
+        if i % 256 == 255 && progress.cancel.load(Ordering::Relaxed) {
             break;
+        }
+        if i % REPORT_EVERY == REPORT_EVERY - 1 {
+            stats.report(progress, &out[reported..]);
+            reported = out.len();
         }
         // DirEntry::metadata does not follow symlinks.
         match e.and_then(|e| Ok((e.file_name(), e.metadata()?))) {
             Ok((n, m)) => out.push(Entry::from_metadata(n, &m)),
-            Err(_) => errors += 1,
+            Err(_) => stats.errors += 1,
         }
     }
-    Ok(ReadStats {
-        errors,
-        ..ReadStats::default()
-    })
+    Ok(stats)
 }
 
 /// Files in the APFS full-clone family of the file at `path`, where the
@@ -1158,17 +1240,12 @@ fn scan_dir(
     // A cancelled scan stops descending; its partial result is discarded.
     let stats = match ctx.progress.cancel.load(Ordering::Relaxed) {
         true => ReadStats::default(),
-        false => platform::read_entries(
-            path,
-            &ctx.progress.cancel,
-            &mut entries,
-            ctx.clones,
-            ctx.progress.private,
-        )
-        .unwrap_or(ReadStats {
-            errors: 1,
-            ..ReadStats::default()
-        }),
+        false => platform::read_entries(path, ctx.progress, &mut entries, ctx.clones, ctx.progress.private).unwrap_or(
+            ReadStats {
+                errors: 1,
+                ..ReadStats::default()
+            },
+        ),
     };
     if stats.clone_ids {
         ctx.progress.clone_ids.store(true, Ordering::Relaxed);
@@ -1187,6 +1264,7 @@ fn scan_dir(
         record_private(path, stats.private, ctx);
     }
     let mut errors = stats.errors;
+    let (reported_files, reported_bytes) = (stats.reported_files, stats.reported_bytes);
     if errors > 0 {
         ctx.progress.errors.fetch_add(errors, Ordering::Relaxed);
     }
@@ -1273,6 +1351,11 @@ fn scan_dir(
     }
     ctx.progress.files.fetch_add(file_entries, Ordering::Relaxed);
     ctx.progress.bytes.fetch_add(file_bytes, Ordering::Relaxed);
+    // What the reader showed early is counted now: take it back out.
+    if reported_files > 0 {
+        let neg = |n: u64| n.wrapping_neg();
+        ctx.progress.pending.add(neg(reported_files), neg(reported_bytes));
+    }
 
     let mut cats = vec![0u64; reg.len()].into_boxed_slice();
     cats[effective.unwrap_or(reg.other()).index()] += own_size;
@@ -1463,6 +1546,64 @@ mod size_tests {
 }
 
 #[cfg(test)]
+mod progress_tests {
+    use super::{Progress, REPORT_EVERY, platform, read_entries_std, scan_excluding};
+    use std::fs;
+    use std::sync::atomic::Ordering;
+
+    /// A huge flat directory shows progress while it is read (more than one
+    /// bulk batch, more than `REPORT_EVERY` read_dir entries), and the scan
+    /// still counts every file exactly once.
+    #[test]
+    fn huge_dirs_report_progress_while_read() {
+        let d = std::env::temp_dir().join(format!("dutype-progress-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(d.join("sub")).unwrap();
+        let n = REPORT_EVERY + 1000;
+        for i in 0..n {
+            fs::write(d.join(format!("file-with-a-longer-name-{i:05}")), b"x").unwrap();
+        }
+        fs::write(d.join("sub/one"), b"x").unwrap();
+
+        let read = |std: bool| {
+            let progress = Progress::default();
+            let mut v = Vec::new();
+            let stats = match std {
+                true => read_entries_std(&d, &progress, &mut v),
+                false => platform::read_entries(&d, &progress, &mut v, false, false),
+            }
+            .unwrap();
+            assert_eq!(v.len(), n + 1);
+            // Bulk reads may report the last batch too: nothing is left for
+            // `scan_dir` then.
+            assert!(stats.reported_files > 0 && stats.reported_files <= n as u64);
+            // Shown, but not in the shared counters, which stay once per dir.
+            assert_eq!(progress.shown_files(), stats.reported_files);
+            assert_eq!(progress.shown_bytes(), stats.reported_bytes);
+            assert_eq!(progress.files.load(Ordering::Relaxed), 0);
+        };
+        read(true);
+        read(false);
+
+        let progress = Progress::default();
+        scan_excluding(&d, true, false, &progress, None).unwrap();
+        let file_bytes: u64 = fs::read_dir(&d)
+            .unwrap()
+            .chain(fs::read_dir(d.join("sub")).unwrap())
+            .map(|e| e.unwrap().metadata().unwrap())
+            .filter(|m| m.is_file())
+            .map(|m| platform::allocated(&m))
+            .sum();
+        assert_eq!(progress.files.load(Ordering::Relaxed), n as u64 + 1);
+        assert_eq!(progress.bytes.load(Ordering::Relaxed), file_bytes);
+        // Nothing pending is left once the scan is done.
+        assert_eq!(progress.shown_files(), n as u64 + 1);
+        assert_eq!(progress.shown_bytes(), file_bytes);
+        fs::remove_dir_all(&d).unwrap();
+    }
+}
+
+#[cfg(test)]
 mod share_tests {
     use super::may_share_blocks;
 
@@ -1542,12 +1683,12 @@ mod bulk_tests {
     #[test]
     fn bulk_matches_lstat() {
         let d = tree("lstat");
-        let cancel = AtomicBool::new(false);
+        let progress = Progress::default();
         for dir in [d.clone(), d.join("sub"), d.join("sub/deeper")] {
             let (mut a, mut b) = (Vec::new(), Vec::new());
-            assert_eq!(read_entries_std(&dir, &cancel, &mut a).unwrap().errors, 0);
+            assert_eq!(read_entries_std(&dir, &progress, &mut a).unwrap().errors, 0);
             assert_eq!(
-                platform::bulk::read_entries(&dir, &cancel, &mut b, true, true)
+                platform::bulk::read_entries(&dir, &progress, &mut b, true, true)
                     .unwrap()
                     .unwrap()
                     .errors,
@@ -1567,9 +1708,8 @@ mod bulk_tests {
     #[test]
     fn clones_off_reads_no_clone_data() {
         let d = tree("off");
-        let cancel = AtomicBool::new(false);
         let mut v = Vec::new();
-        let stats = platform::bulk::read_entries(&d, &cancel, &mut v, false, false)
+        let stats = platform::bulk::read_entries(&d, &Progress::default(), &mut v, false, false)
             .unwrap()
             .unwrap();
         assert!(!stats.clone_ids);
@@ -1812,7 +1952,7 @@ mod bulk_tests {
         let mut v = Vec::new();
         let r = platform::bulk::read_entries(
             Path::new("/nonexistent-dutype"),
-            &AtomicBool::new(false),
+            &Progress::default(),
             &mut v,
             true,
             false,

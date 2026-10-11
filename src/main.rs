@@ -361,8 +361,8 @@ fn scan_with_progress<T: Send + 'static>(
                 ui::draw_scanning(
                     f,
                     path,
-                    progress.files.load(Ordering::Relaxed),
-                    progress.bytes.load(Ordering::Relaxed),
+                    progress.shown_files(),
+                    progress.shown_bytes(),
                     started.elapsed(),
                 )
             })
