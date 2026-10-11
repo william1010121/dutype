@@ -129,7 +129,7 @@ fn read_all(
                 stats.errors += 1;
                 return Some(Ok(stats));
             };
-            match parse(fd, &data[at..at + len], &mut stats.clone_ids) {
+            match parse(fd, &data[at..at + len], clones, &mut stats.clone_ids) {
                 Some(e) => out.push(e),
                 None => stats.errors += 1,
             }
@@ -172,7 +172,7 @@ impl Cursor<'_> {
 /// attribute set, then each returned attribute in bit order, group by group
 /// (common, dir, file, extended common). `None` for an entry with no
 /// usable name or metadata. Sets `clone_ids` when clone flags are reported.
-fn parse(fd: &Fd, d: &[u8], clone_ids: &mut bool) -> Option<Entry> {
+fn parse(fd: &Fd, d: &[u8], clones: bool, clone_ids: &mut bool) -> Option<Entry> {
     let mut c = Cursor { d, at: 4 };
     let common = c.u32()?;
     let _vol = c.u32()?;
@@ -197,7 +197,7 @@ fn parse(fd: &Fd, d: &[u8], clone_ids: &mut bool) -> Option<Entry> {
     // An entry the kernel could not read in bulk may still `lstat`.
     let need = libc::ATTR_CMN_DEVID | libc::ATTR_CMN_OBJTYPE | libc::ATTR_CMN_FILEID;
     if error != 0 || common & need != need {
-        return lstat_at(fd, name);
+        return lstat_at(fd, name, clones);
     }
     // dev_t is signed; widen it like `MetadataExt::dev` does.
     let dev = c.u32()? as i32 as u64;
@@ -215,7 +215,7 @@ fn parse(fd: &Fd, d: &[u8], clone_ids: &mut bool) -> Option<Entry> {
         // A mount point reports the attributes of the filesystem below it;
         // `lstat` gives the mounted one, as a `read_dir` scan sees it.
         if mount & (libc::DIR_MNTSTATUS_MNTPOINT | DIR_MNTSTATUS_TRIGGER) != 0 || alloc.is_none() {
-            return lstat_at(fd, name);
+            return lstat_at(fd, name, clones);
         }
         return Some(Entry {
             name: name.to_os_string(),
@@ -230,11 +230,11 @@ fn parse(fd: &Fd, d: &[u8], clone_ids: &mut bool) -> Option<Entry> {
     }
     let nlink = match file_attrs & libc::ATTR_FILE_LINKCOUNT != 0 {
         true => c.u32()?,
-        false => return lstat_at(fd, name),
+        false => return lstat_at(fd, name, clones),
     };
     let alloc = match file_attrs & libc::ATTR_FILE_ALLOCSIZE != 0 {
         true => c.u64()?,
-        false => return lstat_at(fd, name),
+        false => return lstat_at(fd, name, clones),
     };
     let clone_id = match ext_attrs & libc::ATTR_CMNEXT_CLONEID != 0 {
         true => Some(c.u64()?),
@@ -263,7 +263,9 @@ fn parse(fd: &Fd, d: &[u8], clone_ids: &mut bool) -> Option<Entry> {
 
 /// Fallback for an entry whose bulk attributes are incomplete or describe
 /// another filesystem.
-fn lstat_at(fd: &Fd, name: &OsStr) -> Option<Entry> {
+/// With `clones`, a file read this way has unknown clone flags, so it
+/// counts as one that may share blocks (never as freeable).
+fn lstat_at(fd: &Fd, name: &OsStr, clones: bool) -> Option<Entry> {
     let cname = CString::new(name.as_bytes()).ok()?;
     let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
     if unsafe { libc::fstatat(fd.0, cname.as_ptr(), st.as_mut_ptr(), libc::AT_SYMLINK_NOFOLLOW) } != 0 {
@@ -279,7 +281,7 @@ fn lstat_at(fd: &Fd, name: &OsStr) -> Option<Entry> {
         ino: st.st_ino,
         nlink: if dir { 1 } else { st.st_nlink as u64 },
         clone: None,
-        may_share: false,
+        may_share: clones && !dir,
     })
 }
 
@@ -374,6 +376,18 @@ mod tests {
         (d, fd, e)
     }
 
+    /// With --clones, an entry read through the lstat fallback has unknown
+    /// clone flags: it may share blocks, so it is never counted as freeable.
+    #[test]
+    fn fallback_entry_may_share_with_clones() {
+        let common = libc::ATTR_CMN_RETURNED_ATTRS | libc::ATTR_CMN_NAME | ATTR_CMN_ERROR;
+        let (d, fd, e) = synthetic("fallback-clones", common, libc::EIO as u32);
+        let got = parse(&fd, &e, true, &mut false).expect("entry kept");
+        assert!(got.may_share && got.clone.is_none());
+        assert!(!parse(&fd, &e, false, &mut false).unwrap().may_share);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
     #[test]
     fn plain_request_has_no_extended_attributes() {
         assert_eq!(attr_list(false).forkattr, 0);
@@ -385,8 +399,8 @@ mod tests {
         let common =
             libc::ATTR_CMN_RETURNED_ATTRS | libc::ATTR_CMN_NAME | libc::ATTR_CMN_DEVID | libc::ATTR_CMN_OBJTYPE;
         let (d, fd, e) = synthetic("attrs", common, 0);
-        let got = parse(&fd, &e, &mut false).expect("entry kept");
-        assert_eq!(Some(got), lstat_at(&fd, OsStr::new("f.bin")));
+        let got = parse(&fd, &e, false, &mut false).expect("entry kept");
+        assert_eq!(Some(got), lstat_at(&fd, OsStr::new("f.bin"), false));
         std::fs::remove_dir_all(&d).unwrap();
     }
 
@@ -394,8 +408,8 @@ mod tests {
     fn entry_error_falls_back_to_lstat() {
         let common = libc::ATTR_CMN_RETURNED_ATTRS | libc::ATTR_CMN_NAME | ATTR_CMN_ERROR;
         let (d, fd, e) = synthetic("error", common, libc::EIO as u32);
-        let got = parse(&fd, &e, &mut false).expect("entry kept");
-        assert_eq!(Some(got), lstat_at(&fd, OsStr::new("f.bin")));
+        let got = parse(&fd, &e, false, &mut false).expect("entry kept");
+        assert_eq!(Some(got), lstat_at(&fd, OsStr::new("f.bin"), false));
         std::fs::remove_dir_all(&d).unwrap();
     }
 }

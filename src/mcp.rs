@@ -122,6 +122,7 @@ fn call_tool(name: &str, args: &Value, opts: CacheOpts) -> Result<Value, String>
 
     let path = std::fs::canonicalize(expand(path)).map_err(|e| format!("{path}: {e}"))?;
     let one_fs = !cross_fs;
+    let shares = scan::may_share_blocks(&path, one_fs);
     let render = |snap: &Snapshot| -> Result<Value, String> {
         match category {
             None => serde_json::to_value(report::build(
@@ -133,6 +134,7 @@ fn call_tool(name: &str, args: &Value, opts: CacheOpts) -> Result<Value, String>
                     unreadable: snap.errors,
                     clones: snap.clones,
                     clone_ids: snap.clone_ids,
+                    shares,
                     size_mode,
                 },
                 top.unwrap_or(20),
@@ -141,7 +143,14 @@ fn call_tool(name: &str, args: &Value, opts: CacheOpts) -> Result<Value, String>
                 "path": path.display().to_string(),
                 "category": c.label(),
                 "cached_at": report::unix_secs(snap.cached_at),
-                "items": report::find(&snap.root, &path, c, top.unwrap_or(50), size_mode, snap.clones),
+                "items": report::find(
+                    &snap.root,
+                    &path,
+                    c,
+                    top.unwrap_or(50),
+                    size_mode,
+                    report::freeable_known(snap.clones && snap.clone_ids, shares),
+                ),
             })),
         }
         .map_err(|e| e.to_string())
@@ -275,16 +284,21 @@ mod tests {
         assert_eq!(r["accounting"]["size_mode"], "dedup");
         assert_ne!(r["accounting"]["clone_detection"], "off");
         assert_eq!(r["dedup_bytes"], r["size_bytes"]);
-        assert!(r["freeable_min_bytes"].is_u64());
-        // Without clones: detection off, and on macOS no freeable bound.
+        // Known where APFS reported clone flags, or where nothing shares blocks.
+        let shares = scan::may_share_blocks(&dir, true);
+        let known = r["accounting"]["clone_detection"] == "apfs-full" || !shares;
+        assert_eq!(r["freeable_min_bytes"].is_u64(), known);
+        if cfg!(target_os = "macos") {
+            assert!(known, "temp dir on APFS expected");
+        }
+        // Without clones: detection off, and no freeable bound where files
+        // may share blocks (always on macOS).
         let r = call(Value::Null).unwrap();
         assert_eq!(r["accounting"]["size_mode"], "du");
         assert_eq!(r["accounting"]["clone_detection"], "off");
-        assert_eq!(r["freeable_min_bytes"].is_null(), cfg!(target_os = "macos"));
-        assert_eq!(
-            r["children"][0]["freeable_min_bytes"].is_null(),
-            cfg!(target_os = "macos")
-        );
+        assert_eq!(r["freeable_min_bytes"].is_null(), shares);
+        assert_eq!(r["children"][0]["freeable_min_bytes"].is_null(), shares);
+        assert!(shares || !cfg!(target_os = "macos"));
         assert!(call(json!("DEDUP")).is_err());
         assert!(call(json!(1)).is_err());
         std::fs::remove_dir_all(&dir).unwrap();

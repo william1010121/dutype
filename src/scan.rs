@@ -230,6 +230,41 @@ mod platform {
         }
     }
 
+    /// Files on the filesystem of `root` may share blocks (APFS clones,
+    /// reflinks on btrfs, XFS, bcachefs, OCFS2 or ZFS block cloning), so
+    /// without shared-block detection nothing is known to be freeable.
+    pub fn may_share_blocks(root: &Path) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            let _ = root;
+            true
+        }
+        #[cfg(target_os = "linux")]
+        {
+            const REFLINK_FS: [u64; 5] = [
+                0x9123_683e, // btrfs
+                0x5846_5342, // XFS
+                0xca45_1a4e, // bcachefs
+                0x7461_636f, // OCFS2
+                0x2fc1_2fc1, // ZFS
+            ];
+            let Ok(cpath) = std::ffi::CString::new(root.as_os_str().as_bytes()) else {
+                return true;
+            };
+            let mut st = std::mem::MaybeUninit::<libc::statfs>::uninit();
+            if unsafe { libc::statfs(cpath.as_ptr(), st.as_mut_ptr()) } != 0 {
+                return true;
+            }
+            let kind = unsafe { st.assume_init() }.f_type as u64 & 0xffff_ffff;
+            REFLINK_FS.contains(&kind)
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            let _ = root;
+            false
+        }
+    }
+
     /// The file at `path` may share blocks with another (an APFS clone).
     pub fn may_share(path: &Path) -> bool {
         #[cfg(target_os = "macos")]
@@ -335,6 +370,10 @@ mod platform {
     }
 
     pub fn may_share(_: &Path) -> bool {
+        false
+    }
+
+    pub fn may_share_blocks(_: &Path) -> bool {
         false
     }
 
@@ -448,6 +487,14 @@ fn read_entries_std(path: &Path, cancel: &AtomicBool, out: &mut Vec<Entry>) -> i
 /// system can tell (macOS 14+).
 pub fn clone_refcnt(path: &Path) -> Option<u32> {
     platform::clone_refcnt(path)
+}
+
+/// Files below `root` may share blocks, so a freeable lower bound needs
+/// shared-block detection. Checked once, for the root's filesystem; with
+/// `--cross-fs` the scan may enter other filesystems, so on Linux (where
+/// only some filesystems share blocks) it is then always assumed.
+pub fn may_share_blocks(root: &Path, one_fs: bool) -> bool {
+    platform::may_share_blocks(root) || (!one_fs && cfg!(target_os = "linux"))
 }
 
 struct Ctx<'a> {
@@ -835,6 +882,27 @@ mod escape_tests {
         assert_ne!(escape(b"d\xffir"), escape(b"d\xfeir"));
         assert_eq!(escape(b"d\xffir"), "d\\xffir");
         assert!(unescape("bad\\q").is_none());
+    }
+}
+
+#[cfg(test)]
+mod share_tests {
+    use super::may_share_blocks;
+
+    /// APFS always may share blocks; with --cross-fs a Linux scan may enter a
+    /// reflink filesystem, so it is assumed there too.
+    #[test]
+    fn shared_blocks_are_assumed_where_they_can_happen() {
+        let tmp = std::env::temp_dir();
+        if cfg!(target_os = "macos") {
+            assert!(may_share_blocks(&tmp, true));
+        }
+        if cfg!(any(target_os = "macos", target_os = "linux")) {
+            assert!(may_share_blocks(&tmp, false));
+        }
+        if cfg!(windows) {
+            assert!(!may_share_blocks(&tmp, false));
+        }
     }
 }
 

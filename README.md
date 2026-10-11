@@ -202,8 +202,11 @@ Xcode tree, +31% on a 500k-file uv cache, nothing measurable on
 `~/.cargo/registry`, which has no clones). Without `--clones`, dedup equals
 the `du` size, `accounting.clone_detection` is `"off"`, and on macOS
 `freeable_min_bytes` is `null` and the TUI shows `frees ?`: any file may be a
-clone, so no lower bound can be promised. On other systems freeable still
-accounts for hard links. A `--cache` snapshot made without `--clones` is not
+clone, so no lower bound can be promised. On Linux, `freeable_min_bytes` is
+also `null` when the scanned root is on a filesystem with reflinks or block
+cloning (btrfs, XFS, bcachefs, OCFS2, ZFS; detected once, for the root) and
+always with `--cross-fs` (the scan may enter such a filesystem); on ext4 and
+other filesystems without shared blocks it accounts for hard links. A `--cache` snapshot made without `--clones` is not
 reused for a `--clones` run.
 
 Known limitations:
@@ -220,8 +223,10 @@ Known limitations:
   hint, so freeable can be lower than what deleting really frees.
 - With `--cache`, clone families are as they were at scan time: changes
   outside a rescanned folder are not seen until a full rescan (`R`).
-- Other filesystems (btrfs/XFS reflinks, ZFS block cloning) report
-  `clone_detection: "unsupported"`; dedup then equals the `du` size.
+- Shared blocks on other filesystems (btrfs/XFS reflinks, ZFS block cloning)
+  are not detected yet: with `--clones` they report
+  `clone_detection: "unsupported"`, dedup equals the `du` size and
+  `freeable_min_bytes` is `null`.
 
 ## Categories
 

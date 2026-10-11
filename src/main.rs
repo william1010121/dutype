@@ -160,7 +160,8 @@ fn run(args: Args) -> Result<(), String> {
         };
         let root = &snap.root;
         if let Some(cat) = only {
-            let items = report::find(root, &path, cat, args.top, args.size_mode, snap.clones);
+            let known = report::freeable_known(snap.clones && snap.clone_ids, scan::may_share_blocks(&path, one_fs));
+            let items = report::find(root, &path, cat, args.top, args.size_mode, known);
             if args.json {
                 let doc = serde_json::json!({
                     "path": path.display().to_string(),
@@ -183,6 +184,7 @@ fn run(args: Args) -> Result<(), String> {
                     unreadable: snap.errors,
                     clones: snap.clones,
                     clone_ids: snap.clone_ids,
+                    shares: scan::may_share_blocks(&path, one_fs),
                     size_mode: args.size_mode,
                 },
                 args.top,
@@ -245,6 +247,7 @@ fn run(args: Args) -> Result<(), String> {
             app.root_dev = snap_root_dev;
             app.clone_ids = clone_ids;
             app.clones = snap_clones;
+            app.shares = scan::may_share_blocks(&path, one_fs);
             app.set_size_mode(size_mode);
             app.show_keys = args.show_keys;
             app.go_to(&location);

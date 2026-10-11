@@ -53,7 +53,10 @@ pnpm, `cp -c`, Finder Duplicate) share blocks, so `size_bytes` can be far
 more than deleting would free. Clone detection is opt-in because it slows the
 scan: on macOS, pass `--clones` (MCP: `clones: true`) whenever you will tell
 the user how much a deletion frees. Without it, `freeable_min_bytes` is
-`null` on macOS and `accounting.clone_detection` is `"off"`.
+`null` on macOS and `accounting.clone_detection` is `"off"`. It is also
+`null` on Linux filesystems with reflinks (btrfs, XFS, bcachefs, OCFS2, ZFS)
+and with `--cross-fs`: then no lower bound is known, so do not promise freed
+space.
 
 - `freeable_min_bytes`: at least this much is freed by deleting the item.
   Use it, not `size_bytes`, when you tell the user how much a cleanup frees.

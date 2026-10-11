@@ -116,6 +116,9 @@ pub struct App {
     pub clones: bool,
     /// The scan could see APFS clone families.
     pub clone_ids: bool,
+    /// Files may share blocks on the scanned filesystem (see
+    /// [`crate::scan::may_share_blocks`]).
+    pub shares: bool,
     /// Size shown and sorted by (`c` toggles).
     pub size_mode: SizeMode,
     pub last_key: Option<(String, &'static str)>,
@@ -159,6 +162,7 @@ impl App {
             root_dev: None,
             clones: false,
             clone_ids: false,
+            shares: true,
             size_mode: SizeMode::Du,
             last_key: None,
         };
@@ -375,7 +379,7 @@ impl App {
     /// Lower bound of what deleting `n` frees, if it can be known (see
     /// [`crate::report::freeable_known`]).
     pub fn freeable(&self, n: &Node) -> Option<u64> {
-        crate::report::freeable_known(self.clones).then(|| n.freeable())
+        crate::report::freeable_known(self.clones && self.clone_ids, self.shares).then(|| n.freeable())
     }
 
     /// Size of child `i` of the current folder in the current mode.
@@ -1123,7 +1127,7 @@ mod tests {
         assert_eq!(app.size_mode, SizeMode::Du);
         assert!(app.status.as_deref().unwrap().contains("--clones"));
         assert_eq!(app.freeable(&app.root), None);
-        app.clones = true;
+        (app.clones, app.clone_ids) = (true, true);
         app.handle_key(KeyEvent::from(KeyCode::Char('c')));
         assert_eq!(app.size_mode, SizeMode::Dedup);
         assert_eq!(app.freeable(&app.root), Some(10 << 20));
@@ -1192,8 +1196,9 @@ mod tests {
         app.go_to(&["copies".into()]);
         let progress = Progress::default();
         let fresh = scan_subtree(&app.fs_path().unwrap(), true, true, &progress, None, None).unwrap();
-        // A rescan that sees clone flags makes the tree's detection known.
-        assert!(!app.clone_ids);
+        // A rescan that sees clone flags makes the tree's detection known
+        // (here as if the first scan had seen none).
+        app.clone_ids = false;
         app.replace_current(fresh, progress.clone_ids.load(std::sync::atomic::Ordering::Relaxed));
         assert!(app.clone_ids);
         assert_eq!(app.root.dedup(), 10 << 20);

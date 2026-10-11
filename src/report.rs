@@ -37,13 +37,16 @@ pub struct Meta {
     pub clones: bool,
     /// ... and the filesystem reported them.
     pub clone_ids: bool,
+    /// Files may share blocks there ([`crate::scan::may_share_blocks`]).
+    pub shares: bool,
     pub size_mode: SizeMode,
 }
 
-/// Whether a lower bound of freed bytes can be given: on macOS, any file may
-/// be an APFS clone, so only a scan that looked for clones can tell.
-pub fn freeable_known(clones: bool) -> bool {
-    clones || !cfg!(target_os = "macos")
+/// Whether a lower bound of freed bytes can be given: where files may share
+/// blocks (`shares`: APFS, btrfs, XFS, ...), only a scan that detected
+/// shared blocks (`--clones` on APFS) can tell.
+pub fn freeable_known(detected: bool, shares: bool) -> bool {
+    detected || !shares
 }
 
 /// How sizes were counted, so agents know what the numbers mean.
@@ -56,8 +59,9 @@ pub struct Accounting {
     /// `apfs-full`: identical APFS clones are detected (`dedup_bytes`,
     /// `freeable_min_bytes`); `unsupported`: they are counted in full and
     /// `dedup_bytes` equals `size_bytes`; `off`: not looked for (no
-    /// `--clones`), `dedup_bytes` equals `size_bytes` and, on macOS,
-    /// `freeable_min_bytes` is null.
+    /// `--clones`), `dedup_bytes` equals `size_bytes`. Unless clones were
+    /// detected, `freeable_min_bytes` is null where files may share blocks
+    /// (macOS; btrfs, XFS, bcachefs, OCFS2, ZFS; Linux with `--cross-fs`).
     pub clone_detection: &'static str,
     pub caveats: Vec<&'static str>,
 }
@@ -252,7 +256,7 @@ pub fn ranked_children(root: &Node, mode: SizeMode) -> Vec<usize> {
 }
 
 pub fn build(root: &Node, root_path: &Path, meta: &Meta, top: usize) -> Report {
-    let known = freeable_known(meta.clones);
+    let known = freeable_known(meta.clones && meta.clone_ids, meta.shares);
     let cats = root.cats();
     let mode = meta.size_mode;
 
@@ -382,9 +386,8 @@ pub fn to_text(r: &Report, root: &Node) -> String {
 
 /// Largest items of one category below `root`: the matching special dirs for
 /// directory categories (e.g. every node_modules), files otherwise.
-/// `clones`: the scan looked for APFS clones (see [`freeable_known`]).
-pub fn find(root: &Node, root_path: &Path, cat: Category, top: usize, mode: SizeMode, clones: bool) -> Vec<Entry> {
-    let known = freeable_known(clones);
+/// `known`: freeable bytes can be given (see [`freeable_known`]).
+pub fn find(root: &Node, root_path: &Path, cat: Category, top: usize, mode: SizeMode, known: bool) -> Vec<Entry> {
     let mut list = TopN::new(top);
     let want_dirs = cat.is_dir_kind();
     walk(root, &mut PathBuf::new(), &mut |n, dedup, p| {
