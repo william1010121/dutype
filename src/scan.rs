@@ -191,6 +191,7 @@ mod platform {
 
 /// One directory entry with the metadata the scan needs, from `lstat` or,
 /// on macOS, from `getattrlistbulk`.
+#[cfg_attr(test, derive(Debug, PartialEq))]
 pub(crate) struct Entry {
     /// Raw name: paths must be built from it (names need not be UTF-8).
     pub name: OsString,
@@ -600,9 +601,9 @@ mod bulk_tests {
         d
     }
 
-    fn sorted(mut v: Vec<Entry>) -> Vec<(OsString, bool, u64, u64, Option<(u64, u64)>)> {
+    fn sorted(mut v: Vec<Entry>) -> Vec<Entry> {
         v.sort_by(|a, b| a.name.cmp(&b.name));
-        v.into_iter().map(|e| (e.name, e.dir, e.alloc, e.dev, e.link)).collect()
+        v
     }
 
     #[test]
