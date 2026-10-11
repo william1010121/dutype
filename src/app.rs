@@ -265,7 +265,9 @@ impl App {
 
     /// Replace the current folder with a fresh scan of it, update every
     /// ancestor's totals and order, and keep the cursor on the same entries.
-    pub fn replace_current(&mut self, mut fresh: Node) {
+    /// `clone_ids`: the rescan saw APFS clone flags (see `Progress::clone_ids`).
+    pub fn replace_current(&mut self, mut fresh: Node, clone_ids: bool) {
+        self.clone_ids |= clone_ids;
         let place = self.remember();
 
         let target = node_at_mut(&mut self.root, &self.stack);
@@ -848,7 +850,7 @@ mod tests {
             None,
         )
         .unwrap();
-        app.replace_current(fresh);
+        app.replace_current(fresh, false);
 
         same(&app.root, &full(&root));
         assert_eq!(app.location(), vec![Step::from("small"), Step::from("inner")]);
@@ -872,7 +874,7 @@ mod tests {
             None,
         )
         .unwrap();
-        app.replace_current(fresh);
+        app.replace_current(fresh, false);
         same(&app.root, &full(&root));
     }
 
@@ -905,12 +907,12 @@ mod tests {
         };
         for _ in 0..3 {
             let fresh = rescan(&app);
-            app.replace_current(fresh);
+            app.replace_current(fresh, false);
             assert_eq!(app.errors, 1);
         }
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
         let fresh = rescan(&app);
-        app.replace_current(fresh);
+        app.replace_current(fresh, false);
         assert_eq!(app.errors, 0);
     }
 
@@ -1188,8 +1190,12 @@ mod tests {
         assert!(ok.success());
         app.set_size_mode(SizeMode::Dedup);
         app.go_to(&["copies".into()]);
-        let fresh = scan_subtree(&app.fs_path().unwrap(), true, true, &Progress::default(), None, None).unwrap();
-        app.replace_current(fresh);
+        let progress = Progress::default();
+        let fresh = scan_subtree(&app.fs_path().unwrap(), true, true, &progress, None, None).unwrap();
+        // A rescan that sees clone flags makes the tree's detection known.
+        assert!(!app.clone_ids);
+        app.replace_current(fresh, progress.clone_ids.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(app.clone_ids);
         assert_eq!(app.root.dedup(), 10 << 20);
         assert_eq!(app.current().name.as_ref(), "copies");
         assert_eq!(names(&app), ["plain", "orig", "copies"]);
