@@ -3,7 +3,7 @@
 //! A cache is never trusted across dutype versions or category rule changes.
 
 use crate::category::{Category, reg};
-use crate::scan::{CloneInfo, DirInfo, Node, Shared};
+use crate::scan::{CloneInfo, DirInfo, Node, PrivateSizes, Shared};
 use std::fs;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -12,7 +12,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 // v5: header stores the root's device; directories store their own
 // unreadable-entry count; flag bit 2 marks hard-linked files, bit 3 lossy
 // (non-UTF-8) names.
-const MAGIC: &[u8; 8] = b"DUTYPE\0\x06";
+// v7: header flags for `--private` (bits 4 and 5); the private sizes follow
+// the tree.
+const MAGIC: &[u8; 8] = b"DUTYPE\0\x07";
 
 pub struct Snapshot {
     pub root: Node,
@@ -30,6 +32,29 @@ pub struct Snapshot {
     pub clone_ids: bool,
     /// ... but not for every file (see `Progress::clone_gaps`).
     pub clone_gaps: bool,
+    /// The scan was made with `--private` (see `Progress::private`).
+    pub private: bool,
+    /// A volume returned the flags that pick out partial clones (see
+    /// `Progress::private_sizes`).
+    pub private_sizes: bool,
+    /// ... but some partial clone's private size was not reported (see
+    /// `Progress::private_missing`): the table is then incomplete and not
+    /// offered.
+    pub private_missing: bool,
+    /// The private sizes themselves (empty without `--private`).
+    pub privates: PrivateSizes,
+}
+
+impl Snapshot {
+    /// Whether this snapshot can answer a request with or without `--private`.
+    pub fn serves(&self, private: bool) -> bool {
+        self.private || !private
+    }
+
+    /// Its private sizes, if the scan read them.
+    pub fn private_table(&self) -> Option<&PrivateSizes> {
+        (self.private_sizes && !self.private_missing).then_some(&self.privates)
+    }
 }
 
 pub fn fnv1a(seed: u64, bytes: &[u8]) -> u64 {
@@ -207,10 +232,15 @@ fn write_to(file: &Path, root_path: &Path, snap: &Snapshot) -> io::Result<()> {
         w.0.write_all(&[snap.root_dev.is_some() as u8
             | (snap.clone_ids as u8) << 1
             | (snap.clones as u8) << 2
-            | (snap.clone_gaps as u8) << 3])?;
+            | (snap.clone_gaps as u8) << 3
+            | (snap.private as u8) << 4
+            | (snap.private_sizes as u8) << 5
+            | (snap.private_missing as u8) << 6])?;
         w.varint(snap.root_dev.unwrap_or(0))?;
         w.bytes(root_path.as_os_str().as_encoded_bytes())?;
         w.node(&snap.root)?;
+        // An incomplete table is not kept (see `private_table`).
+        w.private(snap.private_table().unwrap_or(&PrivateSizes::default()))?;
         w.0.into_inner().map_err(|e| e.into_error())?.sync_all()
     })();
     match result {
@@ -239,12 +269,17 @@ fn read_from(file: &Path, root_path: &Path) -> Option<Snapshot> {
     let scan_time = Duration::from_millis(r.varint()?);
     let errors = r.varint()?;
     let flags = *r.take(1)?.first()?;
-    if flags > 15 {
+    if flags > 127 {
         return None;
     }
     let (has_dev, clone_ids, clones) = (flags & 1 != 0, flags & 2 != 0, flags & 4 != 0);
     let clone_gaps = flags & 8 != 0;
     r.clones = clones;
+    let (private, private_sizes, private_missing) = (flags & 16 != 0, flags & 32 != 0, flags & 64 != 0);
+    // Sizes are only ever collected on request.
+    if (private_sizes || private_missing) && !private {
+        return None;
+    }
     let dev = r.varint()?;
     let root_dev = has_dev.then_some(dev);
     // A hash collision between two paths must not show the wrong tree.
@@ -252,6 +287,7 @@ fn read_from(file: &Path, root_path: &Path) -> Option<Snapshot> {
         return None;
     }
     let mut root = r.node(0)?;
+    let privates = r.private(&root, private_sizes && !private_missing)?;
     if r.pos != data.len() {
         return None;
     }
@@ -267,6 +303,10 @@ fn read_from(file: &Path, root_path: &Path) -> Option<Snapshot> {
         clones,
         clone_ids,
         clone_gaps,
+        private,
+        private_sizes,
+        private_missing,
+        privates,
     })
 }
 
@@ -331,6 +371,22 @@ impl<W: Write> Writer<W> {
         }
         Ok(())
     }
+
+    /// Count, then per file (sorted, so equal tables give equal files): its
+    /// path's names, then the bytes.
+    fn private(&mut self, p: &PrivateSizes) -> io::Result<()> {
+        let mut all: Vec<_> = p.0.iter().collect();
+        all.sort();
+        self.varint(all.len() as u64)?;
+        for (path, bytes) in all {
+            self.varint(path.components().count() as u64)?;
+            for c in path.components() {
+                self.bytes(c.as_os_str().as_encoded_bytes())?;
+            }
+            self.varint(*bytes)?;
+        }
+        Ok(())
+    }
 }
 
 struct Reader<'a> {
@@ -369,6 +425,54 @@ impl Reader<'_> {
     fn bytes(&mut self) -> Option<&[u8]> {
         let n = self.varint()?;
         self.take(usize::try_from(n).ok()?)
+    }
+
+    /// The private sizes after the tree (see [`Writer::private`]). Each must
+    /// name a distinct file of `root` and be at most its size; any at all
+    /// only if the header says the snapshot holds them.
+    fn private(&mut self, root: &Node, allowed: bool) -> Option<PrivateSizes> {
+        let count = usize::try_from(self.varint()?).ok()?;
+        if count > self.data.len() - self.pos || (count > 0 && !allowed) {
+            return None;
+        }
+        let mut p = PrivateSizes::default();
+        for _ in 0..count {
+            let names = usize::try_from(self.varint()?).ok()?;
+            if names == 0 || names > self.data.len() - self.pos {
+                return None;
+            }
+            let mut path = PathBuf::new();
+            for _ in 0..names {
+                let name = std::str::from_utf8(self.bytes()?).ok()?;
+                // One plain name per component, as the tree has them (a
+                // backslash is an ordinary character on unix).
+                if name.is_empty() || name.contains(std::path::is_separator) || name == "." || name == ".." {
+                    return None;
+                }
+                path.push(name);
+            }
+            let bytes = self.varint()?;
+            if p.0.insert(path, bytes).is_some() {
+                return None;
+            }
+        }
+        if !p.0.is_empty() {
+            let mut matched = 0;
+            let mut ok = true;
+            crate::scan::walk(root, &mut PathBuf::new(), &mut |n, rel| {
+                if !n.is_dir()
+                    && let Some(b) = p.get(rel)
+                {
+                    matched += 1;
+                    ok &= b <= n.size;
+                }
+                ok
+            });
+            if !ok || matched != p.0.len() {
+                return None;
+            }
+        }
+        Some(p)
     }
 
     fn node(&mut self, depth: usize) -> Option<Node> {
@@ -530,21 +634,32 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn round_trip_keeps_shared_blocks() {
+        let since = crate::scan::test_support::stamp();
         let src = temp("shared-src");
         fs::create_dir_all(src.join("d")).unwrap();
         fs::write(src.join("d/a"), vec![3u8; 2 << 20]).unwrap();
         fs::hard_link(src.join("d/a"), src.join("link")).unwrap();
         if cfg!(target_os = "macos") {
-            let ok = std::process::Command::new("cp")
-                .arg("-c")
-                .arg(src.join("d/a"))
-                .arg(src.join("clone"))
-                .status();
-            assert!(ok.unwrap().success());
+            for c in ["clone", "partial"] {
+                let ok = std::process::Command::new("cp")
+                    .arg("-c")
+                    .arg(src.join("d/a"))
+                    .arg(src.join(c))
+                    .status();
+                assert!(ok.unwrap().success());
+            }
+            // A partial clone, for a private size.
+            let mut f = fs::OpenOptions::new().append(true).open(src.join("partial")).unwrap();
+            f.write_all(&[5u8; 1 << 20]).unwrap();
+            f.sync_all().unwrap();
         }
-        let progress = Progress::default();
+        let progress = Progress {
+            private: true,
+            ..Progress::default()
+        };
+        let root = scan(&src, true, true, &progress).unwrap();
         let snap = Snapshot {
-            root: scan(&src, true, true, &progress).unwrap(),
+            root,
             cached_at: None,
             scan_time: Duration::ZERO,
             errors: 0,
@@ -552,8 +667,13 @@ mod tests {
             clones: true,
             clone_ids: progress.clone_ids.load(std::sync::atomic::Ordering::Relaxed),
             clone_gaps: true,
+            private: true,
+            private_sizes: progress.private_sizes.load(std::sync::atomic::Ordering::Relaxed),
+            private_missing: progress.private_missing.load(std::sync::atomic::Ordering::Relaxed),
+            privates: progress.take_private(),
         };
         assert_eq!(snap.clone_ids, cfg!(target_os = "macos"));
+        assert_eq!(snap.private_sizes, cfg!(target_os = "macos"));
         let file = temp("shared-out").join("c.bin");
         write_to(&file, &src, &snap).unwrap();
         let back = read_from(&file, &src).unwrap();
@@ -562,10 +682,72 @@ mod tests {
             (back.clones, back.clone_ids, back.clone_gaps),
             (snap.clones, snap.clone_ids, snap.clone_gaps)
         );
+        assert_eq!((back.private, back.private_sizes), (true, snap.private_sizes));
+        assert!(back.serves(true) && back.serves(false));
         assert!(answers(&back, true) && answers(&back, false));
         if cfg!(target_os = "macos") {
             assert_eq!(back.root.dedup(), back.root.size - (2 << 20));
+            assert_eq!(back.privates, snap.privates);
+            let got = back.privates.get(Path::new("partial"));
+            crate::scan::test_support::assert_private(got, 1 << 20, &since);
+
+            // A table in a file whose header does not allow one (damaged)
+            // is a miss: clear the "sizes read" bit of a good file.
+            write_to(&file, &src, &snap).unwrap();
+            let mut data = fs::read(&file).unwrap();
+            let mut r = Reader {
+                data: &data,
+                pos: 16,
+                clones: true,
+            };
+            // cached_at, scan time, errors
+            for _ in 0..3 {
+                r.varint().unwrap();
+            }
+            let flags_at = r.pos;
+            data[flags_at] &= !32;
+            fs::write(&file, &data).unwrap();
+            assert!(read_from(&file, &src).is_none());
+            // Sizes without the request are corrupt too.
+            write_to(&file, &src, &Snapshot { private: false, ..snap }).unwrap();
+            assert!(read_from(&file, &src).is_none());
         }
+        // An incomplete table (a lookup the volume could not answer) is not
+        // kept or offered, and the snapshot still loads.
+        let missing = Snapshot {
+            root: scan(&src, true, true, &Progress::default()).unwrap(),
+            cached_at: None,
+            scan_time: Duration::ZERO,
+            errors: 0,
+            root_dev: None,
+            clones: true,
+            clone_ids: false,
+            clone_gaps: false,
+            private: true,
+            private_sizes: true,
+            private_missing: true,
+            privates: PrivateSizes(std::iter::once((Path::new("d").join("a"), 1)).collect()),
+        };
+        assert!(missing.private_table().is_none());
+        write_to(&file, &src, &missing).unwrap();
+        let back = read_from(&file, &src).unwrap();
+        assert!(back.private_missing && back.privates.0.is_empty() && back.private_table().is_none());
+        // Without --private, a snapshot cannot answer a --private request.
+        let none = Snapshot {
+            root: scan(&src, true, true, &Progress::default()).unwrap(),
+            cached_at: None,
+            scan_time: Duration::ZERO,
+            errors: 0,
+            root_dev: None,
+            clones: true,
+            clone_ids: false,
+            clone_gaps: false,
+            private: false,
+            private_sizes: false,
+            private_missing: false,
+            privates: PrivateSizes::default(),
+        };
+        assert!(none.serves(false) && !none.serves(true));
         // Without --clones there are no records to keep: hard links just
         // never count as freeable, and a snapshot claiming otherwise is
         // rejected.
@@ -574,7 +756,7 @@ mod tests {
             clones: false,
             clone_ids: false,
             clone_gaps: false,
-            ..back
+            ..none
         };
         write_to(&file, &src, &plain).unwrap();
         let again = read_from(&file, &src).unwrap();
@@ -582,9 +764,59 @@ mod tests {
         same(&plain.root, &again.root);
         // The hard-linked file is counted (once) but never freeable.
         assert_eq!(again.root.freeable(), again.root.size - (2 << 20));
-        let mislabeled = Snapshot { clones: false, ..snap };
+        let mislabeled = Snapshot {
+            root: scan(&src, true, true, &Progress::default()).unwrap(),
+            clones: false,
+            ..plain
+        };
         write_to(&file, &src, &mislabeled).unwrap();
         assert!(read_from(&file, &src).is_none());
+    }
+
+    /// Private sizes survive a round trip only if each names a distinct
+    /// file of the tree and is at most its size.
+    #[test]
+    fn private_sizes_must_name_files() {
+        let src = temp("private-table");
+        fs::create_dir_all(src.join("d")).unwrap();
+        fs::write(src.join("d/a"), vec![3u8; 8192]).unwrap();
+        let snap = |entries: &[(&str, u64)]| {
+            let mut privates = PrivateSizes::default();
+            for &(p, b) in entries {
+                privates.0.insert(p.split('/').collect(), b);
+            }
+            Snapshot {
+                root: scan(&src, true, true, &Progress::default()).unwrap(),
+                cached_at: None,
+                scan_time: Duration::ZERO,
+                errors: 0,
+                root_dev: None,
+                clones: true,
+                clone_ids: false,
+                clone_gaps: false,
+                private: true,
+                private_sizes: true,
+                private_missing: false,
+                privates,
+            }
+        };
+        let file = temp("private-table-out").join("c.bin");
+        let ok = snap(&[("d/a", 4096)]);
+        write_to(&file, &src, &ok).unwrap();
+        let back = read_from(&file, &src).unwrap();
+        assert_eq!(back.privates, ok.privates);
+        assert_eq!(back.private_table().unwrap().get(&Path::new("d").join("a")), Some(4096));
+        for bad in [&[("d/a", 1 << 40)][..], &[("d", 1)], &[("d/missing", 1)], &[("a", 1)]] {
+            write_to(&file, &src, &snap(bad)).unwrap();
+            assert!(read_from(&file, &src).is_none(), "{bad:?}");
+        }
+        // A backslash is part of a unix file name, not a separator.
+        if cfg!(unix) {
+            fs::write(src.join("d/x\\y"), vec![3u8; 8192]).unwrap();
+            let ok = snap(&[("d/x\\y", 4096)]);
+            write_to(&file, &src, &ok).unwrap();
+            assert_eq!(read_from(&file, &src).unwrap().privates, ok.privates);
+        }
     }
 
     /// A shared-block record must name a file flagged as sharing blocks:
@@ -602,6 +834,10 @@ mod tests {
             clones: true,
             clone_ids: false,
             clone_gaps: false,
+            private: false,
+            private_sizes: false,
+            private_missing: false,
+            privates: PrivateSizes::default(),
         };
         let file = temp("shared-bad-out").join("c.bin");
         write_to(&file, &src, &snap).unwrap();
@@ -650,6 +886,10 @@ mod tests {
             clones: false,
             clone_ids: false,
             clone_gaps: false,
+            private: false,
+            private_sizes: false,
+            private_missing: false,
+            privates: PrivateSizes::default(),
         };
         write_to(&file, &src, &snap(1)).unwrap();
         write_to(&file, &src, &snap(2)).unwrap();
@@ -672,6 +912,10 @@ mod tests {
             clones: false,
             clone_ids: false,
             clone_gaps: false,
+            private: false,
+            private_sizes: false,
+            private_missing: false,
+            privates: PrivateSizes::default(),
         };
         write_to(&file, &src, &snap).unwrap();
         let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
@@ -703,6 +947,10 @@ mod tests {
             clones: false,
             clone_ids: false,
             clone_gaps: false,
+            private: false,
+            private_sizes: false,
+            private_missing: false,
+            privates: PrivateSizes::default(),
         };
         // Snapshots in a directory others can write are not trusted on read.
         fs::write(dir.join("probe"), "x").unwrap();
@@ -746,6 +994,10 @@ mod tests {
             clones: false,
             clone_ids: false,
             clone_gaps: false,
+            private: false,
+            private_sizes: false,
+            private_missing: false,
+            privates: PrivateSizes::default(),
         };
 
         let file = temp("out").join("c.bin");
@@ -835,6 +1087,10 @@ mod tests {
             clones: false,
             clone_ids: false,
             clone_gaps: false,
+            private: false,
+            private_sizes: false,
+            private_missing: false,
+            privates: PrivateSizes::default(),
         };
         assert!(same_device(&on(Some(dev)), &src));
         assert!(!same_device(&on(Some(dev.wrapping_add(1))), &src));

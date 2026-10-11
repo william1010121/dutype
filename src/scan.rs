@@ -1,6 +1,6 @@
 use crate::category::{Category, reg};
 use rayon::prelude::*;
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::ffi::OsString;
@@ -251,6 +251,44 @@ pub struct Progress {
     pub clone_gaps: AtomicBool,
     /// Set to stop a running scan early (the result is then incomplete).
     pub cancel: AtomicBool,
+    /// Request (`--private`): read the APFS private size of partial clones.
+    /// One extra syscall per such file, so it is opt-in.
+    pub private: bool,
+    /// Some directory was read in a way that reports private sizes (macOS,
+    /// bulk reads, with `private`).
+    pub private_sizes: AtomicBool,
+    /// Some volume did not report the private size of a partial clone.
+    pub private_missing: AtomicBool,
+    /// The private sizes found, by path relative to the scanned root.
+    pub found: Mutex<Vec<(PathBuf, u64)>>,
+}
+
+impl Progress {
+    /// The private sizes the scan found (see [`PrivateSizes`]).
+    pub fn take_private(&self) -> PrivateSizes {
+        PrivateSizes(std::mem::take(&mut *self.found.lock().unwrap()).into_iter().collect())
+    }
+}
+
+/// APFS private sizes (`--private`) of partial clones: what deleting that
+/// file alone frees right now, by its path relative to the scanned root
+/// (the tree's names, so it matches [`walk`] paths). Kept beside the tree,
+/// so a scan without `--private` costs no memory for it. Never summed into
+/// folders.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PrivateSizes(pub FxHashMap<PathBuf, u64>);
+
+impl PrivateSizes {
+    pub fn get(&self, rel: &Path) -> Option<u64> {
+        self.0.get(rel).copied()
+    }
+
+    /// Replace everything below `prefix` (a rescanned folder) with `fresh`,
+    /// whose paths are relative to that folder.
+    pub fn replace_below(&mut self, prefix: &Path, fresh: PrivateSizes) {
+        self.0.retain(|p: &PathBuf, _| !p.starts_with(prefix));
+        self.0.extend(fresh.0.into_iter().map(|(p, b)| (prefix.join(p), b)));
+    }
 }
 
 #[cfg(unix)]
@@ -270,13 +308,21 @@ mod platform {
     /// Entries of the directory `path`: from `getattrlistbulk` on macOS when
     /// the volume supports it, else [`super::read_entries_std`].
     /// With `clones`, also APFS clone identity (macOS); without it, the same
-    /// request as a plain scan.
-    pub fn read_entries(path: &Path, cancel: &AtomicBool, out: &mut Vec<Entry>, clones: bool) -> io::Result<ReadStats> {
+    /// request as a plain scan. `private` (with `clones`) also asks for
+    /// [`ReadStats::private`] (bulk reads only).
+    pub fn read_entries(
+        path: &Path,
+        cancel: &AtomicBool,
+        out: &mut Vec<Entry>,
+        clones: bool,
+        private: bool,
+    ) -> io::Result<ReadStats> {
         #[cfg(target_os = "macos")]
-        if let Some(r) = bulk::read_entries(path, cancel, out, clones) {
+        if let Some(r) = bulk::read_entries(path, cancel, out, clones, private) {
             return r;
         }
         let first = out.len();
+        let _ = private;
         let mut r = super::read_entries_std(path, cancel, out);
         // On macOS any volume may share blocks (APFS clones, server-side
         // copies); without bulk flags a file's clone state is unknown.
@@ -439,11 +485,13 @@ mod platform {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::AtomicBool;
 
+    /// No clone identity or private sizes here.
     pub fn read_entries(
         path: &Path,
         cancel: &AtomicBool,
         out: &mut Vec<Entry>,
         _clones: bool,
+        _private: bool,
     ) -> io::Result<ReadStats> {
         super::read_entries_std(path, cancel, out)
     }
@@ -548,6 +596,14 @@ pub(crate) struct ReadStats {
     /// With --clones, files whose clone flags could not be read (another
     /// volume, a reader without them): those count as possibly shared.
     pub clone_gaps: u64,
+    /// Private sizes were requested and the volume returned the clone flags
+    /// that pick out partial clones (APFS).
+    pub private_sizes: bool,
+    /// The volume did not report the private size of a partial clone.
+    pub private_missing: bool,
+    /// `(raw name, bytes)`: APFS private sizes of the partial clones read
+    /// (`--private`; empty, so not allocated, otherwise).
+    pub private: Vec<(OsString, u64)>,
 }
 
 /// Reads `path` with `read_dir` + `lstat`, appending to `out`. Stops early
@@ -588,6 +644,8 @@ pub fn may_share_blocks(root: &Path, one_fs: bool) -> bool {
 
 struct Ctx<'a> {
     progress: &'a Progress,
+    /// The scanned root, for paths of private sizes.
+    root: &'a Path,
     root_dev: u64,
     one_fs: bool,
     /// Detect APFS clones (`--clones`).
@@ -635,6 +693,17 @@ fn display_name(n: OsString) -> (Box<str>, bool) {
         Ok(s) => (s.into(), false),
         Err(n) => (platform::lossy_name(&n).into(), true),
     }
+}
+
+/// Add the private sizes read in the directory `path` to the scan's, by
+/// path relative to the root with the names the tree uses.
+fn record_private(path: &Path, found: Vec<(OsString, u64)>, ctx: &Ctx) {
+    let mut rel = PathBuf::new();
+    for c in path.strip_prefix(ctx.root).unwrap_or(Path::new("")) {
+        rel.push(&*display_name(c.to_os_string()).0);
+    }
+    let found = found.into_iter().map(|(n, b)| (rel.join(&*display_name(n).0), b));
+    ctx.progress.found.lock().unwrap().extend(found);
 }
 
 fn file_name_of(p: &Path) -> String {
@@ -717,6 +786,7 @@ fn scan_root(
     let meta = fs::metadata(root)?;
     let ctx = Ctx {
         progress,
+        root,
         root_dev: root_dev.unwrap_or_else(|| platform::device(&meta)),
         one_fs,
         clones,
@@ -770,7 +840,14 @@ fn scan_dir(
     // A cancelled scan stops descending; its partial result is discarded.
     let stats = match ctx.progress.cancel.load(Ordering::Relaxed) {
         true => ReadStats::default(),
-        false => platform::read_entries(path, &ctx.progress.cancel, &mut entries, ctx.clones).unwrap_or(ReadStats {
+        false => platform::read_entries(
+            path,
+            &ctx.progress.cancel,
+            &mut entries,
+            ctx.clones,
+            ctx.progress.private,
+        )
+        .unwrap_or(ReadStats {
             errors: 1,
             ..ReadStats::default()
         }),
@@ -781,6 +858,17 @@ fn scan_dir(
     let mut clone_gaps = stats.clone_gaps;
     if clone_gaps > 0 {
         ctx.progress.clone_gaps.store(true, Ordering::Relaxed);
+    }
+    if stats.private_sizes {
+        ctx.progress.private_sizes.store(true, Ordering::Relaxed);
+    }
+    // A file whose clone flags could not be read may be a partial clone
+    // whose private size is then unknown.
+    if stats.private_missing || (ctx.progress.private && stats.clone_gaps > 0) {
+        ctx.progress.private_missing.store(true, Ordering::Relaxed);
+    }
+    if !stats.private.is_empty() {
+        record_private(path, stats.private, ctx);
     }
     let mut errors = stats.errors;
     if errors > 0 {
@@ -1100,7 +1188,7 @@ mod bulk_tests {
             let (mut a, mut b) = (Vec::new(), Vec::new());
             assert_eq!(read_entries_std(&dir, &cancel, &mut a).unwrap().errors, 0);
             assert_eq!(
-                platform::bulk::read_entries(&dir, &cancel, &mut b, true)
+                platform::bulk::read_entries(&dir, &cancel, &mut b, true, true)
                     .unwrap()
                     .unwrap()
                     .errors,
@@ -1122,7 +1210,7 @@ mod bulk_tests {
         let d = tree("off");
         let cancel = AtomicBool::new(false);
         let mut v = Vec::new();
-        let stats = platform::bulk::read_entries(&d, &cancel, &mut v, false)
+        let stats = platform::bulk::read_entries(&d, &cancel, &mut v, false, false)
             .unwrap()
             .unwrap();
         assert!(!stats.clone_ids);
@@ -1250,10 +1338,193 @@ mod bulk_tests {
         fs::remove_dir_all(&d).unwrap();
     }
 
+    /// `--private`: a clone with 1 MiB overwritten holds 1 MiB alone. New
+    /// files in a temp dir are younger than any local snapshot, which would
+    /// otherwise hold their blocks (and make the private size 0).
+    #[test]
+    fn private_size_of_partial_clone() {
+        use std::io::{Seek, Write};
+        let since = test_support::stamp();
+        let d = std::env::temp_dir().join(format!("dutype-bulk-private-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(d.join("sub")).unwrap();
+        fs::write(d.join("a"), vec![7u8; 8 << 20]).unwrap();
+        fs::write(d.join("plain"), vec![1u8; 1 << 20]).unwrap();
+        for c in ["full", "partial", "linked", "sub/deep"] {
+            let ok = Command::new("cp").arg("-c").arg(d.join("a")).arg(d.join(c)).status();
+            assert!(ok.unwrap().success());
+        }
+        for c in ["partial", "linked", "sub/deep"] {
+            let mut f = fs::OpenOptions::new().write(true).open(d.join(c)).unwrap();
+            f.seek(std::io::SeekFrom::Start(2 << 20)).unwrap();
+            f.write_all(&vec![9u8; 1 << 20]).unwrap();
+            f.sync_all().unwrap();
+        }
+        // A hard-linked partial clone frees nothing while the other link stays.
+        fs::hard_link(d.join("linked"), d.join("linked2")).unwrap();
+
+        let progress = Progress {
+            private: true,
+            ..Progress::default()
+        };
+        let mut node = scan_excluding(&d, true, true, &progress, None).unwrap();
+        assert!(progress.private_sizes.load(Ordering::Relaxed) && !progress.private_missing.load(Ordering::Relaxed));
+        let table = progress.take_private();
+        // Which files get a size does not depend on snapshots; the values
+        // do (see test_support). Keys are paths below the root.
+        let mut keys: Vec<_> = table.0.keys().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, [PathBuf::from("partial"), Path::new("sub").join("deep")]);
+        let size = table.get(Path::new("partial"));
+        test_support::assert_private(size, 1 << 20, &since);
+        test_support::assert_private(table.get(&Path::new("sub").join("deep")), 1 << 20, &since);
+        // Sorting the tree does not touch it.
+        node.dir.as_mut().unwrap().sort_children(true);
+
+        // In the JSON: on those files only, omitted elsewhere.
+        let meta = crate::report::Meta {
+            elapsed: std::time::Duration::ZERO,
+            cached_at: None,
+            unreadable: 0,
+            clones: true,
+            clone_ids: true,
+            clone_gaps: false,
+            shares: true,
+            size_mode: crate::report::SizeMode::Du,
+            private: Some(&table),
+        };
+        let r = serde_json::to_value(crate::report::build(&node, &d, &meta, 20)).unwrap();
+        assert_eq!(r["accounting"]["private"], true);
+        for list in ["children", "largest_files"] {
+            for e in r[list].as_array().unwrap() {
+                let path = e["path"].as_str().unwrap();
+                let rel = Path::new(path).strip_prefix(&d).unwrap();
+                let want = table.get(rel);
+                assert_eq!(e.get("private_bytes").and_then(|v| v.as_u64()), want, "{list} {path}");
+            }
+        }
+        let other = crate::category::reg().other();
+        let found = crate::report::find(&node, &d, other, 20, meta.size_mode, true, meta.private);
+        let partial = found.iter().find(|e| e.path.ends_with("/partial")).unwrap();
+        assert_eq!(partial.private_bytes, size);
+        let plain_meta = crate::report::Meta { private: None, ..meta };
+        let r = serde_json::to_value(crate::report::build(&node, &d, &plain_meta, 20)).unwrap();
+        assert_eq!(r["accounting"]["private"], false);
+        assert!(
+            r["largest_files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|e| e.get("private_bytes").is_none())
+        );
+
+        // A rescan of `sub` replaces only what is below it.
+        let mut merged = table.clone();
+        let mut fresh = PrivateSizes::default();
+        fresh.0.insert(PathBuf::from("new"), 7);
+        merged.replace_below(Path::new("sub"), fresh);
+        assert_eq!(merged.get(Path::new("partial")), size);
+        assert_eq!(merged.get(&Path::new("sub").join("deep")), None);
+        assert_eq!(merged.get(&Path::new("sub").join("new")), Some(7));
+
+        // Not requested: nothing read. Folder values never include it.
+        let progress = Progress::default();
+        let plain = scan_excluding(&d, true, true, &progress, None).unwrap();
+        assert!(!progress.private_sizes.load(Ordering::Relaxed));
+        assert!(progress.take_private().0.is_empty());
+        // Without clone flags partial clones cannot be told apart.
+        let progress = Progress {
+            private: true,
+            ..Progress::default()
+        };
+        scan_excluding(&d, true, false, &progress, None).unwrap();
+        assert!(!progress.private_sizes.load(Ordering::Relaxed));
+        assert!(progress.take_private().0.is_empty());
+        assert_eq!(
+            (node.size, node.dedup(), node.freeable()),
+            (plain.size, plain.dedup(), plain.freeable())
+        );
+        fs::remove_dir_all(&d).unwrap();
+    }
+
     #[test]
     fn missing_dir_is_an_error() {
         let mut v = Vec::new();
-        let r = platform::bulk::read_entries(Path::new("/nonexistent-dutype"), &AtomicBool::new(false), &mut v, true);
+        let r = platform::bulk::read_entries(
+            Path::new("/nonexistent-dutype"),
+            &AtomicBool::new(false),
+            &mut v,
+            true,
+            false,
+        );
         assert!(r.unwrap().is_err());
+    }
+}
+
+/// `--private` is accepted where private sizes do not exist: nothing is
+/// read and the scan says so.
+#[cfg(all(test, not(target_os = "macos")))]
+mod private_tests {
+    use super::*;
+
+    #[test]
+    fn private_is_a_no_op_elsewhere() {
+        let d = std::env::temp_dir().join(format!("dutype-private-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(d.join("sub")).unwrap();
+        fs::write(d.join("sub/f"), vec![1u8; 1 << 16]).unwrap();
+        let progress = Progress {
+            private: true,
+            ..Progress::default()
+        };
+        scan_excluding(&d, true, true, &progress, None).unwrap();
+        assert!(!progress.private_sizes.load(Ordering::Relaxed));
+        assert!(progress.take_private().0.is_empty());
+        fs::remove_dir_all(&d).unwrap();
+    }
+}
+
+/// Checks of APFS private sizes that tolerate a local snapshot taken during
+/// the test (it holds the file's blocks, so its private size becomes 0).
+#[cfg(all(test, unix))]
+pub(crate) mod test_support {
+    use std::process::Command;
+
+    /// Local time in `tmutil listlocalsnapshotdates` format, taken before
+    /// a test creates its files.
+    pub fn stamp() -> String {
+        let out = Command::new("date").arg("+%Y-%m-%d-%H%M%S").output().unwrap();
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    /// A local snapshot of the data volume was taken at or after `since`.
+    fn snapshot_since(since: &str) -> Option<String> {
+        ["/System/Volumes/Data", "/"].iter().find_map(|vol| {
+            let out = Command::new("tmutil")
+                .args(["listlocalsnapshotdates", vol])
+                .output()
+                .ok()?;
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .map(str::trim)
+                .filter(|l| l.len() == since.len() && l.as_bytes()[0].is_ascii_digit())
+                .find(|l| *l >= since)
+                .map(str::to_string)
+        })
+    }
+
+    /// `got` must be read; it must equal `want` unless a snapshot taken
+    /// since `since` explains a 0.
+    pub fn assert_private(got: Option<u64>, want: u64, since: &str) {
+        let got = got.expect("private size of a partial clone");
+        if got == want {
+            return;
+        }
+        match snapshot_since(since) {
+            Some(snap) if got == 0 => {
+                eprintln!("private size is 0: local snapshot {snap} taken during the test; not checking {want}")
+            }
+            _ => panic!("private size {got}, expected {want}"),
+        }
     }
 }

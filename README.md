@@ -120,6 +120,7 @@ dutype --json ~        # JSON report
 dutype --json --category node_modules ~   # every node_modules with its size
 dutype --cache ~       # reuse the last scan of ~ (instant), save new ones
 dutype --refresh ~     # rescan and update the cache
+dutype --json --private ~/.cache/uv   # macOS: also what deleting each partial clone frees
 ```
 
 With `--cache`, scans are saved in `~/.cache/dutype` (`$XDG_CACHE_HOME/dutype`,
@@ -168,6 +169,7 @@ Options:
       --refresh          Ignore a cached scan: scan again and update the cache (implies --cache)
       --clones           Detect APFS clones (macOS): count each clone family once (dedup sizes, the TUI's `c` key) and give a lower bound of what deleting each item frees. Makes scans slower
       --size-mode <MODE> Size to show and sort by: `du` (allocated, like `du -skx`) or `dedup` (each APFS clone family counted once; implies --clones) [default: du]
+      --private          Also read the APFS private size of partial clones (macOS only; implies --clones)
 ```
 
 </details>
@@ -310,10 +312,33 @@ it is `null` on macOS); children, special dirs, files and
 a file that may share blocks). `--size-mode dedup` ranks the lists by
 `dedup_bytes`.
 
+**Private sizes (`--private`, macOS/APFS)** — a file that was cloned and then
+changed (a *partial clone*) shares only some blocks with other files, so neither
+`size_bytes` nor the clone-family numbers say what deleting it frees. With
+`--private` (MCP: `private: true`; both imply `--clones`, whose flags pick out
+partial clones), every file that may share blocks (`EF_MAY_SHARE_BLOCKS`) but is
+not a full clone (`EF_SHARES_ALL_BLOCKS`), and has a single link, gets
+`private_bytes`: the bytes freed immediately if that file alone is deleted (APFS
+`ATTR_CMNEXT_PRIVATESIZE`). It appears on file entries (`largest_files`,
+`--category` items, file `children`) and in the TUI details pane; it is omitted
+on other files (and on one that vanished or could not be read meanwhile) and
+never summed into folder values. `accounting.private` is `true` when the scan
+read private sizes for every partial clone (macOS volumes that report APFS clone
+flags and private sizes); it is `false` if any file's clone flags or private
+size could not be read. APFS local snapshots (e.g. Time Machine) keep older
+blocks, so files older than the latest snapshot often report 0. Reading it costs
+one `getattrlistat` per partial clone: about +4% over `--clones` alone on
+Xcode's `Platforms` (108k files) and +16% on a uv cache (502k files, 18k partial
+clones); most of the cost over a plain scan is `--clones` itself. Elsewhere
+`--private` is accepted, `accounting.private` is `false` and no `private_bytes`
+are reported. A `--cache` snapshot made with `--private` keeps the values (and
+also serves runs without it); one made without it is not used for a `--private`
+run.
+
 **MCP server** — `dutype --mcp` exposes two read-only tools,
-`disk_usage(path, top?, cross_fs?, refresh?, clones?, size_mode?)` and
-`find_by_category(path, category, top?, cross_fs?, refresh?, clones?, size_mode?)`
-(`clones: true` or `size_mode: "dedup"` turns on clone detection).
+`disk_usage(path, top?, cross_fs?, refresh?, clones?, size_mode?, private?)` and
+`find_by_category(path, category, top?, cross_fs?, refresh?, clones?, size_mode?, private?)`
+(`clones: true`, `size_mode: "dedup"` or `private: true` turns on clone detection).
 They never write files.
 With `dutype --mcp --cache`, repeated calls on the same path reuse the scan from
 memory (or a snapshot the CLI saved in `~/.cache/dutype`) instead of walking the

@@ -2,7 +2,7 @@
 //! meant for scripts and LLM agents.
 
 use crate::category::{Category, by_size, dominant};
-use crate::scan::{Node, TopN};
+use crate::scan::{Node, PrivateSizes, TopN};
 use crate::ui::human;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -29,7 +29,7 @@ impl SizeMode {
 }
 
 /// Scan facts the report shows besides the tree.
-pub struct Meta {
+pub struct Meta<'a> {
     pub elapsed: Duration,
     pub cached_at: Option<SystemTime>,
     pub unreadable: u64,
@@ -42,6 +42,8 @@ pub struct Meta {
     /// Files may share blocks there ([`crate::scan::may_share_blocks`]).
     pub shares: bool,
     pub size_mode: SizeMode,
+    /// The scan read APFS private sizes (`--private` on macOS): these.
+    pub private: Option<&'a PrivateSizes>,
 }
 
 /// `n`'s freeable bytes, when known: always for a subtree without files
@@ -73,10 +75,32 @@ pub struct Accounting {
     /// detected, `freeable_min_bytes` is null where files may share blocks
     /// (macOS; btrfs, XFS, bcachefs, OCFS2, ZFS; Linux with `--cross-fs`).
     pub clone_detection: &'static str,
+    /// `private_bytes` were collected (`--private`, APFS): on files that may
+    /// share blocks but are not full clones, what deleting the file alone
+    /// frees right now. Never summed into folders.
+    pub private: bool,
     pub caveats: Vec<&'static str>,
 }
 
-fn accounting(meta: &Meta) -> Accounting {
+/// The `accounting` object for a tree scanned with these facts.
+pub fn accounting(meta: &Meta) -> Accounting {
+    let mut caveats = match (meta.clones, meta.clone_ids, meta.clone_gaps) {
+        (false, ..) => vec![
+            "clones-not-detected",
+            "hard-links-not-freeable",
+            "snapshots-not-considered",
+        ],
+        (true, true, false) => vec!["partial-clones-not-deduplicated", "snapshots-not-considered"],
+        (true, true, true) => vec![
+            "partial-clones-not-deduplicated",
+            "clone-flags-missing-for-some-files",
+            "snapshots-not-considered",
+        ],
+        (true, false, _) => vec!["snapshots-not-considered"],
+    };
+    if meta.private.is_some() {
+        caveats.push("private-bytes-affected-by-snapshots");
+    }
     Accounting {
         size: "du-allocated",
         size_mode: meta.size_mode,
@@ -86,20 +110,8 @@ fn accounting(meta: &Meta) -> Accounting {
             (true, true, true) => "apfs-partial",
             (true, false, _) => "unsupported",
         },
-        caveats: match (meta.clones, meta.clone_ids, meta.clone_gaps) {
-            (false, ..) => vec![
-                "clones-not-detected",
-                "hard-links-not-freeable",
-                "snapshots-not-considered",
-            ],
-            (true, true, false) => vec!["partial-clones-not-deduplicated", "snapshots-not-considered"],
-            (true, true, true) => vec![
-                "partial-clones-not-deduplicated",
-                "clone-flags-missing-for-some-files",
-                "snapshots-not-considered",
-            ],
-            (true, false, _) => vec!["snapshots-not-considered"],
-        },
+        private: meta.private.is_some(),
+        caveats,
     }
 }
 
@@ -159,6 +171,11 @@ pub struct Child {
     pub freeable_min_bytes: Option<u64>,
     /// It is, or holds, a file that may share blocks with others (APFS clones).
     pub clone: bool,
+    /// Files with `--private`: APFS bytes freed immediately if this file
+    /// alone is deleted (affected by APFS snapshots). Only on files that may
+    /// share blocks but are not full clones (absent if it could not be read).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub private_bytes: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -170,6 +187,9 @@ pub struct Entry {
     pub dedup_bytes: u64,
     pub freeable_min_bytes: Option<u64>,
     pub clone: bool,
+    /// See [`Child::private_bytes`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub private_bytes: Option<u64>,
 }
 
 fn round1(x: f64) -> f64 {
@@ -190,7 +210,7 @@ fn shares(cats: &[u64], total: u64, limit: usize) -> Vec<CategoryShare> {
 }
 
 /// A node of a list, with its deduplicated size (which for a file depends
-/// on its parent).
+/// on its parent) and private size.
 struct Item {
     rank: u64,
     rel: PathBuf,
@@ -199,10 +219,11 @@ struct Item {
     dedup: u64,
     freeable: Option<u64>,
     clone: bool,
+    private: Option<u64>,
 }
 
 impl Item {
-    fn of(n: &Node, dedup: u64, rel: &Path, mode: SizeMode, known: bool) -> Item {
+    fn of(n: &Node, dedup: u64, private: Option<u64>, rel: &Path, mode: SizeMode, known: bool) -> Item {
         Item {
             rank: mode.pick(n.size, dedup),
             rel: rel.to_path_buf(),
@@ -211,6 +232,7 @@ impl Item {
             dedup,
             freeable: freeable_of(n, known),
             clone: n.clone,
+            private,
         }
     }
 
@@ -223,6 +245,7 @@ impl Item {
             dedup_bytes: self.dedup,
             freeable_min_bytes: self.freeable,
             clone: self.clone,
+            private_bytes: self.private,
         }
     }
 }
@@ -256,6 +279,11 @@ fn walk(node: &Node, rel: &mut PathBuf, f: &mut impl FnMut(&Node, u64, &Path) ->
         }
         rel.pop();
     }
+}
+
+/// Private size of the file `n` at `rel`, if the scan read one.
+fn private_of(private: Option<&PrivateSizes>, n: &Node, rel: &Path) -> Option<u64> {
+    private.filter(|_| !n.is_dir())?.get(rel)
 }
 
 /// Unix seconds, for the `cached_at` output field.
@@ -292,7 +320,7 @@ pub fn build(root: &Node, root_path: &Path, meta: &Meta, top: usize) -> Report {
         };
         let rank = mode.pick(n.size, dedup);
         if list.accepts(|min: &Item| rank > min.rank) {
-            list.push(Item::of(n, dedup, p, mode, known));
+            list.push(Item::of(n, dedup, private_of(meta.private, n, p), p, mode, known));
         }
         // Nested special dirs only occur inside weak ones (huggingface/ inside
         // .cache/); both are reported.
@@ -333,6 +361,7 @@ pub fn build(root: &Node, root_path: &Path, meta: &Meta, top: usize) -> Report {
                     dedup_bytes: dedup,
                     freeable_min_bytes: freeable_of(c, known),
                     clone: c.clone,
+                    private_bytes: private_of(meta.private, c, Path::new(&*c.name)),
                 }
             })
             .collect(),
@@ -396,18 +425,38 @@ pub fn to_text(r: &Report, root: &Node) -> String {
             let _ = writeln!(out, "  {:>10}  {:<14} {}", size, e.category, e.path);
         }
     }
-    let _ = writeln!(out, "\nLargest files:");
+    let _ = writeln!(
+        out,
+        "\nLargest files{}:",
+        if r.accounting.private {
+            " (private: freed now if deleted alone)"
+        } else {
+            ""
+        }
+    );
     for e in &r.largest_files {
         let size = shown(e.size_bytes, e.dedup_bytes);
-        let _ = writeln!(out, "  {:>10}  {:<14} {}", size, e.category, e.path);
+        let private = e
+            .private_bytes
+            .map_or(String::new(), |p| format!("  (private {})", human(p)));
+        let _ = writeln!(out, "  {:>10}  {:<14} {}{}", size, e.category, e.path, private);
     }
     out
 }
 
 /// Largest items of one category below `root`: the matching special dirs for
 /// directory categories (e.g. every node_modules), files otherwise.
-/// `known`: freeable bytes can be given (see [`freeable_known`]).
-pub fn find(root: &Node, root_path: &Path, cat: Category, top: usize, mode: SizeMode, known: bool) -> Vec<Entry> {
+/// `known`: freeable bytes can be given (see [`freeable_known`]);
+/// `private`: the scan's private sizes, if it read them.
+pub fn find(
+    root: &Node,
+    root_path: &Path,
+    cat: Category,
+    top: usize,
+    mode: SizeMode,
+    known: bool,
+    private: Option<&PrivateSizes>,
+) -> Vec<Entry> {
     let mut list = TopN::new(top);
     let want_dirs = cat.is_dir_kind();
     walk(root, &mut PathBuf::new(), &mut |n, dedup, p| {
@@ -418,7 +467,7 @@ pub fn find(root: &Node, root_path: &Path, cat: Category, top: usize, mode: Size
         };
         let rank = mode.pick(n.size, dedup);
         if hit && list.accepts(|min: &Item| rank > min.rank) {
-            list.push(Item::of(n, dedup, p, mode, known));
+            list.push(Item::of(n, dedup, private_of(private, n, p), p, mode, known));
         }
         !(hit && want_dirs)
     });
@@ -442,7 +491,10 @@ pub fn find_to_text(cat: Category, items: &[Entry], mode: SizeMode) -> String {
         }
     );
     for e in items {
-        let _ = writeln!(out, "  {:>10}  {}", human(size(e)), e.path);
+        let private = e
+            .private_bytes
+            .map_or(String::new(), |p| format!("  (private {})", human(p)));
+        let _ = writeln!(out, "  {:>10}  {}{}", human(size(e)), e.path, private);
     }
     out
 }
@@ -465,6 +517,7 @@ mod tests {
                 clone_gaps,
                 shares: true,
                 size_mode: SizeMode::Du,
+                private: None,
             };
             accounting(&meta).clone_detection
         };
@@ -484,6 +537,7 @@ mod tests {
             dedup_bytes: dedup,
             freeable_min_bytes: None,
             clone: dedup < size,
+            private_bytes: None,
         };
         let items = [item("/a", 3 << 20, 3 << 20), item("/b", 2 << 20, 0)];
         let du = find_to_text(reg().other(), &items, SizeMode::Du);

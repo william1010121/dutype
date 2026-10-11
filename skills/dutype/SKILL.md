@@ -44,7 +44,7 @@ If `dutype` is not installed, run it through npx with the same arguments:
   `dedup_bytes`, `freeable_min_bytes` and `clone` (the item is, or holds, a
   file that may share blocks with others)
 
-`--category` returns `{path, category, items: [{path, size_bytes, size, ...}]}`.
+`--category` returns `{path, category, accounting, items: [{path, size_bytes, size, ...}]}`.
 
 ## Shared blocks (APFS clones, hard links)
 
@@ -80,6 +80,13 @@ on disk, but its files are clones of your uv cache: deleting it frees at least
 1 GB"), and suggest cleaning the shared source (e.g. `uv cache clean`) if the
 user wants the space back.
 
+On macOS, `--private` (implies `--clones`) adds `private_bytes` to files that
+are partial APFS clones: what deleting that one file frees right now
+(`accounting.private` is `true` when collected). Use it before promising space
+from deleting cloned files (uv / bun caches, `cp -c` copies). Files older than
+an APFS local snapshot report 0 until the snapshot expires. Never add these up
+per folder.
+
 ## Workflow for "my disk is full"
 
 1. `dutype --json --top 15 ~` (or the path the user names) and summarize the
@@ -95,8 +102,9 @@ user wants the space back.
 ## MCP
 
 `dutype --mcp` is an MCP server on stdio with two read-only tools,
-`disk_usage(path, top?, cross_fs?, refresh?, clones?, size_mode?)` and
-`find_by_category(path, category, top?, cross_fs?, refresh?, clones?, size_mode?)`,
+`disk_usage(path, top?, cross_fs?, refresh?, clones?, size_mode?, private?)` and
+`find_by_category(path, category, top?, cross_fs?, refresh?, clones?, size_mode?, private?)`,
 with the same fields as `--json`. `size_mode` is `"du"` (default) or `"dedup"`
-(implies `clones: true`).
+(implies `clones: true`); `private: true` adds `private_bytes` (implies
+`clones: true`).
 Claude Code: `claude mcp add dutype -- npx -y dutype --mcp`.
