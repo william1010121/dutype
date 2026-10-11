@@ -1,6 +1,6 @@
 [package]
 name = "dutype"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 rust-version = "1.88"
 description = "Disk usage by kind: a fast parallel TUI that shows how much of a folder is video, PDFs, node_modules, Python envs, caches, ML models, ..."
