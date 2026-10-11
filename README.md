@@ -138,6 +138,7 @@ you and is set to mode 0700, snapshots to 0600. `--json` reports `cached_at`
 | `←` `Backspace` | go up |
 | `Tab` | switch between the folder list and the breakdown |
 | `m` | categories ⇄ extensions |
+| `c` | sizes: allocated (like `du`) ⇄ deduplicated (APFS clones counted once) |
 | `o` | reveal in Finder / Explorer / file manager |
 | `y` | copy the selected path to the clipboard (OSC 52 over SSH) |
 | `r` | rescan the current folder only (fast; updates the `--cache`) |
@@ -165,9 +166,50 @@ Options:
       --mcp              Run as an MCP server on stdio, for LLM agents
       --cache            Reuse the last scan of this path if there is one, and save new scans (in ~/.cache/dutype, or $DUTYPE_CACHE_DIR)
       --refresh          Ignore a cached scan: scan again and update the cache (implies --cache)
+      --size-mode <MODE> Size to show and sort by: `du` (allocated, like `du -skx`) or `dedup` (each APFS clone family counted once). `c` toggles it in the TUI [default: du]
 ```
 
 </details>
+
+### APFS clones
+
+On APFS (macOS), `cp -c`, Finder's Duplicate, uv, bun and pnpm make *clones*:
+files with their own inode that share their blocks with another file. `du`,
+and dutype's main number, count every clone in full, so a `.venv` or
+`node_modules` cloned from a package cache can look huge while deleting it
+frees almost nothing. dutype detects identical clones while it scans and adds
+two numbers next to the `du` size:
+
+- **dedup**: the size with each clone family counted once (on one member,
+  picked by a stable rule: the shortest path, then the alphabetically first).
+  It adds up like `du` sizes. Press `c` (or pass `--size-mode dedup`) to show
+  and sort by it; the header then says `clones: −X shared` and rows holding
+  clones counted elsewhere get a `⧉`.
+- **freeable** (`frees ≥` in the details panel): a lower bound of what
+  deleting a folder would free right now: files that share no blocks, plus
+  clone families and hard links whose every member is inside the folder.
+  It does not add up across folders.
+
+For example, a 21.5 GB `~/.cache/uv` holds 16.8 GB once clones are counted
+once, and deleting all of it frees at least 9.4 GB (the rest is shared with
+virtualenvs elsewhere).
+
+Known limitations:
+
+- Only full clones are deduplicated. A clone that was modified afterwards
+  (a partial clone) is counted in full and never counted as freeable.
+- APFS local snapshots (Time Machine) are not considered: space they still
+  reference is freed only once they expire.
+- Dedup and freeable values are relative to the scanned tree: clone family
+  members outside it make a family non-freeable.
+- A family's size is read on macOS 14 and later only; on older systems and on
+  sealed system volumes, families are deduplicated but never freeable.
+- `EF_MAY_SHARE_BLOCKS` (once cloned, maybe still sharing) is sticky and only a
+  hint, so freeable can be lower than what deleting really frees.
+- With `--cache`, clone families are as they were at scan time: changes
+  outside a rescanned folder are not seen until a full rescan (`R`).
+- Other filesystems (btrfs/XFS reflinks, ZFS block cloning) report
+  `clone_detection: "unsupported"`; dedup then equals the `du` size.
 
 ## Categories
 
@@ -220,17 +262,31 @@ candidates) and the biggest files, with absolute paths and byte sizes:
 {
   "path": "/home/me",
   "size_bytes": 190982119424,
+  "dedup_bytes": 186126925824,
+  "clone_shared_bytes": 4855193600,
+  "freeable_min_bytes": 171798691840,
+  "accounting": { "size": "du-allocated", "size_mode": "du", "clone_detection": "apfs-full",
+                  "caveats": ["partial-clones-not-deduplicated", "snapshots-not-considered"] },
   "files": 666884,
   "categories": [{ "name": "Data", "size_bytes": 87828418560, "size": "81.8 GiB", "percent": 46.0 }, …],
-  "children": [{ "name": "dataset", "type": "dir", "percent": 27.6, "top_categories": […] }, …],
+  "children": [{ "name": "dataset", "type": "dir", "percent": 27.6, "top_categories": […],
+                 "dedup_bytes": 52707115008, "freeable_min_bytes": 52707115008, "clone": false }, …],
   "special_dirs": [{ "path": "/home/me/proj/.venv", "category": "Python env", "size": "7.8 GiB" }, …],
   "largest_files": [{ "path": "/home/me/ckpt/last.safetensors", "category": "ML model", "size": "12.0 GiB" }, …]
 }
 ```
 
+`size_bytes` is always the `du` size. `dedup_bytes` counts each APFS clone
+family once and `freeable_min_bytes` is a lower bound of what deleting the item
+frees (see [APFS clones](#apfs-clones)); children, special dirs, files and
+`--category` items carry the same fields plus `clone` (the item is, or holds,
+a file that may share blocks). `--size-mode dedup` ranks the lists by
+`dedup_bytes`.
+
 **MCP server** — `dutype --mcp` exposes two read-only tools,
-`disk_usage(path, top?, cross_fs?, refresh?)` and
-`find_by_category(path, category, top?, refresh?)`. They never write files.
+`disk_usage(path, top?, cross_fs?, refresh?, size_mode?)` and
+`find_by_category(path, category, top?, cross_fs?, refresh?, size_mode?)`.
+They never write files.
 With `dutype --mcp --cache`, repeated calls on the same path reuse the scan from
 memory (or a snapshot the CLI saved in `~/.cache/dutype`) instead of walking the
 disk again (`refresh: true` forces a rescan):

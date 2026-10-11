@@ -1,4 +1,5 @@
 use crate::category::{self, Category, by_size, reg};
+use crate::report::SizeMode;
 use crate::scan::{Node, TopN, walk, walk_with_ancestors};
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::widgets::TableState;
@@ -111,6 +112,10 @@ pub struct App {
     pub show_keys: bool,
     /// Device of the scan root when the tree was built (None: unknown).
     pub root_dev: Option<u64>,
+    /// The scan could see APFS clone families.
+    pub clone_ids: bool,
+    /// Size shown and sorted by (`c` toggles).
+    pub size_mode: SizeMode,
     pub last_key: Option<(String, &'static str)>,
 }
 
@@ -150,6 +155,8 @@ impl App {
             status: None,
             show_keys: false,
             root_dev: None,
+            clone_ids: false,
+            size_mode: SizeMode::Du,
             last_key: None,
         };
         app.refresh_breakdown();
@@ -256,17 +263,7 @@ impl App {
     /// Replace the current folder with a fresh scan of it, update every
     /// ancestor's totals and order, and keep the cursor on the same entries.
     pub fn replace_current(&mut self, mut fresh: Node) {
-        let location = self.location();
-        // Selected entry name at every level, to restore after re-sorting.
-        let selected: Vec<Option<Step>> = (0..=self.stack.len())
-            .map(|k| {
-                let node = node_at(&self.root, &self.stack[..k]);
-                self.states[k]
-                    .selected()
-                    .and_then(|i| node.children().get(i))
-                    .map(Step::of)
-            })
-            .collect();
+        let place = self.remember();
 
         let target = node_at_mut(&mut self.root, &self.stack);
         fresh.name = target.name.clone();
@@ -275,6 +272,8 @@ impl App {
         let size_delta = new.size as i128 - old.size as i128;
         let files_delta = new.files() as i128 - old.files() as i128;
         let errors_delta = new.errors() as i128 - old.errors() as i128;
+        let free_delta =
+            new.dir.as_ref().map_or(0, |d| d.free_base) as i128 - old.dir.as_ref().map_or(0, |d| d.free_base) as i128;
         let cats_delta: Vec<i128> = new
             .cats()
             .iter()
@@ -288,16 +287,47 @@ impl App {
             if let Some(dir) = node.dir.as_mut() {
                 shift(&mut dir.files, files_delta);
                 shift(&mut dir.errors, errors_delta);
+                shift(&mut dir.free_base, free_delta);
                 dir.cats.iter_mut().zip(&cats_delta).for_each(|(c, d)| shift(c, *d));
-                dir.children
-                    .sort_unstable_by(|a, b| b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name)));
+                // Clones may have appeared or gone below.
+                node.clone = dir.children.iter().any(|c| c.clone);
+            }
+        }
+        // Clone families may span the old and new subtree and the rest.
+        crate::account::account(&mut self.root, Some(&self.root_path));
+        let by_dedup = self.size_mode == SizeMode::Dedup;
+        if by_dedup {
+            sort_tree(&mut self.root, true);
+        } else {
+            for k in (0..self.stack.len()).rev() {
+                if let Some(dir) = node_at_mut(&mut self.root, &self.stack[..k]).dir.as_mut() {
+                    dir.sort_children(false);
+                }
             }
         }
         // The subtree's old errors were replaced, not added to.
         self.errors = self.root.errors();
         // Free the old subtree off the UI thread; it can be large.
         std::thread::spawn(move || drop(old));
+        self.restore(place);
+    }
 
+    /// The location and the selected entry at every level, by name.
+    fn remember(&self) -> (Vec<Step>, Vec<Option<Step>>) {
+        let selected = (0..=self.stack.len())
+            .map(|k| {
+                let node = node_at(&self.root, &self.stack[..k]);
+                self.states[k]
+                    .selected()
+                    .and_then(|i| node.children().get(i))
+                    .map(Step::of)
+            })
+            .collect();
+        (self.location(), selected)
+    }
+
+    /// Back to a [`Self::remember`]ed place after the tree was re-sorted.
+    fn restore(&mut self, (location, selected): (Vec<Step>, Vec<Option<Step>>)) {
         self.stack.clear();
         self.states = vec![first_selected(self.root.children().len())];
         self.go_to(&location);
@@ -310,6 +340,47 @@ impl App {
         }
         self.popup = None;
         self.refresh_breakdown();
+    }
+
+    /// Show and sort by `mode`, keeping the cursor on the same entries.
+    pub fn set_size_mode(&mut self, mode: SizeMode) {
+        if mode == self.size_mode {
+            return;
+        }
+        let place = self.remember();
+        self.size_mode = mode;
+        sort_tree(&mut self.root, mode == SizeMode::Dedup);
+        self.restore(place);
+    }
+
+    /// Run `f` on the tree in du order, the order scans give and caches
+    /// store, and go back to the current order afterwards.
+    pub fn in_du_order<T>(&mut self, f: impl FnOnce(&mut Node) -> T) -> T {
+        if self.size_mode == SizeMode::Du {
+            return f(&mut self.root);
+        }
+        let place = self.remember();
+        sort_tree(&mut self.root, false);
+        let out = f(&mut self.root);
+        sort_tree(&mut self.root, true);
+        self.restore(place);
+        out
+    }
+
+    /// Size of child `i` of the current folder in the current mode.
+    pub fn shown_size(&self, dir: &Node, i: usize) -> u64 {
+        match (self.size_mode, &dir.dir) {
+            (SizeMode::Dedup, Some(d)) => d.child_dedup(i),
+            _ => dir.children()[i].size,
+        }
+    }
+
+    /// Size of a folder itself in the current mode.
+    pub fn shown_total(&self, n: &Node) -> u64 {
+        match self.size_mode {
+            SizeMode::Du => n.size,
+            SizeMode::Dedup => n.dedup(),
+        }
     }
 
     fn selected_entry(&self) -> Option<usize> {
@@ -364,6 +435,17 @@ impl App {
                     Focus::Entries => Focus::Breakdown,
                     Focus::Breakdown => Focus::Entries,
                 }
+            }
+            KeyCode::Char('c') => {
+                self.set_size_mode(match self.size_mode {
+                    SizeMode::Du => SizeMode::Dedup,
+                    SizeMode::Dedup => SizeMode::Du,
+                });
+                self.status = Some(match (self.size_mode, self.clone_ids) {
+                    (SizeMode::Dedup, true) => "sizes: APFS clones counted once".into(),
+                    (SizeMode::Dedup, false) => "sizes: clones counted once (none detectable here)".into(),
+                    (SizeMode::Du, _) => "sizes: allocated, like du".into(),
+                });
             }
             KeyCode::Char('m') => {
                 self.mode = match self.mode {
@@ -437,6 +519,7 @@ impl App {
             KeyCode::Esc => ("Esc".to_string(), if popup { "close" } else { "quit" }),
             KeyCode::Tab | KeyCode::BackTab => ("⇥ Tab".to_string(), "switch pane"),
             KeyCode::Char('m') => ("m".to_string(), "category / extension"),
+            KeyCode::Char('c') => ("c".to_string(), "du / dedup size"),
             KeyCode::Char('o') => ("o".to_string(), "reveal"),
             KeyCode::Char('y') => ("y".to_string(), "copy path"),
             KeyCode::Char('r') if !popup => ("r".to_string(), "rescan folder"),
@@ -550,6 +633,19 @@ impl App {
         let items: Vec<_> = top.into_sorted().into_iter().map(|(s, p, fs)| (p, s, fs)).collect();
         let state = first_selected(items.len());
         self.popup = Some(Popup { title, items, state });
+    }
+}
+
+/// Re-sort the dirs whose order can depend on the size mode: those with
+/// clones below (elsewhere the deduplicated size equals the size).
+fn sort_tree(node: &mut Node, by_dedup: bool) {
+    let Some(d) = node.dir.as_mut() else { return };
+    if !node.clone {
+        return;
+    }
+    d.sort_children(by_dedup);
+    for c in d.children.iter_mut() {
+        sort_tree(c, by_dedup);
     }
 }
 
@@ -699,6 +795,12 @@ mod tests {
     fn same(a: &Node, b: &Node) {
         assert_eq!((&a.name, a.size, a.cat, a.special), (&b.name, b.size, b.cat, b.special));
         assert_eq!((a.files(), a.cats()), (b.files(), b.cats()), "{}", a.name);
+        assert_eq!(
+            (a.dedup(), a.freeable(), a.clone),
+            (b.dedup(), b.freeable(), b.clone),
+            "{}",
+            a.name
+        );
         let names = |n: &Node| n.children().iter().map(|c| c.name.clone()).collect::<Vec<_>>();
         assert_eq!(names(a), names(b), "order under {}", a.name);
         a.children().iter().zip(b.children()).for_each(|(x, y)| same(x, y));
@@ -969,6 +1071,76 @@ mod tests {
         std::os::unix::fs::symlink(root.join("elsewhere"), root.join("a")).unwrap();
         assert!(crate::scan::is_real_dir(&root.join("a/b"))); // the leaf alone looks fine
         assert_eq!(app.fs_path_checked(), None);
+    }
+
+    /// APFS clones: `r` keeps families that span the rescanned folder and
+    /// the rest of the tree, and `c` re-sorts by deduplicated size.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn clones_survive_rescan_and_sort_by_dedup() {
+        use std::process::Command;
+        let root = temp("clones");
+        fs::create_dir_all(root.join("copies")).unwrap();
+        fs::create_dir_all(root.join("plain")).unwrap();
+        fs::write(root.join("copies/a"), vec![1u8; 4 << 20]).unwrap();
+        for c in ["copies/b", "orig"] {
+            let ok = Command::new("cp")
+                .arg("-c")
+                .arg(root.join("copies/a"))
+                .arg(root.join(c))
+                .status()
+                .unwrap();
+            assert!(ok.success());
+        }
+        fs::write(root.join("plain/p"), vec![2u8; 6 << 20]).unwrap();
+        let mut app = App::new(full(&root), root.clone(), Duration::ZERO, 0);
+        let names = |app: &App| {
+            app.root
+                .children()
+                .iter()
+                .map(|c| c.name.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&app), ["copies", "plain", "orig"]);
+        // "orig" (shortest path) keeps the family's bytes.
+        assert_eq!(app.root.dedup(), 10 << 20);
+        assert_eq!(app.root.freeable(), 10 << 20);
+        assert_eq!(app.root.children()[0].dedup(), 0);
+        assert_eq!(app.root.children()[0].freeable(), 0);
+
+        app.set_size_mode(SizeMode::Dedup);
+        assert_eq!(names(&app), ["plain", "orig", "copies"]);
+        app.set_size_mode(SizeMode::Du);
+        assert_eq!(names(&app), ["copies", "plain", "orig"]);
+
+        // Caches are written in du order, even from dedup mode, and the
+        // cursor stays put.
+        app.set_size_mode(SizeMode::Dedup);
+        app.states[0].select(Some(2));
+        let inside = app.in_du_order(|root| root.children().iter().map(|c| c.name.to_string()).collect::<Vec<_>>());
+        assert_eq!(inside, ["copies", "plain", "orig"]);
+        assert_eq!(names(&app), ["plain", "orig", "copies"]);
+        assert_eq!(app.states[0].selected(), Some(2));
+        app.set_size_mode(SizeMode::Du);
+
+        // Rescan "copies" after a third clone appears there.
+        let ok = Command::new("cp")
+            .arg("-c")
+            .arg(root.join("copies/a"))
+            .arg(root.join("copies/c"))
+            .status()
+            .unwrap();
+        assert!(ok.success());
+        app.set_size_mode(SizeMode::Dedup);
+        app.go_to(&["copies".into()]);
+        let fresh = scan_subtree(&app.fs_path().unwrap(), true, &Progress::default(), None, None).unwrap();
+        app.replace_current(fresh);
+        assert_eq!(app.root.dedup(), 10 << 20);
+        assert_eq!(app.current().name.as_ref(), "copies");
+        assert_eq!(names(&app), ["plain", "orig", "copies"]);
+        app.set_size_mode(SizeMode::Du);
+        same(&app.root, &full(&root));
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

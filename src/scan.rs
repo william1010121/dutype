@@ -24,6 +24,10 @@ pub struct Node {
     /// The name on disk is not valid UTF-8; `name` is a lossy rendering
     /// (which may even collide with a sibling's real name).
     pub lossy: bool,
+    /// File: it may share blocks with another file (an APFS clone, now or
+    /// once), so deleting it alone may free less than its size. Dir: some
+    /// file below it may.
+    pub clone: bool,
     pub dir: Option<Box<DirInfo>>,
 }
 
@@ -35,6 +39,38 @@ pub struct DirInfo {
     /// its share of the total instead of adding to it.
     pub errors: u64,
     pub children: Vec<Node>,
+    /// "Freeable" bytes that need no shared-block bookkeeping: the dirs' own
+    /// blocks and files without hard links or clones, in this subtree.
+    pub free_base: u64,
+    /// Bytes of complete groups (every link and clone of them inside) whose
+    /// lowest common ancestor is in this subtree. Set by [`crate::account`].
+    pub group_free: u64,
+    /// Bytes of clones in this subtree whose family is already counted at
+    /// another member. Set by [`crate::account`].
+    pub dup: u64,
+    /// Files of this dir with hard links or clone siblings, by child index.
+    pub shared: Box<[Shared]>,
+}
+
+/// A file of a [`DirInfo`] that shares blocks with other files: hard links
+/// (same inode) or members of an APFS full-clone family (same clone id).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Shared {
+    /// Index of the file in `children`.
+    pub idx: u32,
+    /// The group: `(dev, clone id)` for a clone family, else `(dev, inode)`.
+    pub key: (u64, u64),
+    pub is_clone: bool,
+    pub ino: u64,
+    pub nlink: u64,
+    /// Inodes in the clone family on the whole volume, read by
+    /// [`crate::account`] once the family has two members in the tree: 0
+    /// while unknown, 1 when it cannot be read (the family is then never
+    /// complete). 1 for a plain hard link.
+    pub refcnt: u32,
+    /// Set by [`crate::account`]: the family is counted at another member,
+    /// so this file adds nothing to deduplicated sizes.
+    pub dup: bool,
 }
 
 impl Node {
@@ -55,6 +91,20 @@ impl Node {
         self.dir.as_ref().map_or(1, |d| d.files)
     }
 
+    /// Size with each APFS clone family counted once (additive).
+    pub fn dedup(&self) -> u64 {
+        self.dir.as_ref().map_or(self.size, |d| self.size.saturating_sub(d.dup))
+    }
+
+    /// Lower bound of the bytes deleting this would free (not additive).
+    pub fn freeable(&self) -> u64 {
+        match &self.dir {
+            Some(d) => d.free_base + d.group_free,
+            None if self.hardlink || self.clone => 0,
+            None => self.size,
+        }
+    }
+
     pub fn cats(&self) -> Box<[u64]> {
         match &self.dir {
             Some(d) => d.cats.clone(),
@@ -67,18 +117,83 @@ impl Node {
     }
 }
 
+impl DirInfo {
+    /// The [`Shared`] record of child `i`, if it has one.
+    pub fn shared_of(&self, i: usize) -> Option<&Shared> {
+        self.shared
+            .binary_search_by_key(&(i as u32), |s| s.idx)
+            .ok()
+            .map(|k| &self.shared[k])
+    }
+
+    /// Deduplicated size of child `i` (see [`Node::dedup`]).
+    pub fn child_dedup(&self, i: usize) -> u64 {
+        let c = &self.children[i];
+        match self.shared_of(i) {
+            Some(s) if s.dup => 0,
+            _ => c.dedup(),
+        }
+    }
+
+    /// Sort children biggest first by `key` (then by name), keeping
+    /// `shared` pointing at the same files.
+    pub fn sort_children(&mut self, by_dedup: bool) {
+        if self.shared.is_empty() && !by_dedup {
+            self.children
+                .sort_unstable_by(|a, b| b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name)));
+            return;
+        }
+        let n = self.children.len();
+        let keys: Vec<u64> = match by_dedup {
+            true => (0..n).map(|i| self.child_dedup(i)).collect(),
+            false => Vec::new(),
+        };
+        let key = |i: usize| keys.get(i).copied().unwrap_or(self.children[i].size);
+        let mut order: Vec<u32> = (0..n as u32).collect();
+        order.sort_unstable_by(|&a, &b| {
+            let (a, b) = (a as usize, b as usize);
+            key(b)
+                .cmp(&key(a))
+                .then_with(|| self.children[a].name.cmp(&self.children[b].name))
+        });
+        let mut new_pos = vec![0u32; n];
+        for (pos, &old) in order.iter().enumerate() {
+            new_pos[old as usize] = pos as u32;
+        }
+        for s in self.shared.iter_mut() {
+            s.idx = new_pos[s.idx as usize];
+        }
+        // Apply the permutation in place, one cycle at a time (position
+        // `pos` takes the child at `order[pos]`).
+        for start in 0..n {
+            let mut pos = start;
+            loop {
+                let src = std::mem::replace(&mut order[pos], pos as u32) as usize;
+                if src == start {
+                    break;
+                }
+                self.children.swap(pos, src);
+                pos = src;
+            }
+        }
+        self.shared.sort_unstable_by_key(|s| s.idx);
+    }
+}
+
 #[derive(Default)]
 pub struct Progress {
     pub files: AtomicU64,
     pub bytes: AtomicU64,
     pub errors: AtomicU64,
+    /// Some directory reported APFS clone flags.
+    pub clone_ids: AtomicBool,
     /// Set to stop a running scan early (the result is then incomplete).
     pub cancel: AtomicBool,
 }
 
 #[cfg(unix)]
 mod platform {
-    use super::Entry;
+    use super::{Entry, ReadStats};
     use std::ffi::OsStr;
     use std::fs::Metadata;
     use std::io;
@@ -92,12 +207,35 @@ mod platform {
 
     /// Entries of the directory `path`: from `getattrlistbulk` on macOS when
     /// the volume supports it, else [`super::read_entries_std`].
-    pub fn read_entries(path: &Path, cancel: &AtomicBool, out: &mut Vec<Entry>) -> io::Result<u64> {
+    pub fn read_entries(path: &Path, cancel: &AtomicBool, out: &mut Vec<Entry>) -> io::Result<ReadStats> {
         #[cfg(target_os = "macos")]
         if let Some(r) = bulk::read_entries(path, cancel, out) {
             return r;
         }
         super::read_entries_std(path, cancel, out)
+    }
+
+    /// Files in the APFS full-clone family of the file at `path`, where the
+    /// system can tell (macOS 14+).
+    pub fn clone_refcnt(path: &Path) -> Option<u32> {
+        #[cfg(target_os = "macos")]
+        return bulk::clone_refcnt(path);
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = path;
+            None
+        }
+    }
+
+    /// The file at `path` may share blocks with another (an APFS clone).
+    pub fn may_share(path: &Path) -> bool {
+        #[cfg(target_os = "macos")]
+        return bulk::may_share(path);
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = path;
+            false
+        }
     }
 
     pub fn allocated(m: &Metadata) -> u64 {
@@ -109,6 +247,10 @@ mod platform {
     /// Identity of a hard-linked file, if it has more than one link.
     pub fn hardlink_id(m: &Metadata) -> Option<(u64, u64)> {
         (m.nlink() > 1 && !m.is_dir()).then(|| (m.dev(), m.ino()))
+    }
+    /// `(inode, link count)`.
+    pub fn file_id(m: &Metadata) -> (u64, u64) {
+        (m.ino(), m.nlink())
     }
 
     /// Escaped rendering of a non-UTF-8 name, like `ls -b` (`\\xff` for bad
@@ -169,15 +311,23 @@ mod platform {
 
 #[cfg(not(unix))]
 mod platform {
-    use super::Entry;
+    use super::{Entry, ReadStats};
     use std::ffi::OsStr;
     use std::fs::{self, Metadata};
     use std::io;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::AtomicBool;
 
-    pub fn read_entries(path: &Path, cancel: &AtomicBool, out: &mut Vec<Entry>) -> io::Result<u64> {
+    pub fn read_entries(path: &Path, cancel: &AtomicBool, out: &mut Vec<Entry>) -> io::Result<ReadStats> {
         super::read_entries_std(path, cancel, out)
+    }
+
+    pub fn clone_refcnt(_: &Path) -> Option<u32> {
+        None
+    }
+
+    pub fn may_share(_: &Path) -> bool {
+        false
     }
 
     pub fn allocated(m: &Metadata) -> u64 {
@@ -188,6 +338,9 @@ mod platform {
     }
     pub fn hardlink_id(_: &Metadata) -> Option<(u64, u64)> {
         None
+    }
+    pub fn file_id(_: &Metadata) -> (u64, u64) {
+        (0, 1)
     }
 
     /// Lossy rendering of a non-UTF-8 (unpaired surrogate) name.
@@ -221,25 +374,50 @@ pub(crate) struct Entry {
     /// Allocated bytes (`st_blocks * 512` on unix).
     pub alloc: u64,
     pub dev: u64,
-    /// `(dev, ino)` of a non-directory with more than one link.
-    pub link: Option<(u64, u64)>,
+    pub ino: u64,
+    pub nlink: u64,
+    /// APFS full-clone family (clone id), when this file has identical
+    /// clones (`EF_SHARES_ALL_BLOCKS`).
+    pub clone: Option<u64>,
+    /// Some blocks may be shared with another file (APFS
+    /// `EF_MAY_SHARE_BLOCKS`; it stays set once a file was cloned).
+    pub may_share: bool,
 }
 
 impl Entry {
     fn from_metadata(name: OsString, m: &Metadata) -> Entry {
+        let (ino, nlink) = platform::file_id(m);
         Entry {
             name,
             dir: m.is_dir(),
+            // Only file links matter; keep dirs comparable across readers.
+            nlink: if m.is_dir() { 1 } else { nlink },
             alloc: platform::allocated(m),
             dev: platform::device(m),
-            link: platform::hardlink_id(m),
+            ino,
+            clone: None,
+            may_share: false,
         }
+    }
+
+    /// `(dev, ino)` of a non-directory with more than one link.
+    pub fn link(&self) -> Option<(u64, u64)> {
+        (!self.dir && self.nlink > 1).then_some((self.dev, self.ino))
     }
 }
 
-/// Reads `path` with `read_dir` + `lstat`, appending to `out`; returns how
-/// many entries could not be read. Stops early once `cancel` is set.
-fn read_entries_std(path: &Path, cancel: &AtomicBool, out: &mut Vec<Entry>) -> io::Result<u64> {
+/// What a directory read found besides its entries.
+#[derive(Default)]
+pub(crate) struct ReadStats {
+    /// Entries that could not be read.
+    pub errors: u64,
+    /// The filesystem reported clone flags (APFS).
+    pub clone_ids: bool,
+}
+
+/// Reads `path` with `read_dir` + `lstat`, appending to `out`. Stops early
+/// once `cancel` is set.
+fn read_entries_std(path: &Path, cancel: &AtomicBool, out: &mut Vec<Entry>) -> io::Result<ReadStats> {
     let mut errors = 0;
     for (i, e) in fs::read_dir(path)?.enumerate() {
         // Huge flat directories: notice a cancel without reading them all.
@@ -252,7 +430,16 @@ fn read_entries_std(path: &Path, cancel: &AtomicBool, out: &mut Vec<Entry>) -> i
             Err(_) => errors += 1,
         }
     }
-    Ok(errors)
+    Ok(ReadStats {
+        errors,
+        clone_ids: false,
+    })
+}
+
+/// Files in the APFS full-clone family of the file at `path`, where the
+/// system can tell (macOS 14+).
+pub fn clone_refcnt(path: &Path) -> Option<u32> {
+    platform::clone_refcnt(path)
 }
 
 struct Ctx<'a> {
@@ -382,6 +569,8 @@ fn scan_root(
             special: false,
             hardlink: platform::hardlink_id(&meta).is_some(),
             lossy: false,
+            // Keeps a cloned file from looking freeable.
+            clone: platform::may_share(root),
             dir: None,
         });
     }
@@ -389,6 +578,7 @@ fn scan_root(
     let own_size = platform::allocated(&meta);
     let mut node = scan_dir(root, file_name_of(root).into(), &parent, inherited, own_size, &ctx);
     node.name = name;
+    crate::account::account(&mut node, Some(root));
     Ok(node)
 }
 
@@ -403,10 +593,17 @@ fn scan_dir(
     let reg = reg();
     let mut entries: Vec<Entry> = Vec::new();
     // A cancelled scan stops descending; its partial result is discarded.
-    let mut errors = match ctx.progress.cancel.load(Ordering::Relaxed) {
-        true => 0,
-        false => platform::read_entries(path, &ctx.progress.cancel, &mut entries).unwrap_or(1),
+    let stats = match ctx.progress.cancel.load(Ordering::Relaxed) {
+        true => ReadStats::default(),
+        false => platform::read_entries(path, &ctx.progress.cancel, &mut entries).unwrap_or(ReadStats {
+            errors: 1,
+            clone_ids: false,
+        }),
     };
+    if stats.clone_ids {
+        ctx.progress.clone_ids.store(true, Ordering::Relaxed);
+    }
+    let mut errors = stats.errors;
     if errors > 0 {
         ctx.progress.errors.fetch_add(errors, Ordering::Relaxed);
     }
@@ -442,13 +639,34 @@ fn scan_dir(
 
     // Progress is updated once per directory to keep atomics off the hot path.
     let (file_entries, mut file_bytes) = (files.len() as u64, 0);
+    let mut shared = Vec::new();
+    let mut free_base = own_size;
     for (i, e) in files.into_iter().enumerate() {
         if i % 256 == 255 && ctx.progress.cancel.load(Ordering::Relaxed) {
             break;
         }
-        let hardlink = e.link.is_some();
-        let size = ctx.alloc_size(e.alloc, e.link);
+        let link = e.link();
+        let size = ctx.alloc_size(e.alloc, link);
         file_bytes += size;
+        if link.is_some() || e.clone.is_some() {
+            let (key, is_clone, refcnt) = match e.clone {
+                Some(id) => ((e.dev, id), true, 0),
+                None => ((e.dev, e.ino), false, 1),
+            };
+            shared.push(Shared {
+                idx: children.len() as u32,
+                key,
+                is_clone,
+                ino: e.ino,
+                nlink: e.nlink,
+                refcnt,
+                dup: false,
+            });
+        }
+        let clone = e.clone.is_some() || e.may_share;
+        if link.is_none() && !clone {
+            free_base += size;
+        }
         let (name, lossy) = display_name(e.name);
         let cat = effective.unwrap_or_else(|| reg.classify_file(&name));
         children.push(Node {
@@ -457,7 +675,8 @@ fn scan_dir(
             size,
             cat,
             special: false,
-            hardlink,
+            hardlink: link.is_some(),
+            clone,
             dir: None,
         });
     }
@@ -468,20 +687,32 @@ fn scan_dir(
     cats[effective.unwrap_or(reg.other()).index()] += own_size;
     let mut size = own_size;
     let mut file_count = 0;
-    let mut hardlink = false;
+    let (mut hardlink, mut clone) = (false, false);
     for c in &children {
         size += c.size;
         file_count += c.files();
         hardlink |= c.hardlink;
+        clone |= c.clone;
         match &c.dir {
             Some(d) => {
                 cats.iter_mut().zip(d.cats.iter()).for_each(|(a, b)| *a += b);
                 errors += d.errors;
+                free_base += d.free_base;
             }
             None => cats[c.cat.index()] += c.size,
         }
     }
-    children.sort_unstable_by(|a, b| b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name)));
+    let mut dir = DirInfo {
+        cats,
+        files: file_count,
+        errors,
+        children,
+        free_base,
+        group_free: 0,
+        dup: 0,
+        shared: shared.into_boxed_slice(),
+    };
+    dir.sort_children(false);
 
     Node {
         name,
@@ -490,12 +721,8 @@ fn scan_dir(
         special: own.is_some(),
         hardlink,
         lossy: false,
-        dir: Some(Box::new(DirInfo {
-            cats,
-            files: file_count,
-            errors,
-            children,
-        })),
+        clone,
+        dir: Some(Box::new(dir)),
     }
 }
 
@@ -622,8 +849,18 @@ mod bulk_tests {
         let cancel = AtomicBool::new(false);
         for dir in [d.clone(), d.join("sub"), d.join("sub/deeper")] {
             let (mut a, mut b) = (Vec::new(), Vec::new());
-            assert_eq!(read_entries_std(&dir, &cancel, &mut a).unwrap(), 0);
-            assert_eq!(platform::bulk::read_entries(&dir, &cancel, &mut b).unwrap().unwrap(), 0);
+            assert_eq!(read_entries_std(&dir, &cancel, &mut a).unwrap().errors, 0);
+            assert_eq!(
+                platform::bulk::read_entries(&dir, &cancel, &mut b)
+                    .unwrap()
+                    .unwrap()
+                    .errors,
+                0
+            );
+            // lstat knows nothing about clones.
+            for e in &mut b {
+                (e.clone, e.may_share) = (None, false);
+            }
             assert_eq!(sorted(a), sorted(b), "{}", dir.display());
         }
         fs::remove_dir_all(&d).unwrap();
@@ -641,6 +878,88 @@ mod bulk_tests {
             .parse()
             .unwrap();
         assert_eq!(node.size, kib * 1024);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// The issue #5 fixture: an 8 MiB file, three clones, 1 MiB of one of
+    /// them overwritten, and a hard link.
+    #[test]
+    fn clone_families_count_once() {
+        use std::io::{Seek, Write};
+        let d = std::env::temp_dir().join(format!("dutype-bulk-clones-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(d.join("sub")).unwrap();
+        fs::write(d.join("a"), vec![7u8; 8 << 20]).unwrap();
+        for c in ["c1", "c2", "c3"] {
+            assert!(
+                Command::new("cp")
+                    .arg("-c")
+                    .arg(d.join("a"))
+                    .arg(d.join(c))
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let mut f = fs::OpenOptions::new().write(true).open(d.join("c3")).unwrap();
+        f.seek(std::io::SeekFrom::Start(0)).unwrap();
+        f.write_all(&vec![9u8; 1 << 20]).unwrap();
+        f.sync_all().unwrap();
+        fs::hard_link(d.join("a"), d.join("sub/hl")).unwrap();
+
+        let progress = Progress::default();
+        let node = scan_excluding(&d, true, &progress, None).unwrap();
+        assert!(progress.clone_ids.load(Ordering::Relaxed), "APFS on macOS 14+ expected");
+        let out = Command::new("/usr/bin/du").arg("-skx").arg(&d).output().unwrap();
+        let kib: u64 = String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(node.size, kib * 1024);
+        assert_eq!(node.size, 32 << 20);
+        // a/c1/c2 (one family) once, c3 (a partial clone now) in full.
+        assert_eq!(node.dedup(), 16 << 20);
+        // The family, with both links of `a`, is all inside; c3 may share.
+        assert_eq!(node.freeable(), 8 << 20);
+        let sub = node.children().iter().find(|c| &*c.name == "sub").unwrap();
+        assert_eq!(sub.freeable(), 0);
+
+        // Parallel scans pick the same representative every time.
+        let dedups = |n: &Node| {
+            (0..n.children().len())
+                .map(|i| n.dir.as_ref().unwrap().child_dedup(i))
+                .collect::<Vec<_>>()
+        };
+        let first = dedups(&node);
+        for _ in 0..5 {
+            assert_eq!(
+                dedups(&scan_excluding(&d, true, &Progress::default(), None).unwrap()),
+                first
+            );
+        }
+        // A clone in `sub`, scanned alone: the rest of its family is
+        // outside, so it frees nothing for sure and has no copy to drop.
+        assert!(
+            Command::new("cp")
+                .arg("-c")
+                .arg(d.join("a"))
+                .arg(d.join("sub/c4"))
+                .status()
+                .unwrap()
+                .success()
+        );
+        let sub = scan_excluding(&d.join("sub"), true, &Progress::default(), None).unwrap();
+        assert_eq!((sub.size, sub.dedup(), sub.freeable()), (16 << 20, 8 << 20, 0));
+
+        // A single file as the root: a clone (full or partial) frees nothing
+        // for sure, a plain file all of it.
+        fs::write(d.join("plain"), vec![1u8; 1 << 20]).unwrap();
+        let file = |n: &str| scan_excluding(&d.join(n), true, &Progress::default(), None).unwrap();
+        assert_eq!(file("c1").freeable(), 0);
+        assert_eq!(file("c3").freeable(), 0);
+        assert_eq!(file("plain").freeable(), 1 << 20);
         fs::remove_dir_all(&d).unwrap();
     }
 

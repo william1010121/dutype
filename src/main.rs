@@ -1,3 +1,4 @@
+mod account;
 mod app;
 mod cache;
 mod category;
@@ -64,6 +65,15 @@ struct Args {
     /// Ignore a cached scan: scan again and update the cache (implies --cache)
     #[arg(long)]
     refresh: bool,
+    /// Size to show and sort by: `du` (allocated, like `du -skx`) or
+    /// `dedup` (each APFS clone family counted once). `c` toggles it in the TUI
+    ///
+    /// Only full clones are deduplicated (a clone modified since counts in
+    /// full); APFS snapshots are not considered; families are relative to the
+    /// scanned tree. --report / --json also give a lower bound of what
+    /// deleting each item frees (freeable_min_bytes).
+    #[arg(long, value_enum, default_value_t = report::SizeMode::Du, value_name = "MODE")]
+    size_mode: report::SizeMode,
 }
 
 fn main() -> ExitCode {
@@ -133,6 +143,7 @@ fn run(args: Args) -> Result<(), String> {
                     scan_time: started.elapsed(),
                     errors: progress.errors.load(Ordering::Relaxed),
                     root_dev,
+                    clone_ids: progress.clone_ids.load(Ordering::Relaxed),
                 };
                 if use_cache && let Err(e) = cache::save(&path, one_fs, &snap) {
                     eprintln!("dutype: cannot write cache: {e}");
@@ -142,7 +153,7 @@ fn run(args: Args) -> Result<(), String> {
         };
         let root = &snap.root;
         if let Some(cat) = only {
-            let items = report::find(root, &path, cat, args.top);
+            let items = report::find(root, &path, cat, args.top, args.size_mode);
             if args.json {
                 let doc = serde_json::json!({
                     "path": path.display().to_string(),
@@ -156,7 +167,18 @@ fn run(args: Args) -> Result<(), String> {
                 print(&report::find_to_text(cat, &items));
             }
         } else {
-            let r = report::build(root, &path, snap.scan_time, snap.cached_at, snap.errors, args.top);
+            let r = report::build(
+                root,
+                &path,
+                &report::Meta {
+                    elapsed: snap.scan_time,
+                    cached_at: snap.cached_at,
+                    unreadable: snap.errors,
+                    clone_ids: snap.clone_ids,
+                    size_mode: args.size_mode,
+                },
+                args.top,
+            );
             if args.json {
                 print(&serde_json::to_string_pretty(&r).map_err(|e| e.to_string())?);
                 print("\n");
@@ -176,6 +198,8 @@ fn run(args: Args) -> Result<(), String> {
         let mut location = Vec::new();
         // Status to show after a full rescan (e.g. why `r` became `R`).
         let mut carried_status: Option<String> = None;
+        // `c` survives a full rescan.
+        let mut size_mode = args.size_mode;
         loop {
             // The root's device when a fresh tree is scanned (measured before
             // the scan); a cached tree carries its own. `r` compares against it.
@@ -185,7 +209,7 @@ fn run(args: Args) -> Result<(), String> {
                 None => {
                     let p = path.clone();
                     let scanned = scan_with_progress(&mut terminal, &path, move |pr| scan::scan(&p, one_fs, pr))?;
-                    let Some((root, scan_time, errors)) = scanned else {
+                    let Some((root, scan_time, errors, clone_ids)) = scanned else {
                         return Ok(());
                     };
                     Snapshot {
@@ -194,6 +218,7 @@ fn run(args: Args) -> Result<(), String> {
                         scan_time,
                         errors,
                         root_dev,
+                        clone_ids,
                     }
                 }
             };
@@ -202,9 +227,12 @@ fn run(args: Args) -> Result<(), String> {
                 false => None,
             };
             let snap_root_dev = snap.root_dev;
+            let clone_ids = snap.clone_ids;
             let mut app = App::new(snap.root, path.clone(), snap.scan_time, snap.errors);
             app.cached_at = snap.cached_at;
             app.root_dev = snap_root_dev;
+            app.clone_ids = clone_ids;
+            app.set_size_mode(size_mode);
             app.show_keys = args.show_keys;
             app.go_to(&location);
             app.status = save_error
@@ -228,6 +256,7 @@ fn run(args: Args) -> Result<(), String> {
             }
             location = app.location();
             carried_status = app.status.take();
+            size_mode = app.size_mode;
             // Free the old tree off the UI thread; it can take a while.
             std::thread::spawn(move || drop(app));
         }
@@ -242,7 +271,7 @@ fn scan_with_progress<T: Send + 'static>(
     terminal: &mut ratatui::DefaultTerminal,
     path: &Path,
     scan: impl FnOnce(&Progress) -> std::io::Result<T> + Send + 'static,
-) -> Result<Option<(T, Duration, u64)>, String> {
+) -> Result<Option<(T, Duration, u64, bool)>, String> {
     let io = |e: std::io::Error| e.to_string();
     let progress = Arc::new(Progress::default());
     let started = Instant::now();
@@ -278,7 +307,12 @@ fn scan_with_progress<T: Send + 'static>(
         .join()
         .expect("scan thread panicked")
         .map_err(|e| format!("{}: {e}", path.display()))?;
-    Ok(Some((root, started.elapsed(), progress.errors.load(Ordering::Relaxed))))
+    Ok(Some((
+        root,
+        started.elapsed(),
+        progress.errors.load(Ordering::Relaxed),
+        progress.clone_ids.load(Ordering::Relaxed),
+    )))
 }
 
 /// `r`: rescan the folder the user is in, splice it into the tree and update
@@ -327,14 +361,14 @@ fn rescan_current(
     let scanned = scan_with_progress(terminal, &target, move |pr| {
         scan::scan_subtree(&t, one_fs, pr, inherited, root_dev)
     });
-    if let Ok(Some((sub, _, _))) = &scanned
+    if let Ok(Some((sub, ..))) = &scanned
         && sub.hardlink
     {
         full_rescan(app);
         return Ok(());
     }
     app.status = Some(match scanned {
-        Ok(Some((sub, took, _))) => {
+        Ok(Some((sub, took, ..))) => {
             // replace_current swaps in the subtree's own error count.
             app.replace_current(sub);
             app.cached_at = None;
@@ -359,16 +393,23 @@ fn save_tree(app: &mut App, one_fs: bool) -> Option<std::io::Error> {
         special: false,
         hardlink: false,
         lossy: false,
+        clone: false,
         dir: None,
     };
-    let snap = Snapshot {
-        root: std::mem::replace(&mut app.root, placeholder),
-        cached_at: None,
-        scan_time: app.scan_time,
-        errors: app.errors,
-        root_dev: app.root_dev,
-    };
-    let result = cache::save(&app.root_path, one_fs, &snap).err();
-    app.root = snap.root;
-    result
+    let root_path = app.root_path.clone();
+    let (scan_time, errors, root_dev, clone_ids) = (app.scan_time, app.errors, app.root_dev, app.clone_ids);
+    // A cache holds the tree in du order, whatever the TUI shows.
+    app.in_du_order(|root| {
+        let snap = Snapshot {
+            root: std::mem::replace(root, placeholder),
+            cached_at: None,
+            scan_time,
+            errors,
+            root_dev,
+            clone_ids,
+        };
+        let result = cache::save(&root_path, one_fs, &snap).err();
+        *root = snap.root;
+        result
+    })
 }

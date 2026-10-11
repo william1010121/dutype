@@ -1,5 +1,6 @@
 use crate::app::{App, Focus, Mode, node_at};
 use crate::category::{Category, by_size, dominant, folder_icon};
+use crate::report::SizeMode;
 use crate::scan::Node;
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Flex, Layout, Rect};
@@ -212,6 +213,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             ("← ⌫", "up"),
             ("tab", "pane"),
             ("m", "category/ext"),
+            ("c", "du/dedup"),
             ("o", "reveal"),
             ("y", "copy path"),
             ("r", "rescan folder"),
@@ -311,17 +313,27 @@ fn breadcrumb(path: &Path, width: usize) -> Line<'static> {
 
 fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     let cur = app.current();
+    let total = app.shown_total(cur);
+    let dedup = app.size_mode == SizeMode::Dedup;
+    let mut left = vec![Span::raw(" "), chip("◆ dutype", ACCENT), Span::raw(" ")];
+    if dedup {
+        left.push(chip("dedup", Color::Indexed(117)));
+        left.push(Span::raw(" "));
+    }
+    let shared = cur.size - cur.dedup();
+    if shared > 0 {
+        left.push(Span::styled(
+            format!(" clones: −{} shared ", human(shared)),
+            Style::new().fg(Color::Indexed(117)),
+        ));
+    }
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(BORDER))
-        .title(Line::from(vec![
-            Span::raw(" "),
-            chip("◆ dutype", ACCENT),
-            Span::raw(" "),
-        ]))
+        .title(Line::from(left))
         .title(
             Line::from(vec![
-                Span::styled(human(cur.size), size_style(cur.size)),
+                Span::styled(human(total), size_style(total)),
                 Span::styled(
                     format!("  ·  {} files  ·  ", thousands(cur.files())),
                     Style::new().fg(MUTED),
@@ -396,6 +408,15 @@ fn entry_name(c: &Node) -> Line<'static> {
 }
 
 fn draw_entries(f: &mut Frame, app: &mut App, area: Rect) {
+    // Shown size, and whether clone copies in it are counted elsewhere.
+    let sizes: Vec<(u64, bool)> = {
+        let cur = app.current();
+        let copies = |i: usize| cur.dir.as_ref().is_some_and(|d| d.child_dedup(i) < d.children[i].size);
+        (0..cur.children().len())
+            .map(|i| (app.shown_size(cur, i), copies(i)))
+            .collect()
+    };
+    let total = app.shown_total(app.current());
     let App {
         root,
         stack,
@@ -426,13 +447,18 @@ fn draw_entries(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    let max = cur.children().first().map_or(1, |c| c.size);
-    let rows = cur.children().iter().map(|c| {
+    let max = sizes.first().map_or(1, |s| s.0);
+    let rows = cur.children().iter().zip(&sizes).map(|(c, &(size, copies))| {
+        let mut name = entry_name(c);
+        // Holds (or is) a clone whose family is counted at another member.
+        if copies {
+            name.push_span(Span::styled("  ⧉", Style::new().fg(Color::Indexed(117))));
+        }
         Row::new(vec![
-            Cell::from(Line::from(Span::styled(human(c.size), size_style(c.size))).right_aligned()),
-            Cell::from(Span::styled(pct(c.size, cur.size), Style::new().fg(MUTED))),
-            Cell::from(stacked_bar(&c.cats(), c.size, max, ENTRY_BAR, "█")),
-            Cell::from(entry_name(c)),
+            Cell::from(Line::from(Span::styled(human(size), size_style(size))).right_aligned()),
+            Cell::from(Span::styled(pct(size, total), Style::new().fg(MUTED))),
+            Cell::from(stacked_bar(&c.cats(), size, max, ENTRY_BAR, "█")),
+            Cell::from(name),
         ])
     });
     let table = Table::new(
@@ -528,15 +554,16 @@ fn draw_details(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(block, area);
 
     let cur = app.current();
-    let Some(node) = app
+    let Some((i, node)) = app
         .states
         .last()
         .and_then(|s| s.selected())
-        .and_then(|i| cur.children().get(i))
+        .and_then(|i| Some((i, cur.children().get(i)?)))
     else {
         f.render_widget(Paragraph::new("nothing selected").fg(MUTED), inner);
         return;
     };
+    let dedup = cur.dir.as_ref().map_or(node.size, |d| d.child_dedup(i));
     let cats = node.cats();
     let label = |s: &str| Span::styled(format!("{s:<8}"), Style::new().fg(MUTED));
 
@@ -551,6 +578,19 @@ fn draw_details(f: &mut Frame, app: &App, area: Rect) {
             ),
         ]),
     ];
+    // "freeable": what deleting it would free at least (shared blocks with
+    // files elsewhere stay); "dedup": clones of each other counted once.
+    let mut space = vec![
+        label("frees"),
+        Span::styled(format!("≥ {}", human(node.freeable())), Style::new().fg(TEXT)),
+    ];
+    if dedup != node.size {
+        space.push(Span::styled(
+            format!("   dedup {}", human(dedup)),
+            Style::new().fg(Color::Indexed(117)),
+        ));
+    }
+    lines.push(Line::from(space));
     if node.is_dir() {
         lines.push(Line::from(vec![
             label("files"),
