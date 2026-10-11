@@ -459,8 +459,11 @@ impl Reader<'_> {
         if !p.0.is_empty() {
             let mut matched = 0;
             let mut ok = true;
-            crate::scan::walk(root, &mut PathBuf::new(), &mut |n, rel| {
+            // As reports look sizes up: never under a lossy name.
+            crate::scan::walk_with_ancestors(root, &mut PathBuf::new(), &mut Vec::new(), &mut |n, _, rel, up| {
                 if !n.is_dir()
+                    && !n.lossy
+                    && !up.iter().any(|a| a.lossy)
                     && let Some(b) = p.get(rel)
                 {
                     matched += 1;

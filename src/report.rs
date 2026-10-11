@@ -269,21 +269,25 @@ impl Ord for Item {
 }
 
 /// Depth-first walk below `node` like [`crate::scan::walk`], also passing
-/// each node's deduplicated size.
-fn walk(node: &Node, rel: &mut PathBuf, f: &mut impl FnMut(&Node, u64, &Path) -> bool) {
+/// each node's deduplicated size and whether its path has a non-UTF-8
+/// (lossy) name.
+fn walk(node: &Node, rel: &mut PathBuf, lossy: bool, f: &mut impl FnMut(&Node, u64, &Path, bool) -> bool) {
     let Some(d) = &node.dir else { return };
     for (i, c) in d.children.iter().enumerate() {
         rel.push(&*c.name);
-        if f(c, d.child_dedup(i), rel) && c.is_dir() {
-            walk(c, rel, f);
+        let lossy = lossy || c.lossy;
+        if f(c, d.child_dedup(i), rel, lossy) && c.is_dir() {
+            walk(c, rel, lossy, f);
         }
         rel.pop();
     }
 }
 
-/// Private size of the file `n` at `rel`, if the scan read one.
-fn private_of(private: Option<&PrivateSizes>, n: &Node, rel: &Path) -> Option<u64> {
-    private.filter(|_| !n.is_dir())?.get(rel)
+/// Private size of the file `n` at `rel`, if the scan read one. Never for a
+/// path with a lossy name: it renders like a valid name could, and sizes
+/// are only kept by valid names.
+fn private_of(private: Option<&PrivateSizes>, n: &Node, rel: &Path, lossy: bool) -> Option<u64> {
+    private.filter(|_| !n.is_dir() && !lossy)?.get(rel)
 }
 
 /// Unix seconds, for the `cached_at` output field.
@@ -310,7 +314,7 @@ pub fn build(root: &Node, root_path: &Path, meta: &Meta, top: usize) -> Report {
 
     let mut special = TopN::new(top);
     let mut files = TopN::new(top);
-    walk(root, &mut PathBuf::new(), &mut |n, dedup, p| {
+    walk(root, &mut PathBuf::new(), false, &mut |n, dedup, p, lossy| {
         let list = if n.special {
             &mut special
         } else if !n.is_dir() {
@@ -320,7 +324,14 @@ pub fn build(root: &Node, root_path: &Path, meta: &Meta, top: usize) -> Report {
         };
         let rank = mode.pick(n.size, dedup);
         if list.accepts(|min: &Item| rank > min.rank) {
-            list.push(Item::of(n, dedup, private_of(meta.private, n, p), p, mode, known));
+            list.push(Item::of(
+                n,
+                dedup,
+                private_of(meta.private, n, p, lossy),
+                p,
+                mode,
+                known,
+            ));
         }
         // Nested special dirs only occur inside weak ones (huggingface/ inside
         // .cache/); both are reported.
@@ -361,7 +372,7 @@ pub fn build(root: &Node, root_path: &Path, meta: &Meta, top: usize) -> Report {
                     dedup_bytes: dedup,
                     freeable_min_bytes: freeable_of(c, known),
                     clone: c.clone,
-                    private_bytes: private_of(meta.private, c, Path::new(&*c.name)),
+                    private_bytes: private_of(meta.private, c, Path::new(&*c.name), c.lossy),
                 }
             })
             .collect(),
@@ -459,7 +470,7 @@ pub fn find(
 ) -> Vec<Entry> {
     let mut list = TopN::new(top);
     let want_dirs = cat.is_dir_kind();
-    walk(root, &mut PathBuf::new(), &mut |n, dedup, p| {
+    walk(root, &mut PathBuf::new(), false, &mut |n, dedup, p, lossy| {
         let hit = if want_dirs {
             n.special && n.cat == cat
         } else {
@@ -467,7 +478,7 @@ pub fn find(
         };
         let rank = mode.pick(n.size, dedup);
         if hit && list.accepts(|min: &Item| rank > min.rank) {
-            list.push(Item::of(n, dedup, private_of(private, n, p), p, mode, known));
+            list.push(Item::of(n, dedup, private_of(private, n, p, lossy), p, mode, known));
         }
         !(hit && want_dirs)
     });
@@ -503,6 +514,54 @@ pub fn find_to_text(cat: Category, items: &[Entry], mode: SizeMode) -> String {
 mod tests {
     use super::*;
     use crate::category::reg;
+
+    /// A private size kept for a valid name never shows on a non-UTF-8
+    /// file that renders the same (`\xff` and a raw 0xff byte).
+    #[cfg(unix)]
+    #[test]
+    fn private_sizes_skip_lossy_names() {
+        use crate::scan::{Progress, scan_excluding};
+        let d = std::env::temp_dir().join(format!("dutype-report-lossy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let mut f = d.clone();
+        f.push("\\xff");
+        std::fs::write(&f, vec![1u8; 8192]).unwrap();
+        std::fs::write(d.join("other"), vec![1u8; 65536]).unwrap();
+        let mut root = scan_excluding(&d, true, false, &Progress::default(), None).unwrap();
+        // Stand in for a raw 0xff name (APFS refuses to create one).
+        let twin = root
+            .dir
+            .as_mut()
+            .unwrap()
+            .children
+            .iter_mut()
+            .find(|c| &*c.name == "other")
+            .unwrap();
+        (twin.name, twin.lossy) = ("\\xff".into(), true);
+        let mut table = PrivateSizes::default();
+        table.0.insert(PathBuf::from("\\xff"), 4096);
+        let meta = Meta {
+            elapsed: Duration::ZERO,
+            cached_at: None,
+            unreadable: 0,
+            clones: true,
+            clone_ids: true,
+            clone_gaps: false,
+            shares: true,
+            size_mode: SizeMode::Du,
+            private: Some(&table),
+        };
+        let r = build(&root, &d, &meta, 10);
+        let by_size = |l: &[Entry], size: u64| l.iter().find(|e| e.size_bytes == size).unwrap().private_bytes;
+        let small = root.children().iter().find(|c| !c.lossy).unwrap().size;
+        let big = root.children().iter().find(|c| c.lossy).unwrap().size;
+        assert_eq!(by_size(&r.largest_files, small), Some(4096));
+        assert_eq!(by_size(&r.largest_files, big), None);
+        let kids: Vec<_> = r.children.iter().map(|c| (c.size_bytes, c.private_bytes)).collect();
+        assert!(kids.contains(&(small, Some(4096))) && kids.contains(&(big, None)));
+        std::fs::remove_dir_all(&d).unwrap();
+    }
 
     /// Detection is "apfs-full" only when every file's clone flags were read.
     #[test]

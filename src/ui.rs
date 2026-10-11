@@ -600,7 +600,8 @@ fn draw_details(f: &mut Frame, app: &App, area: Rect) {
     }
     lines.push(Line::from(space));
     // --private: what deleting this partial clone alone frees right now.
-    let private = (!node.is_dir() && app.private_sizes && !app.private_missing)
+    let lossy = node.lossy || app.path_has_lossy_name();
+    let private = (!node.is_dir() && !lossy && app.private_sizes && !app.private_missing)
         .then(|| app.privates.get(&app.current_rel().join(&*node.name)))
         .flatten();
     if let Some(p) = private {
