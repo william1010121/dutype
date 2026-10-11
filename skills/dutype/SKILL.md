@@ -43,6 +43,12 @@ If `dutype` is not installed, run it through npx with the same arguments:
 - children, special dirs, files and `--category` items also have
   `dedup_bytes`, `freeable_min_bytes` and `clone` (the item is, or holds, a
   file that may share blocks with others)
+- On Linux btrfs / XFS / bcachefs, `--clones` (slower: one ioctl per file)
+  makes `dedup_bytes` count reflinked copies and snapshot-shared data once
+  (`accounting.clone_detection: "fiemap"`). Shared extents are never in
+  `freeable_min_bytes`; on btrfs, data a snapshot also holds is not freed
+  until the snapshot is deleted (`snapshots-counted-as-shared`). Without
+  `--clones`, `freeable_min_bytes` is null there.
 
 `--category` returns `{path, category, accounting, items: [{path, size_bytes, size, ...}]}`.
 

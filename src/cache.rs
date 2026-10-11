@@ -3,7 +3,7 @@
 //! A cache is never trusted across dutype versions or category rule changes.
 
 use crate::category::{Category, reg};
-use crate::scan::{CloneInfo, DirInfo, Node, PrivateSizes, Shared};
+use crate::scan::{CloneInfo, DirInfo, Extents, Node, PrivateSizes, Reflink, ReflinkFs, Shared};
 use std::fs;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -14,7 +14,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 // (non-UTF-8) names.
 // v7: header flags for `--private` (bits 4 and 5); the private sizes follow
 // the tree.
-const MAGIC: &[u8; 8] = b"DUTYPE\0\x07";
+// v8: a byte after the header flags holds the Linux reflink filesystem whose
+// shared extents were read (`--clones`); shared-block records end with
+// those extents (and, if any, a byte: some shared extents had an unknown
+// size).
+const MAGIC: &[u8; 8] = b"DUTYPE\0\x08";
 
 pub struct Snapshot {
     pub root: Node,
@@ -43,6 +47,9 @@ pub struct Snapshot {
     pub private_missing: bool,
     /// The private sizes themselves (empty without `--private`).
     pub privates: PrivateSizes,
+    /// With `clones`, the Linux reflink filesystem whose shared extents were
+    /// read (see `Progress::reflink_fs`).
+    pub reflink_fs: Option<ReflinkFs>,
 }
 
 impl Snapshot {
@@ -236,6 +243,7 @@ fn write_to(file: &Path, root_path: &Path, snap: &Snapshot) -> io::Result<()> {
             | (snap.private as u8) << 4
             | (snap.private_sizes as u8) << 5
             | (snap.private_missing as u8) << 6])?;
+        w.0.write_all(&[snap.reflink_fs.map_or(0, ReflinkFs::code)])?;
         w.varint(snap.root_dev.unwrap_or(0))?;
         w.bytes(root_path.as_os_str().as_encoded_bytes())?;
         w.node(&snap.root)?;
@@ -261,6 +269,7 @@ fn read_from(file: &Path, root_path: &Path) -> Option<Snapshot> {
         data: &data,
         pos: 0,
         clones: false,
+        extents: false,
     };
     if r.take(MAGIC.len())? != MAGIC || u64::from_le_bytes(r.take(8)?.try_into().ok()?) != reg().fingerprint {
         return None;
@@ -280,6 +289,14 @@ fn read_from(file: &Path, root_path: &Path) -> Option<Snapshot> {
     if (private_sizes || private_missing) && !private {
         return None;
     }
+    // The reflink filesystem whose shared extents were read, only with
+    // `--clones`.
+    let fs = *r.take(1)?.first()?;
+    let reflink_fs = ReflinkFs::from_code(fs);
+    if (fs != 0 && reflink_fs.is_none()) || (reflink_fs.is_some() && !clones) {
+        return None;
+    }
+    r.extents = reflink_fs.is_some();
     let dev = r.varint()?;
     let root_dev = has_dev.then_some(dev);
     // A hash collision between two paths must not show the wrong tree.
@@ -307,6 +324,7 @@ fn read_from(file: &Path, root_path: &Path) -> Option<Snapshot> {
         private_sizes,
         private_missing,
         privates,
+        reflink_fs,
     })
 }
 
@@ -333,7 +351,8 @@ impl<W: Write> Writer<W> {
     }
 
     /// Pre-order: name, size, category, flags, then for dirs the children,
-    /// the dir's own error and clone-gap counts and its shared-block records. Per-dir
+    /// the dir's own error and clone-gap counts and its shared-block records
+    /// (with their shared extents). Per-dir
     /// category totals, file counts, error totals and freeable bytes are
     /// derived again on load.
     fn node(&mut self, n: &Node) -> io::Result<()> {
@@ -362,10 +381,19 @@ impl<W: Write> Writer<W> {
                     s.key.1,
                     s.is_clone as u64,
                     s.ino,
-                    s.nlink,
+                    s.nlink as u64,
                     s.refcnt as u64,
                 ] {
                     self.varint(v)?;
+                }
+                let extents = s.reflink.as_ref().map_or(&[][..], |r| &r.extents);
+                self.varint(extents.len() as u64)?;
+                for &(start, len) in extents {
+                    self.varint(start)?;
+                    self.varint(len)?;
+                }
+                if let Some(r) = &s.reflink {
+                    self.0.write_all(&[r.opaque as u8])?;
                 }
             }
         }
@@ -395,6 +423,8 @@ struct Reader<'a> {
     /// The snapshot looked for clones; without it, no dir may carry
     /// clone gaps or shared-block records (a scan never makes them).
     clones: bool,
+    /// Shared extents may appear (`--clones` on a reflink filesystem).
+    extents: bool,
 }
 
 impl Reader<'_> {
@@ -478,6 +508,28 @@ impl Reader<'_> {
         Some(p)
     }
 
+    /// Shared extents of a shared-block record: non-empty ranges sorted by
+    /// start, none past the end of the address space. `Some(None)` for none.
+    fn extents(&mut self) -> Option<Option<Extents>> {
+        let count = usize::try_from(self.varint()?).ok()?;
+        if count == 0 {
+            return Some(None);
+        }
+        // Each range takes at least two bytes.
+        if !self.extents || count > (self.data.len() - self.pos) / 2 {
+            return None;
+        }
+        let mut out: Vec<(u64, u64)> = Vec::with_capacity(count);
+        for _ in 0..count {
+            let (start, len) = (self.varint()?, self.varint()?);
+            if len == 0 || start.checked_add(len).is_none() || out.last().is_some_and(|&p| p > (start, len)) {
+                return None;
+            }
+            out.push((start, len));
+        }
+        Some(Some(out.into_boxed_slice()))
+    }
+
     fn node(&mut self, depth: usize) -> Option<Node> {
         // Deeper than any sane tree, and keeps the recursion well within
         // small (2 MiB) thread stacks even in debug builds. Deeper snapshots
@@ -553,13 +605,18 @@ impl Reader<'_> {
                     1 => true,
                     _ => return None,
                 };
-                let (ino, nlink) = (self.varint()?, self.varint()?);
+                let (ino, nlink) = (self.varint()?, u32::try_from(self.varint()?).ok()?);
                 let refcnt = u32::try_from(self.varint()?).ok()?;
                 // In order, each naming a distinct file child that shares
                 // blocks (so `account` visits its dir).
                 let prev = shared.last().map(|s: &Shared| s.idx as i64).unwrap_or(-1);
                 let shares = |c: &Node| !c.is_dir() && (c.hardlink || c.clone);
                 if idx as i64 <= prev || !children.get(idx as usize).is_some_and(shares) {
+                    return None;
+                }
+                let extents = self.extents()?;
+                // Files with shared extents are marked as possibly sharing.
+                if extents.is_some() && !children[idx as usize].clone {
                     return None;
                 }
                 shared.push(Shared {
@@ -570,6 +627,18 @@ impl Reader<'_> {
                     nlink,
                     refcnt,
                     dup: false,
+                    reflink: match extents {
+                        Some(extents) => Some(Box::new(Reflink {
+                            extents,
+                            dup: 0,
+                            opaque: match *self.take(1)?.first()? {
+                                0 => false,
+                                1 => true,
+                                _ => return None,
+                            },
+                        })),
+                        None => None,
+                    },
                 });
             }
             hardlink_flag = hardlink;
@@ -674,6 +743,7 @@ mod tests {
             private_sizes: progress.private_sizes.load(std::sync::atomic::Ordering::Relaxed),
             private_missing: progress.private_missing.load(std::sync::atomic::Ordering::Relaxed),
             privates: progress.take_private(),
+            reflink_fs: None,
         };
         assert_eq!(snap.clone_ids, cfg!(target_os = "macos"));
         assert_eq!(snap.private_sizes, cfg!(target_os = "macos"));
@@ -702,6 +772,7 @@ mod tests {
                 data: &data,
                 pos: 16,
                 clones: true,
+                extents: false,
             };
             // cached_at, scan time, errors
             for _ in 0..3 {
@@ -730,6 +801,7 @@ mod tests {
             private_sizes: true,
             private_missing: true,
             privates: PrivateSizes(std::iter::once((Path::new("d").join("a"), 1)).collect()),
+            reflink_fs: None,
         };
         assert!(missing.private_table().is_none());
         write_to(&file, &src, &missing).unwrap();
@@ -749,6 +821,7 @@ mod tests {
             private_sizes: false,
             private_missing: false,
             privates: PrivateSizes::default(),
+            reflink_fs: None,
         };
         assert!(none.serves(false) && !none.serves(true));
         // Without --clones there are no records to keep: hard links just
@@ -801,6 +874,7 @@ mod tests {
                 private_sizes: true,
                 private_missing: false,
                 privates,
+                reflink_fs: None,
             }
         };
         let file = temp("private-table-out").join("c.bin");
@@ -841,6 +915,7 @@ mod tests {
             private_sizes: false,
             private_missing: false,
             privates: PrivateSizes::default(),
+            reflink_fs: None,
         };
         let file = temp("shared-bad-out").join("c.bin");
         write_to(&file, &src, &snap).unwrap();
@@ -854,10 +929,93 @@ mod tests {
             nlink: 1,
             refcnt: 2,
             dup: false,
+            reflink: None,
         }]
         .into_boxed_slice();
         write_to(&file, &src, &snap).unwrap();
         assert!(read_from(&file, &src).is_none());
+    }
+
+    /// Shared extents survive a round trip (needs `DUTYPE_REFLINK_TEST_DIR`,
+    /// see `scan::reflink_tests`).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn round_trip_keeps_shared_extents() {
+        use crate::scan::reflink_tests::{fixture, reflink_copy, scan_reflinks};
+        let Some(src) = fixture("cache") else { return };
+        fs::write(src.join("a"), vec![3u8; 4 << 20]).unwrap();
+        fs::File::open(src.join("a")).unwrap().sync_all().unwrap();
+        reflink_copy(&src.join("a"), &src.join("sub/b"));
+        let (root, reflink_fs) = scan_reflinks(&src);
+        assert!(reflink_fs.is_some());
+        let snap = Snapshot {
+            root,
+            cached_at: None,
+            scan_time: Duration::ZERO,
+            errors: 0,
+            root_dev: None,
+            clones: true,
+            clone_ids: false,
+            clone_gaps: false,
+            private: false,
+            private_sizes: false,
+            private_missing: false,
+            privates: PrivateSizes::default(),
+            reflink_fs,
+        };
+        assert_eq!(snap.root.dedup(), snap.root.size - (4 << 20));
+        let file = temp("extents-out").join("c.bin");
+        write_to(&file, &src, &snap).unwrap();
+        let back = read_from(&file, &src).unwrap();
+        same(&snap.root, &back.root);
+        assert_eq!((back.clones, back.reflink_fs), (true, reflink_fs));
+        assert_eq!(back.root.dedup(), snap.root.dedup());
+        fs::remove_dir_all(&src).unwrap();
+    }
+
+    /// The reflink filesystem survives a round trip; an unknown one, or one
+    /// recorded without `--clones`, is a miss.
+    #[test]
+    fn reflink_flags_are_checked() {
+        let src = temp("flags-src");
+        let snap = Snapshot {
+            root: scan(&src, true, true, &Progress::default()).unwrap(),
+            cached_at: None,
+            scan_time: Duration::ZERO,
+            errors: 0,
+            root_dev: None,
+            clones: true,
+            clone_ids: false,
+            clone_gaps: false,
+            private: false,
+            private_sizes: false,
+            private_missing: false,
+            privates: PrivateSizes::default(),
+            reflink_fs: Some(ReflinkFs::Xfs),
+        };
+        let file = temp("flags-out").join("c.bin");
+        write_to(&file, &src, &snap).unwrap();
+        let back = read_from(&file, &src).unwrap();
+        assert_eq!((back.clones, back.reflink_fs), (true, Some(ReflinkFs::Xfs)));
+        let good = fs::read(&file).unwrap();
+        // The flags byte follows the magic, fingerprint and three varints;
+        // the reflink filesystem byte follows it.
+        let mut r = Reader {
+            data: &good,
+            pos: 16,
+            clones: false,
+            extents: false,
+        };
+        (0..3).for_each(|_| assert!(r.varint().is_some()));
+        let at = r.pos;
+        assert_eq!((good[at], good[at + 1]), (0b100, ReflinkFs::Xfs.code()));
+        // An unknown filesystem, or one without the `--clones` flag.
+        for (flags, fs) in [(0b100, 4), (0b100, 0xff), (0, ReflinkFs::Xfs.code())] {
+            let mut data = good.clone();
+            (data[at], data[at + 1]) = (flags, fs);
+            fs::write(&file, &data).unwrap();
+            assert!(read_from(&file, &src).is_none(), "{flags:#b} {fs}");
+        }
     }
 
     #[test]
@@ -893,6 +1051,7 @@ mod tests {
             private_sizes: false,
             private_missing: false,
             privates: PrivateSizes::default(),
+            reflink_fs: None,
         };
         write_to(&file, &src, &snap(1)).unwrap();
         write_to(&file, &src, &snap(2)).unwrap();
@@ -919,6 +1078,7 @@ mod tests {
             private_sizes: false,
             private_missing: false,
             privates: PrivateSizes::default(),
+            reflink_fs: None,
         };
         write_to(&file, &src, &snap).unwrap();
         let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
@@ -954,6 +1114,7 @@ mod tests {
             private_sizes: false,
             private_missing: false,
             privates: PrivateSizes::default(),
+            reflink_fs: None,
         };
         // Snapshots in a directory others can write are not trusted on read.
         fs::write(dir.join("probe"), "x").unwrap();
@@ -1001,6 +1162,7 @@ mod tests {
             private_sizes: false,
             private_missing: false,
             privates: PrivateSizes::default(),
+            reflink_fs: None,
         };
 
         let file = temp("out").join("c.bin");
@@ -1061,12 +1223,14 @@ mod tests {
             data: &[0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02],
             pos: 0,
             clones: false,
+            extents: false,
         };
         assert_eq!(r.varint(), None);
         let mut r = Reader {
             data: &[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01],
             pos: 0,
             clones: false,
+            extents: false,
         };
         assert_eq!(r.varint(), Some(u64::MAX));
 
@@ -1094,6 +1258,7 @@ mod tests {
             private_sizes: false,
             private_missing: false,
             privates: PrivateSizes::default(),
+            reflink_fs: None,
         };
         assert!(same_device(&on(Some(dev)), &src));
         assert!(!same_device(&on(Some(dev.wrapping_add(1))), &src));

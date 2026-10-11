@@ -1,16 +1,24 @@
 //! Shared-block accounting on a scanned tree: sizes with each APFS clone
-//! family counted once (`Node::dedup`) and lower bounds of what deleting a
-//! folder frees (`Node::freeable`).
+//! family or shared extent counted once (`Node::dedup`) and lower bounds of
+//! what deleting a folder frees (`Node::freeable`).
 //!
-//! With `--clones`, the scan records every file with hard links or clone
-//! siblings in its dir's `shared` list (without it, nothing runs here). This pass groups them (by inode for hard links, by
-//! clone id for clone families), then:
+//! With `--clones`, the scan records every file with hard links, clone
+//! siblings or (on Linux) shared extents in its dir's `shared` list
+//! (without it, nothing runs here). This pass groups them (by inode for
+//! hard links, by clone id for clone families), then:
 //! - keeps one member of each clone family, picked by a stable rule (the
 //!   shortest path, then the smallest), and subtracts the others from the
 //!   deduplicated size of every folder above them;
+//! - splits shared extents into segments by physical position (a sweep over
+//!   the sorted ranges, so partial overlaps work) and keeps each segment at
+//!   one of the files that hold it, picked by the same rule; the others
+//!   subtract it. Like "Set shared" in `btrfs filesystem du`, every shared
+//!   physical byte in the tree is then counted once;
 //! - adds a group's bytes to the freeable bytes of the lowest folder that
 //!   holds all of it (every inode of the family, every link of each inode),
-//!   and of the folders above.
+//!   and of the folders above. Shared extents never count as freeable:
+//!   Linux has no global reference count to tell whether every user of an
+//!   extent (another file, a snapshot) is inside the tree.
 //!
 //! A family's size on the whole volume is read here, once per family with
 //! two or more members in the tree (one syscall each, in parallel), and kept
@@ -23,6 +31,7 @@
 use crate::scan::{Node, clone_refcnt, resolve_chain};
 use rayon::prelude::*;
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// A visited dir, in pre-order.
@@ -45,12 +54,20 @@ struct Member {
     key: (u64, u64),
     is_clone: bool,
     ino: u64,
-    nlink: u64,
+    nlink: u32,
     refcnt: u32,
     size: u64,
     /// Position before sorting.
     pos: u32,
+    /// The file has shared extents (Linux `--clones`).
+    reflinked: bool,
+    /// ... and some of unknown physical size (see `Reflink::opaque`).
+    opaque: bool,
 }
+
+/// A shared extent of a member: `(device, physical start, length, member
+/// position)`.
+type Range = (u64, u64, u64, u32);
 
 /// Recompute `dup`, `group_free` and the `Shared` records' `dup` (and
 /// unknown `refcnt`) for the whole tree. `base` is the root's path on disk,
@@ -58,10 +75,17 @@ struct Member {
 pub fn account(root: &mut Node, base: Option<&Path>) {
     let mut dirs = Vec::new();
     let mut members = Vec::new();
-    collect(root, 0, 0, 0, &mut dirs, &mut members);
+    let mut ranges = Vec::new();
+    collect(root, 0, 0, 0, &mut dirs, &mut members, &mut ranges);
     if members.is_empty() {
         return;
     }
+    // Per member position: bytes in its shared extents, and the part of
+    // them counted at another file. Empty without shared extents.
+    let (held, extent_dup) = match ranges.is_empty() {
+        true => (Vec::new(), Vec::new()),
+        false => extent_dups(root, &dirs, &members, ranges),
+    };
     members.sort_unstable_by_key(|m| (m.is_clone, m.key, m.ino));
     let mut groups: Vec<&mut [Member]> = members
         .chunk_by_mut(|a, b| (a.is_clone, a.key) == (b.is_clone, b.key))
@@ -110,12 +134,17 @@ pub fn account(root: &mut Node, base: Option<&Path>) {
                 out[m.pos as usize].0 = true;
             }
         }
+        for m in g.iter().filter(|m| m.reflinked) {
+            dup[m.dir as usize] += extent_dup[m.pos as usize];
+        }
         for m in g.iter() {
             out[m.pos as usize].1 = m.refcnt;
         }
         // Every link of every inode here, and for a clone family every inode.
         let refcnt = g.iter().map(|m| m.refcnt).max().unwrap_or(0) as usize;
-        let all_links = g.chunk_by(|a, b| a.ino == b.ino).all(|l| l.len() as u64 >= l[0].nlink);
+        let all_links = g
+            .chunk_by(|a, b| a.ino == b.ino)
+            .all(|l| l.len() as u64 >= l[0].nlink as u64);
         let complete = all_links
             && match is_clone {
                 true => refcnt >= 2 && n >= refcnt,
@@ -124,9 +153,15 @@ pub fn account(root: &mut Node, base: Option<&Path>) {
             };
         if complete {
             // One copy: the bytes counted on the links of one inode.
+            // Shared extents are never freeable.
+            let private = |m: &Member| match m.reflinked {
+                true if m.opaque => 0,
+                true => m.size.saturating_sub(held[m.pos as usize]),
+                false => m.size,
+            };
             let bytes = g
                 .chunk_by(|a, b| a.ino == b.ino)
-                .map(|l| l.iter().map(|m| m.size).sum::<u64>())
+                .map(|l| l.iter().map(private).sum::<u64>())
                 .max()
                 .unwrap_or(0);
             let lca = g[1..].iter().fold(g[0].dir, |a, m| lca(&dirs, a, m.dir));
@@ -140,7 +175,70 @@ pub fn account(root: &mut Node, base: Option<&Path>) {
         free[p] += free[i];
     }
     let mut next = 0;
-    apply(root, &dirs, &mut next, &dup, &free, &out);
+    apply(root, &dirs, &mut next, &dup, &free, &out, &extent_dup);
+}
+
+/// Members with shared extents: each shared physical segment stays at one of
+/// the files holding it (the first by [`compare`]); every other file holding
+/// it does not count it. Returns, per member position, the bytes in its
+/// shared extents and the part of them counted at another file.
+fn extent_dups(root: &Node, dirs: &[Dir], members: &[Member], mut ranges: Vec<Range>) -> (Vec<u64>, Vec<u64>) {
+    // Rank the members with extents by the stable rule (0 = preferred).
+    let mut ids: Vec<u32> = ranges.iter().map(|r| r.3).collect();
+    ids.dedup();
+    let (mut pa, mut pb) = (Vec::new(), Vec::new());
+    ids.sort_by(|&a, &b| compare(root, dirs, &members[a as usize], &members[b as usize], &mut pa, &mut pb));
+    let mut rank = vec![0u32; members.len()];
+    for (r, &id) in ids.iter().enumerate() {
+        rank[id as usize] = r as u32;
+    }
+    let mut held = vec![0u64; members.len()];
+    for r in &ranges {
+        held[r.3 as usize] += r.2;
+    }
+    let mut credited = vec![0u64; ids.len()];
+    ranges.sort_unstable_by_key(|r| r.0);
+    for dev in ranges.chunk_by(|a, b| a.0 == b.0) {
+        let segs: Vec<(u64, u64, u32)> = dev.iter().map(|r| (r.1, r.2, rank[r.3 as usize])).collect();
+        credit(&segs, &mut credited);
+    }
+    let mut dup = vec![0u64; members.len()];
+    for &id in &ids {
+        let i = id as usize;
+        dup[i] = held[i].min(members[i].size).saturating_sub(credited[rank[i] as usize]);
+    }
+    (held, dup)
+}
+
+/// The sweep: `ranges` are `(start, len, file)`; every stretch covered by at
+/// least one range is credited to the smallest `file` covering it. Adds the
+/// credited bytes to `credited[file]`.
+pub(crate) fn credit(ranges: &[(u64, u64, u32)], credited: &mut [u64]) {
+    let mut events: Vec<(u64, bool, u32)> = Vec::with_capacity(ranges.len() * 2);
+    for &(start, len, file) in ranges {
+        events.push((start, true, file));
+        events.push((start.saturating_add(len), false, file));
+    }
+    events.sort_unstable_by_key(|e| e.0);
+    // Files covering the current position, with how many of their ranges do.
+    let mut active: BTreeMap<u32, u32> = BTreeMap::new();
+    let mut prev = 0;
+    for (pos, open, file) in events {
+        if pos > prev
+            && let Some((&first, _)) = active.first_key_value()
+        {
+            credited[first as usize] += pos - prev;
+        }
+        prev = pos;
+        if open {
+            *active.entry(file).or_default() += 1;
+        } else if let Some(n) = active.get_mut(&file) {
+            *n -= 1;
+            if *n == 0 {
+                active.remove(&file);
+            }
+        }
+    }
 }
 
 fn members_len(groups: &[&mut [Member]]) -> usize {
@@ -154,7 +252,15 @@ fn inodes(g: &[Member]) -> usize {
 
 /// Visit the dirs that may hold group members or old results, resetting
 /// the results and collecting the members.
-fn collect(node: &mut Node, parent: u32, child: u32, depth: u32, dirs: &mut Vec<Dir>, members: &mut Vec<Member>) {
+fn collect(
+    node: &mut Node,
+    parent: u32,
+    child: u32,
+    depth: u32,
+    dirs: &mut Vec<Dir>,
+    members: &mut Vec<Member>,
+    ranges: &mut Vec<Range>,
+) {
     let Some(d) = node.dir.as_deref_mut() else { return };
     let id = dirs.len() as u32;
     dirs.push(Dir {
@@ -168,6 +274,9 @@ fn collect(node: &mut Node, parent: u32, child: u32, depth: u32, dirs: &mut Vec<
         c.group_free = 0;
     }
     for (slot, s) in d.shared().iter().enumerate() {
+        for &(start, len) in s.reflink.as_ref().map_or(&[][..], |r| &r.extents) {
+            ranges.push((s.key.0, start, len, members.len() as u32));
+        }
         members.push(Member {
             dir: id,
             slot: slot as u32,
@@ -178,18 +287,28 @@ fn collect(node: &mut Node, parent: u32, child: u32, depth: u32, dirs: &mut Vec<
             refcnt: s.refcnt,
             size: d.children[s.idx as usize].size,
             pos: members.len() as u32,
+            reflinked: s.reflink.is_some(),
+            opaque: s.reflink.as_ref().is_some_and(|r| r.opaque),
         });
     }
     for (i, c) in d.children.iter_mut().enumerate() {
         let stale = c.dir.as_ref().is_some_and(|d| d.dup() != 0 || d.group_free() != 0);
         if c.is_dir() && (c.hardlink || c.clone || stale) {
-            collect(c, id, i as u32, depth + 1, dirs, members);
+            collect(c, id, i as u32, depth + 1, dirs, members, ranges);
         }
     }
 }
 
 /// Write the results back, visiting the same dirs as [`collect`].
-fn apply(node: &mut Node, dirs: &[Dir], next: &mut usize, dup: &[u64], free: &[u64], out: &[(bool, u32)]) {
+fn apply(
+    node: &mut Node,
+    dirs: &[Dir],
+    next: &mut usize,
+    dup: &[u64],
+    free: &[u64],
+    out: &[(bool, u32)],
+    extent_dup: &[u64],
+) {
     let id = *next;
     *next += 1;
     let d = node.dir.as_deref_mut().expect("a collected dir");
@@ -198,15 +317,18 @@ fn apply(node: &mut Node, dirs: &[Dir], next: &mut usize, dup: &[u64], free: &[u
         c.dup = dup[id];
         c.group_free = free[id];
         let first = dirs[id].first as usize;
-        for (s, &(is_dup, refcnt)) in c.shared.iter_mut().zip(&out[first..]) {
+        for (k, (s, &(is_dup, refcnt))) in c.shared.iter_mut().zip(&out[first..]).enumerate() {
             s.dup = is_dup;
             s.refcnt = refcnt;
+            if let Some(r) = &mut s.reflink {
+                r.dup = extent_dup.get(first + k).copied().unwrap_or(0);
+            }
         }
         d.trim_clones();
     }
     while *next < dirs.len() && dirs[*next].parent as usize == id {
         let c = dirs[*next].child as usize;
-        apply(&mut d.children[c], dirs, next, dup, free, out);
+        apply(&mut d.children[c], dirs, next, dup, free, out, extent_dup);
     }
 }
 
@@ -381,6 +503,7 @@ mod synthetic {
                 nlink: 1,
                 refcnt: 0,
                 dup: false,
+                reflink: None,
             })
             .collect();
         let size = children.iter().map(|c| c.size).sum();
@@ -500,6 +623,7 @@ mod synthetic {
                 nlink: 1,
                 refcnt,
                 dup: false,
+                reflink: None,
             }]
             .into_boxed_slice();
             account(&mut root, None);
@@ -516,5 +640,141 @@ mod synthetic {
         let first = (root.dedup(), root.freeable(), dups(&root));
         account(&mut root, None);
         assert_eq!((root.dedup(), root.freeable(), dups(&root)), first);
+    }
+}
+
+#[cfg(test)]
+mod sweep_tests {
+    use super::credit;
+
+    fn run(ranges: &[(u64, u64, u32)], files: usize) -> Vec<u64> {
+        let mut c = vec![0; files];
+        credit(ranges, &mut c);
+        c
+    }
+
+    #[test]
+    fn disjoint_ranges_stay_with_their_file() {
+        assert_eq!(run(&[(0, 10, 1), (20, 5, 0)], 2), [5, 10]);
+        assert_eq!(run(&[], 1), [0]);
+    }
+
+    #[test]
+    fn the_first_file_keeps_shared_segments() {
+        // Two full copies and one partial one of [100, 200).
+        assert_eq!(run(&[(100, 100, 2), (100, 100, 1), (150, 50, 0)], 3), [50, 50, 0]);
+        // Partial overlaps: 2 keeps what nobody earlier holds.
+        assert_eq!(run(&[(0, 60, 2), (40, 40, 0), (70, 50, 1)], 3), [40, 40, 40]);
+    }
+
+    #[test]
+    fn touching_and_repeated_ranges() {
+        // Touching ranges of one file, a range a file holds twice.
+        assert_eq!(run(&[(0, 10, 0), (10, 10, 0), (5, 10, 1)], 2), [20, 0]);
+        assert_eq!(run(&[(0, 10, 1), (0, 10, 1)], 2), [0, 10]);
+        // Every covered byte is credited exactly once.
+        let r = [(3, 9, 0), (0, 4, 1), (8, 8, 2), (20, 1, 1), (15, 6, 0)];
+        assert_eq!(run(&r, 3).iter().sum::<u64>(), 16 + 5);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod extent_tests {
+    use crate::scan::{Node, Progress, Reflink, Shared, scan_excluding};
+    use std::fs;
+
+    /// Mark the file at `path` as holding the shared `extents`, as a
+    /// `--clones` scan on btrfs or XFS would.
+    fn reflink(root: &mut Node, path: &[&str], extents: &[(u64, u64)], opaque: bool) {
+        let (file, dirs) = path.split_last().unwrap();
+        let mut n = &mut *root;
+        let mut chain = vec![];
+        for name in dirs {
+            let i = n.children().iter().position(|c| &*c.name == *name).unwrap();
+            chain.push(i);
+            n = &mut n.dir.as_mut().unwrap().children[i];
+        }
+        let d = n.dir.as_mut().unwrap();
+        let i = d.children.iter().position(|c| &*c.name == *file).unwrap();
+        let size = d.children[i].size;
+        d.children[i].clone = true;
+        let mut shared = d.shared().to_vec();
+        shared.push(Shared {
+            idx: i as u32,
+            key: (1, i as u64 + 1000 * chain.len() as u64),
+            is_clone: false,
+            ino: i as u64 + 1000 * chain.len() as u64,
+            nlink: 1,
+            refcnt: 1,
+            dup: false,
+            reflink: Some(Box::new(Reflink {
+                extents: extents.into(),
+                dup: 0,
+                opaque,
+            })),
+        });
+        shared.sort_by_key(|s| s.idx);
+        d.clones_mut().shared = shared.into_boxed_slice();
+        // The scan leaves such files out of the plain freeable bytes.
+        let mut n = &mut *root;
+        n.clone = true;
+        n.dir.as_mut().unwrap().free_base -= size;
+        for i in chain {
+            n = &mut n.dir.as_mut().unwrap().children[i];
+            n.clone = true;
+            n.dir.as_mut().unwrap().free_base -= size;
+        }
+    }
+
+    #[test]
+    fn shared_extents_count_once_at_the_first_path() {
+        const M: u64 = 1 << 20;
+        let d = std::env::temp_dir().join(format!("dutype-account-extents-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(d.join("sub")).unwrap();
+        for f in ["a", "c", "sub/b", "plain"] {
+            fs::write(d.join(f), vec![1u8; 8 << 20]).unwrap();
+        }
+        let mut root = scan_excluding(&d, true, true, &Progress::default(), None).unwrap();
+        let own = root.size - 32 * M;
+        let plain = root.freeable() - 32 * M;
+        let p = 1 << 40;
+        // a and sub/b: full copies of one extent; c: its last 7 MiB plus 1 MiB of its own.
+        reflink(&mut root, &["a"], &[(p, 8 * M)], false);
+        reflink(&mut root, &["c"], &[(p + M, 7 * M)], false);
+        reflink(&mut root, &["sub", "b"], &[(p, 8 * M)], false);
+        crate::account::account(&mut root, None);
+
+        assert_eq!(root.size, own + 32 * M);
+        // a keeps the extent: c's 7 MiB and b's 8 MiB are copies.
+        assert_eq!(root.dedup(), own + 17 * M);
+        let dir = root.dir.as_ref().unwrap();
+        let at = |name: &str| dir.children.iter().position(|c| &*c.name == name).unwrap();
+        assert_eq!(dir.child_dedup(at("a")), 8 * M);
+        assert_eq!(dir.child_dedup(at("c")), M);
+        assert_eq!(dir.child_dedup(at("plain")), 8 * M);
+        let sub = &dir.children[at("sub")];
+        assert_eq!(sub.dedup(), sub.size - 8 * M);
+        // Only bytes in no shared extent are freeable.
+        assert_eq!(dir.child_freeable(at("a")), 0);
+        assert_eq!(dir.child_freeable(at("c")), M);
+        assert_eq!(dir.child_freeable(at("plain")), 8 * M);
+        assert_eq!(root.freeable(), plain + 8 * M + M);
+        assert_eq!(sub.freeable(), sub.size - 8 * M);
+
+        // A pure function of the tree: running it again changes nothing.
+        crate::account::account(&mut root, None);
+        assert_eq!(root.dedup(), own + 17 * M);
+
+        // "plain" also shares compressed extents (unknown physical size): it
+        // keeps its readable shared range but nothing of it is freeable.
+        reflink(&mut root, &["plain"], &[(p + 7 * M, M)], true);
+        crate::account::account(&mut root, None);
+        let dir = root.dir.as_ref().unwrap();
+        let i = dir.children.iter().position(|c| &*c.name == "plain").unwrap();
+        assert_eq!(dir.child_freeable(i), 0);
+        assert_eq!(dir.child_dedup(i), 7 * M);
+        assert_eq!(root.freeable(), plain + M);
+        fs::remove_dir_all(&d).unwrap();
     }
 }

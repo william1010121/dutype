@@ -2,7 +2,7 @@
 //! meant for scripts and LLM agents.
 
 use crate::category::{Category, by_size, dominant};
-use crate::scan::{Node, PrivateSizes, TopN};
+use crate::scan::{Node, PrivateSizes, ReflinkFs, TopN};
 use crate::ui::human;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -15,7 +15,8 @@ pub enum SizeMode {
     /// Allocated bytes, like `du -skx` (hard links once).
     #[default]
     Du,
-    /// Like `du`, but each APFS clone family counted once.
+    /// Like `du`, but each APFS clone family (or, on Linux, each shared
+    /// extent) counted once.
     Dedup,
 }
 
@@ -41,6 +42,9 @@ pub struct Meta<'a> {
     pub clone_gaps: bool,
     /// Files may share blocks there ([`crate::scan::may_share_blocks`]).
     pub shares: bool,
+    /// With `clones`, the shared extents of this Linux reflink filesystem
+    /// were read.
+    pub reflink_fs: Option<ReflinkFs>,
     pub size_mode: SizeMode,
     /// The scan read APFS private sizes (`--private` on macOS): these.
     pub private: Option<&'a PrivateSizes>,
@@ -52,9 +56,15 @@ pub fn freeable_of(n: &Node, known: bool) -> Option<u64> {
     (known || n.files() == 0).then(|| n.freeable())
 }
 
+/// Shared blocks were detected: APFS reported clone flags, or (with
+/// `--clones` on btrfs, XFS, bcachefs) shared extents were read.
+pub fn detected(clones: bool, clone_ids: bool, reflink_fs: Option<ReflinkFs>) -> bool {
+    clones && (clone_ids || reflink_fs.is_some())
+}
+
 /// Whether a lower bound of freed bytes can be given: where files may share
 /// blocks (`shares`: APFS, btrfs, XFS, ...), only a scan that detected
-/// shared blocks (`--clones` on APFS) can tell.
+/// shared blocks (see [`detected`]) can tell.
 pub fn freeable_known(detected: bool, shares: bool) -> bool {
     detected || !shares
 }
@@ -69,9 +79,14 @@ pub struct Accounting {
     /// `apfs-full`: identical APFS clones are detected (`dedup_bytes`,
     /// `freeable_min_bytes`); `apfs-partial`: the same, but some files'
     /// clone flags could not be read (another volume): those are counted
-    /// in full and as possibly shared; `unsupported`: they are counted in full and
-    /// `dedup_bytes` equals `size_bytes`; `off`: not looked for (no
-    /// `--clones`), `dedup_bytes` equals `size_bytes`. Unless clones were
+    /// in full and as possibly shared; `fiemap`: shared extents were read on
+    /// a Linux reflink filesystem (btrfs, XFS, bcachefs), each shared
+    /// physical byte counts once in `dedup_bytes` and never in
+    /// `freeable_min_bytes`; `fiemap-partial`: the same, but some files could
+    /// not be probed (counted in full and as possibly shared);
+    /// `unsupported`: shared blocks are counted in full and `dedup_bytes`
+    /// equals `size_bytes`; `off`: not looked for (no `--clones`),
+    /// `dedup_bytes` equals `size_bytes`. Unless shared blocks were
     /// detected, `freeable_min_bytes` is null where files may share blocks
     /// (macOS; btrfs, XFS, bcachefs, OCFS2, ZFS; Linux with `--cross-fs`).
     pub clone_detection: &'static str,
@@ -84,19 +99,29 @@ pub struct Accounting {
 
 /// The `accounting` object for a tree scanned with these facts.
 pub fn accounting(meta: &Meta) -> Accounting {
-    let mut caveats = match (meta.clones, meta.clone_ids, meta.clone_gaps) {
+    let mut caveats = match (meta.clones, meta.reflink_fs, meta.clone_ids, meta.clone_gaps) {
         (false, ..) => vec![
             "clones-not-detected",
             "hard-links-not-freeable",
             "snapshots-not-considered",
         ],
-        (true, true, false) => vec!["partial-clones-not-deduplicated", "snapshots-not-considered"],
-        (true, true, true) => vec![
+        (true, Some(fs), _, gaps) => {
+            let mut c = vec!["shared-extents-not-freeable"];
+            if fs == ReflinkFs::Btrfs {
+                c.extend(["snapshots-counted-as-shared", "compressed-extents-not-deduplicated"]);
+            }
+            if gaps {
+                c.push("shared-extents-missing-for-some-files");
+            }
+            c
+        }
+        (true, None, true, false) => vec!["partial-clones-not-deduplicated", "snapshots-not-considered"],
+        (true, None, true, true) => vec![
             "partial-clones-not-deduplicated",
             "clone-flags-missing-for-some-files",
             "snapshots-not-considered",
         ],
-        (true, false, _) => vec!["snapshots-not-considered"],
+        (true, None, false, _) => vec!["snapshots-not-considered"],
     };
     if meta.private.is_some() {
         caveats.push("private-bytes-affected-by-snapshots");
@@ -104,11 +129,13 @@ pub fn accounting(meta: &Meta) -> Accounting {
     Accounting {
         size: "du-allocated",
         size_mode: meta.size_mode,
-        clone_detection: match (meta.clones, meta.clone_ids, meta.clone_gaps) {
+        clone_detection: match (meta.clones, meta.reflink_fs, meta.clone_ids, meta.clone_gaps) {
             (false, ..) => "off",
-            (true, true, false) => "apfs-full",
-            (true, true, true) => "apfs-partial",
-            (true, false, _) => "unsupported",
+            (true, Some(_), _, false) => "fiemap",
+            (true, Some(_), _, true) => "fiemap-partial",
+            (true, None, true, false) => "apfs-full",
+            (true, None, true, true) => "apfs-partial",
+            (true, None, false, _) => "unsupported",
         },
         private: meta.private.is_some(),
         caveats,
@@ -126,7 +153,8 @@ pub struct Report {
     /// `size_bytes - dedup_bytes`: bytes that are clones of other files.
     pub clone_shared_bytes: u64,
     /// Lower bound of what deleting the whole folder would free; null when
-    /// it cannot be known (macOS without `--clones`).
+    /// it cannot be known (macOS or a Linux reflink filesystem without
+    /// `--clones`).
     pub freeable_min_bytes: Option<u64>,
     pub accounting: Accounting,
     pub files: u64,
@@ -169,7 +197,8 @@ pub struct Child {
     pub top_categories: Vec<CategoryShare>,
     pub dedup_bytes: u64,
     pub freeable_min_bytes: Option<u64>,
-    /// It is, or holds, a file that may share blocks with others (APFS clones).
+    /// It is, or holds, a file that may share blocks with others (APFS
+    /// clones, shared extents).
     pub clone: bool,
     /// Files with `--private`: APFS bytes freed immediately if this file
     /// alone is deleted (affected by APFS snapshots). Only on files that may
@@ -223,14 +252,14 @@ struct Item {
 }
 
 impl Item {
-    fn of(n: &Node, dedup: u64, private: Option<u64>, rel: &Path, mode: SizeMode, known: bool) -> Item {
+    fn of(n: &Node, s: Sizes, private: Option<u64>, rel: &Path, mode: SizeMode, known: bool) -> Item {
         Item {
-            rank: mode.pick(n.size, dedup),
+            rank: mode.pick(n.size, s.dedup),
             rel: rel.to_path_buf(),
             cat: n.cat,
             size: n.size,
-            dedup,
-            freeable: freeable_of(n, known),
+            dedup: s.dedup,
+            freeable: freeable_of(n, known).map(|_| s.freeable),
             clone: n.clone,
             private,
         }
@@ -268,15 +297,26 @@ impl Ord for Item {
     }
 }
 
+/// Sizes of a node that, for a file, depend on its parent's records.
+#[derive(Clone, Copy)]
+struct Sizes {
+    dedup: u64,
+    freeable: u64,
+}
+
 /// Depth-first walk below `node` like [`crate::scan::walk`], also passing
-/// each node's deduplicated size and whether its path has a non-UTF-8
-/// (lossy) name.
-fn walk(node: &Node, rel: &mut PathBuf, lossy: bool, f: &mut impl FnMut(&Node, u64, &Path, bool) -> bool) {
+/// each node's deduplicated and freeable sizes and whether its path has a
+/// non-UTF-8 (lossy) name.
+fn walk(node: &Node, rel: &mut PathBuf, lossy: bool, f: &mut impl FnMut(&Node, Sizes, &Path, bool) -> bool) {
     let Some(d) = &node.dir else { return };
     for (i, c) in d.children.iter().enumerate() {
         rel.push(&*c.name);
         let lossy = lossy || c.lossy;
-        if f(c, d.child_dedup(i), rel, lossy) && c.is_dir() {
+        let sizes = Sizes {
+            dedup: d.child_dedup(i),
+            freeable: d.child_freeable(i),
+        };
+        if f(c, sizes, rel, lossy) && c.is_dir() {
             walk(c, rel, lossy, f);
         }
         rel.pop();
@@ -308,13 +348,13 @@ pub fn ranked_children(root: &Node, mode: SizeMode) -> Vec<usize> {
 }
 
 pub fn build(root: &Node, root_path: &Path, meta: &Meta, top: usize) -> Report {
-    let known = freeable_known(meta.clones && meta.clone_ids, meta.shares);
+    let known = freeable_known(detected(meta.clones, meta.clone_ids, meta.reflink_fs), meta.shares);
     let cats = root.cats();
     let mode = meta.size_mode;
 
     let mut special = TopN::new(top);
     let mut files = TopN::new(top);
-    walk(root, &mut PathBuf::new(), false, &mut |n, dedup, p, lossy| {
+    walk(root, &mut PathBuf::new(), false, &mut |n, sizes, p, lossy| {
         let list = if n.special {
             &mut special
         } else if !n.is_dir() {
@@ -322,11 +362,11 @@ pub fn build(root: &Node, root_path: &Path, meta: &Meta, top: usize) -> Report {
         } else {
             return true;
         };
-        let rank = mode.pick(n.size, dedup);
+        let rank = mode.pick(n.size, sizes.dedup);
         if list.accepts(|min: &Item| rank > min.rank) {
             list.push(Item::of(
                 n,
-                dedup,
+                sizes,
                 private_of(meta.private, n, p, lossy),
                 p,
                 mode,
@@ -370,7 +410,8 @@ pub fn build(root: &Node, root_path: &Path, meta: &Meta, top: usize) -> Report {
                     special: c.special.then(|| c.cat.label()),
                     top_categories: shares(&c.cats(), c.size, 3),
                     dedup_bytes: dedup,
-                    freeable_min_bytes: freeable_of(c, known),
+                    freeable_min_bytes: freeable_of(c, known)
+                        .map(|_| root.dir.as_ref().map_or(0, |d| d.child_freeable(i))),
                     clone: c.clone,
                     private_bytes: private_of(meta.private, c, Path::new(&*c.name), c.lossy),
                 }
@@ -378,6 +419,15 @@ pub fn build(root: &Node, root_path: &Path, meta: &Meta, top: usize) -> Report {
             .collect(),
         special_dirs: special.into_sorted().into_iter().map(|i| i.entry(root_path)).collect(),
         largest_files: files.into_sorted().into_iter().map(|i| i.entry(root_path)).collect(),
+    }
+}
+
+/// What the text report calls shared blocks, by `clone_detection`: every
+/// FIEMAP state (`fiemap`, `fiemap-partial`) reads shared extents.
+fn shared_label(clone_detection: &str) -> &'static str {
+    match clone_detection.starts_with("fiemap") {
+        true => "shared extents",
+        false => "APFS clones",
     }
 }
 
@@ -393,7 +443,8 @@ pub fn to_text(r: &Report, root: &Node) -> String {
         let frees = r.freeable_min_bytes.map(human).unwrap_or_else(|| "?".into());
         let _ = writeln!(
             out,
-            "(APFS clones: {} counted once is {}; deleting it all frees at least {})",
+            "({}: {} counted once is {}; deleting it all frees at least {})",
+            shared_label(r.accounting.clone_detection),
             r.size,
             human(r.dedup_bytes),
             frees
@@ -470,15 +521,15 @@ pub fn find(
 ) -> Vec<Entry> {
     let mut list = TopN::new(top);
     let want_dirs = cat.is_dir_kind();
-    walk(root, &mut PathBuf::new(), false, &mut |n, dedup, p, lossy| {
+    walk(root, &mut PathBuf::new(), false, &mut |n, sizes, p, lossy| {
         let hit = if want_dirs {
             n.special && n.cat == cat
         } else {
             !n.is_dir() && n.cat == cat
         };
-        let rank = mode.pick(n.size, dedup);
+        let rank = mode.pick(n.size, sizes.dedup);
         if hit && list.accepts(|min: &Item| rank > min.rank) {
-            list.push(Item::of(n, dedup, private_of(private, n, p, lossy), p, mode, known));
+            list.push(Item::of(n, sizes, private_of(private, n, p, lossy), p, mode, known));
         }
         !(hit && want_dirs)
     });
@@ -551,6 +602,7 @@ mod tests {
             shares: true,
             size_mode: SizeMode::Du,
             private: Some(&table),
+            reflink_fs: None,
         };
         let r = build(&root, &d, &meta, 10);
         let by_size = |l: &[Entry], size: u64| l.iter().find(|e| e.size_bytes == size).unwrap().private_bytes;
@@ -575,6 +627,7 @@ mod tests {
                 clone_ids,
                 clone_gaps,
                 shares: true,
+                reflink_fs: None,
                 size_mode: SizeMode::Du,
                 private: None,
             };
@@ -584,6 +637,57 @@ mod tests {
         assert_eq!(state(true, true, false), "apfs-full");
         assert_eq!(state(true, true, true), "apfs-partial");
         assert_eq!(state(true, false, true), "unsupported");
+    }
+
+    /// No freeable bound where files may share blocks unless they were
+    /// detected (APFS clone flags, or shared extents read with `--clones`);
+    /// shared extents are reported as `fiemap`.
+    #[test]
+    fn freeable_needs_detection_where_blocks_may_be_shared() {
+        assert!(detected(true, false, Some(ReflinkFs::Btrfs)) && detected(true, true, None));
+        assert!(!detected(true, false, None) && !detected(false, true, None));
+        assert!(!freeable_known(false, true) && freeable_known(false, false) && freeable_known(true, true));
+        let meta = |clones, reflink_fs| Meta {
+            elapsed: Duration::ZERO,
+            cached_at: None,
+            unreadable: 0,
+            clones,
+            clone_ids: false,
+            clone_gaps: false,
+            shares: true,
+            reflink_fs,
+            size_mode: SizeMode::Du,
+            private: None,
+        };
+        let a = accounting(&meta(true, Some(ReflinkFs::Btrfs)));
+        assert_eq!(a.clone_detection, "fiemap");
+        assert!(a.caveats.contains(&"snapshots-counted-as-shared"));
+        let a = accounting(&meta(true, Some(ReflinkFs::Xfs)));
+        assert_eq!(
+            (a.clone_detection, a.caveats),
+            ("fiemap", vec!["shared-extents-not-freeable"])
+        );
+        assert_eq!(accounting(&meta(false, Some(ReflinkFs::Xfs))).clone_detection, "off");
+        assert_eq!(accounting(&meta(true, None)).clone_detection, "unsupported");
+        let gaps = Meta {
+            clone_gaps: true,
+            ..meta(true, Some(ReflinkFs::Xfs))
+        };
+        let a = accounting(&gaps);
+        assert_eq!(a.clone_detection, "fiemap-partial");
+        assert!(a.caveats.contains(&"shared-extents-missing-for-some-files"));
+    }
+
+    #[test]
+    fn shared_blocks_are_labelled_by_detection() {
+        for (state, label) in [
+            ("fiemap", "shared extents"),
+            ("fiemap-partial", "shared extents"),
+            ("apfs-full", "APFS clones"),
+            ("apfs-partial", "APFS clones"),
+        ] {
+            assert_eq!(shared_label(state), label, "{state}");
+        }
     }
 
     #[test]

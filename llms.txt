@@ -9,6 +9,7 @@ Agent usage: always pass `--json` or `--report`; plain `dutype PATH` opens an in
 - `dutype --json --category NAME PATH`: largest items of one category, e.g. `node_modules`, `Python env`, `Build output`, `Video`, `PDF`. Directory categories return directories, file categories return files.
 - `dutype --json --private PATH` (macOS/APFS): files that are partial clones get `private_bytes`, the bytes freed immediately if that file alone is deleted (0 for files older than an APFS local snapshot; never summed into folders). `accounting.private` says whether they were collected. Opt-in; implies `--clones`.
 - `dutype --top N`: list lengths (default 20). `--cross-fs`: descend into other mounts.
+- `dutype --json --clones PATH`: detect shared blocks (slower): APFS clones on macOS; on Linux btrfs / XFS / bcachefs, shared extents (one FIEMAP ioctl per file), so `dedup_bytes` counts reflinked copies and snapshot-shared data once, like `btrfs filesystem du`'s "Set shared", and `freeable_min_bytes` never includes shared extents. Without it `freeable_min_bytes` is null on macOS and those filesystems. `accounting.clone_detection` says what was detected (`fiemap`, `fiemap-partial`, `apfs-full`, `apfs-partial`, `unsupported` or `off`).
 - `dutype --dump-config`: every category and its rules (TOML). Users extend them in `~/.config/dutype/config.toml`.
 - `dutype --mcp`: MCP server on stdio with read-only tools `disk_usage` and `find_by_category` (arguments `path`, `top`, `cross_fs`, `refresh`, `clones`, `size_mode`; same fields as `--json`).
 
