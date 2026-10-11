@@ -255,6 +255,13 @@ fn parse(fd: &Fd, d: &[u8], clones: bool, stats: &mut ReadStats) -> Option<Entry
         }
         false => 0,
     };
+    // Only a family with other members matters: a file that shares all
+    // its blocks has at least one identical clone. Without its clone id
+    // (skipped by the volume) it is a gap: shared, but not grouped.
+    let clone = clone_id.filter(|_| flags & EF_SHARES_ALL_BLOCKS != 0);
+    if flags & EF_SHARES_ALL_BLOCKS != 0 && clone.is_none() {
+        stats.clone_gaps += 1;
+    }
     Some(Entry {
         name: name.to_os_string(),
         dir: false,
@@ -262,15 +269,12 @@ fn parse(fd: &Fd, d: &[u8], clones: bool, stats: &mut ReadStats) -> Option<Entry
         dev,
         ino,
         nlink: nlink as u64,
-        // Only a family with other members matters: a file that shares all
-        // its blocks has at least one identical clone.
-        clone: clone_id.filter(|_| flags & EF_SHARES_ALL_BLOCKS != 0),
-        may_share: flags & EF_MAY_SHARE_BLOCKS != 0,
+        clone,
+        // EF_SHARES_ALL_BLOCKS implies EF_MAY_SHARE_BLOCKS.
+        may_share: flags & (EF_MAY_SHARE_BLOCKS | EF_SHARES_ALL_BLOCKS) != 0,
     })
 }
 
-/// Fallback for an entry whose bulk attributes are incomplete or describe
-/// another filesystem.
 /// [`lstat_at`] from [`parse`]: with `clones`, a file read this way is a gap
 /// in clone coverage.
 fn fallback(fd: &Fd, name: &OsStr, clones: bool, stats: &mut ReadStats) -> Option<Entry> {
@@ -279,8 +283,10 @@ fn fallback(fd: &Fd, name: &OsStr, clones: bool, stats: &mut ReadStats) -> Optio
     Some(e)
 }
 
-/// With `clones`, a file read this way has unknown clone flags, so it
-/// counts as one that may share blocks (never as freeable).
+/// Fallback for an entry whose bulk attributes are incomplete or describe
+/// another filesystem. With `clones`, a file read this way has unknown
+/// clone flags, so it counts as one that may share blocks (never as
+/// freeable).
 fn lstat_at(fd: &Fd, name: &OsStr, clones: bool) -> Option<Entry> {
     let cname = CString::new(name.as_bytes()).ok()?;
     let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
@@ -458,6 +464,11 @@ mod tests {
         assert!(!parse_rec(both, 0, true).may_share);
         assert!(parse_rec(both, EF_MAY_SHARE_BLOCKS, true).may_share);
         assert_eq!(parse_rec(both, EF_SHARES_ALL_BLOCKS, true).clone, Some(42));
+        // A full clone whose clone id was skipped: shared, ungrouped, a gap.
+        let flags_only = libc::ATTR_CMNEXT_EXT_FLAGS;
+        let mut stats = ReadStats::default();
+        let e = parse(&fd, &file_record(flags_only, EF_SHARES_ALL_BLOCKS), true, &mut stats).unwrap();
+        assert!(e.may_share && e.clone.is_none() && stats.clone_gaps == 1);
         assert_eq!(parse_rec(0, 0, true).alloc, 16384);
         std::fs::remove_dir_all(&d).unwrap();
     }
