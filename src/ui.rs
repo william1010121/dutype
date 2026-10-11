@@ -537,7 +537,12 @@ fn draw_breakdown(f: &mut Frame, app: &mut App, area: Rect) {
         .block(
             panel(title, focused).title(
                 Line::from(Span::styled(
-                    " ⏎ list files ",
+                    // Category sizes stay allocated (du) sizes in dedup mode.
+                    if app.size_mode == SizeMode::Dedup {
+                        " du sizes · ⏎ list files "
+                    } else {
+                        " ⏎ list files "
+                    },
                     Style::new().fg(if focused { MUTED } else { DIM }),
                 ))
                 .right_aligned(),
