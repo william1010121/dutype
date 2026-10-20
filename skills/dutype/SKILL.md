@@ -14,8 +14,8 @@ Directory rules win over extensions: everything inside `node_modules/` counts as
 ```bash
 dutype --json PATH                        # full report as JSON
 dutype --json --top 50 PATH               # longer lists
-dutype --json --category node_modules PATH   # every node_modules with its size
-dutype --json --category "Python env" ~      # every venv / conda env
+dutype --json --category node_modules PATH   # largest node_modules with sizes (default: 20)
+dutype --json --category "Python env" ~      # largest venvs / conda envs (default: 20)
 dutype --json --category Video ~/Movies      # biggest video files
 dutype --json --clones PATH               # macOS: also detect APFS clones (slower)
 dutype --json --size-mode dedup PATH      # rank by size with APFS clones counted once (implies --clones)
@@ -58,6 +58,10 @@ before the top-N limit; a matching directory counts once and prunes descendants.
 complete: `unreadable` is scan-wide and unclassifiable entries are not inferred.
 Text totals cover only displayed items. CLI `--top 0` still counts matches;
 MCP `top` remains 1–500.
+
+For a category inventory, increase CLI `--top` to at least `matched_items`
+and check that `items_truncated` is false in the result. This lists all matches
+in that snapshot, not a guarantee that unreadable entries were classified.
 
 ## Shared blocks (APFS clones, hard links)
 
@@ -120,4 +124,7 @@ per folder.
 with the same fields as `--json`. `size_mode` is `"du"` (default) or `"dedup"`
 (implies `clones: true`); `private: true` adds `private_bytes` (implies
 `clones: true`).
+With `dutype --mcp --cache`, `refresh: true` replaces the session's in-memory
+snapshot only; MCP never writes or replaces the CLI's disk cache. Use a CLI
+run with `--refresh` to update the disk snapshot used by future sessions.
 Claude Code: `claude mcp add dutype -- npx -y dutype --mcp`.
