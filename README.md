@@ -141,7 +141,8 @@ you and is set to mode 0700, snapshots to 0600. `--json` reports `cached_at`
 | `Tab` | switch between the folder list and the breakdown |
 | `m` | categories ⇄ extensions |
 | `c` | sizes: allocated (like `du`) ⇄ deduplicated (APFS clones or shared extents counted once; needs `--clones`) |
-| `o` | reveal in Finder / Explorer / file manager |
+| `s` | in a category/extension result popup: jump inside dutype to the directory, or select the file in its parent |
+| `o` | reveal in Finder / Explorer / file manager (also `Enter` in a result popup) |
 | `y` | copy the selected path to the clipboard (OSC 52 over SSH) |
 | `r` | rescan the current folder only (fast; updates the `--cache`) |
 | `R` | rescan everything from the root |

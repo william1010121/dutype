@@ -1,6 +1,6 @@
 use crate::category::{self, Category, by_size, reg};
 use crate::report::SizeMode;
-use crate::scan::{Node, TopN, walk, walk_with_ancestors};
+use crate::scan::{Node, TopN, walk};
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::widgets::TableState;
 use std::collections::HashMap;
@@ -78,11 +78,20 @@ impl From<&str> for Step {
     }
 }
 
+pub struct PopupItem {
+    /// Relative to the folder the popup was opened in; display only.
+    pub path: PathBuf,
+    pub size: u64,
+    /// Real path for reveal/copy, unavailable for ambiguous non-UTF-8 names.
+    pub fs_path: Option<PathBuf>,
+    /// Child indices from the current folder in this snapshot. Never resolve
+    /// the display path: distinct raw names can render identically.
+    target: Vec<usize>,
+}
+
 pub struct Popup {
     pub title: String,
-    /// (path relative to the folder the popup was opened in, for display;
-    /// size; real path on disk, `None` if a non-UTF-8 name is ambiguous).
-    pub items: Vec<(PathBuf, u64, Option<PathBuf>)>,
+    pub items: Vec<PopupItem>,
     pub state: TableState,
 }
 
@@ -424,6 +433,8 @@ impl App {
     /// Run `f` on the tree in du order, the order scans give and caches
     /// store, and go back to the current order afterwards.
     pub fn in_du_order<T>(&mut self, f: impl FnOnce(&mut Node) -> T) -> T {
+        // The callback gets mutable tree access, including in du mode.
+        self.popup = None;
         if self.size_mode == SizeMode::Du {
             return f(&mut self.root);
         }
@@ -604,6 +615,7 @@ impl App {
             KeyCode::Tab | KeyCode::BackTab => ("⇥ Tab".to_string(), "switch pane"),
             KeyCode::Char('m') => ("m".to_string(), "category / extension"),
             KeyCode::Char('c') => ("c".to_string(), "du / dedup size"),
+            KeyCode::Char('s') if popup => ("s".to_string(), "jump in TUI"),
             KeyCode::Char('o') => ("o".to_string(), "reveal"),
             KeyCode::Char('y') => ("y".to_string(), "copy path"),
             KeyCode::Char('r') if !popup => ("r".to_string(), "rescan folder"),
@@ -624,9 +636,10 @@ impl App {
             KeyCode::Down | KeyCode::Char('j') => step(&mut popup.state, len, 1),
             KeyCode::PageUp => step(&mut popup.state, len, -15),
             KeyCode::PageDown => step(&mut popup.state, len, 15),
+            KeyCode::Char('s') => self.jump_to_result(),
             KeyCode::Char('o') | KeyCode::Enter | KeyCode::Char('y') => {
                 let Some(i) = popup.state.selected() else { return };
-                match popup.items[i].2.clone() {
+                match popup.items[i].fs_path.clone() {
                     Some(path) if key.code == KeyCode::Char('y') => self.copy(&path),
                     Some(path) => reveal(&path),
                     None => self.status = Some("cannot resolve this non-UTF-8 name".into()),
@@ -665,6 +678,43 @@ impl App {
         }
     }
 
+    /// Enter a result directory, or select a result file in its parent. Each
+    /// ancestor keeps its selected child, just like ordinary folder entry.
+    fn jump_to_result(&mut self) {
+        let Some(target) = self.popup.as_ref().and_then(|p| {
+            p.state
+                .selected()
+                .and_then(|i| p.items.get(i))
+                .map(|item| item.target.clone())
+        }) else {
+            return;
+        };
+        // Validate the whole chain before changing any navigation state.
+        // Refresh/re-sort always closes the popup in restore(), so indices
+        // cannot outlive the snapshot/order that supplied them.
+        let mut node = self.current();
+        for &i in &target {
+            let Some(child) = node.children().get(i) else {
+                self.popup = None;
+                self.status = Some("result is no longer in this snapshot".into());
+                return;
+            };
+            node = child;
+        }
+        self.popup = None;
+        self.focus = Focus::Entries;
+        for i in target {
+            self.states.last_mut().unwrap().select(Some(i));
+            let child = &self.current().children()[i];
+            if child.is_dir() {
+                let state = first_selected(child.children().len());
+                self.stack.push(i);
+                self.states.push(state);
+            }
+        }
+        self.refresh_breakdown();
+    }
+
     fn open_popup(&mut self) {
         let Some(item) = self.breakdown_state.selected().and_then(|i| self.breakdown.get(i)) else {
             return;
@@ -673,56 +723,79 @@ impl App {
         let cur = self.current();
         let by_dedup = self.size_mode == SizeMode::Dedup;
         let mut top = TopN::new(POPUP_LIMIT);
-        // The real path is resolved through the node chain (raw-name aware)
-        // only for items that make the cut.
-        let mut push = |n: &Node, dedup: u64, path: &Path, ancestors: &[&Node]| {
-            let size = if by_dedup { dedup } else { n.size };
-            if top.accepts(|min: &(u64, PathBuf, Option<PathBuf>)| size > min.0) {
-                let fs = base
-                    .as_deref()
-                    .and_then(|b| crate::scan::resolve_chain(b, ancestors, n));
-                top.push((size, path.to_path_buf(), fs));
-            }
+        let mut title = match &item.key {
+            Key::Cat(c) if c.is_dir_kind() => format!("{} directories", c.label()),
+            Key::Cat(c) => format!("{} files", c.label()),
+            Key::Ext(e) => format!("*.{e} files"),
         };
-        let mut title;
-        match &item.key {
-            // For directory kinds, list the special directories themselves.
-            Key::Cat(c) if c.is_dir_kind() => {
-                title = format!("{} directories", c.label());
-                walk_with_ancestors(cur, &mut PathBuf::new(), &mut Vec::new(), &mut |n, d, p, a| {
-                    if n.special && n.cat == *c {
-                        push(n, d, p, a);
-                        return false;
+        walk_popup(
+            cur,
+            &mut PathBuf::new(),
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &mut |n, dedup, path, ancestors, indices| {
+                let matches = match &item.key {
+                    Key::Cat(c) if c.is_dir_kind() => n.special && n.cat == *c,
+                    Key::Cat(c) => !n.is_dir() && n.cat == *c,
+                    Key::Ext(e) => !n.is_dir() && ext_key(&n.name) == *e,
+                };
+                if matches {
+                    let size = if by_dedup { dedup } else { n.size };
+                    if top.accepts(|min: &(u64, PathBuf, Option<PathBuf>, Vec<usize>)| size > min.0) {
+                        // Resolve filesystem paths only for the existing external
+                        // actions. Jumping uses captured indices, even if fs is None.
+                        let fs = base
+                            .as_deref()
+                            .and_then(|b| crate::scan::resolve_chain(b, ancestors, n));
+                        top.push((size, path.to_path_buf(), fs, indices.to_vec()));
                     }
-                    true
-                });
-            }
-            Key::Cat(c) => {
-                title = format!("{} files", c.label());
-                walk_with_ancestors(cur, &mut PathBuf::new(), &mut Vec::new(), &mut |n, d, p, a| {
-                    if !n.is_dir() && n.cat == *c {
-                        push(n, d, p, a);
-                    }
-                    true
-                });
-            }
-            Key::Ext(e) => {
-                title = format!("*.{e} files");
-                walk_with_ancestors(cur, &mut PathBuf::new(), &mut Vec::new(), &mut |n, d, p, a| {
-                    if !n.is_dir() && ext_key(&n.name) == *e {
-                        push(n, d, p, a);
-                    }
-                    true
-                });
-            }
-        }
+                }
+                // A matching directory represents its whole special subtree.
+                !(matches && n.is_dir())
+            },
+        );
         if by_dedup {
             title.push_str(" · clones counted once");
         }
-        let items: Vec<_> = top.into_sorted().into_iter().map(|(s, p, fs)| (p, s, fs)).collect();
+        let items: Vec<_> = top
+            .into_sorted()
+            .into_iter()
+            .map(|(size, path, fs_path, target)| PopupItem {
+                path,
+                size,
+                fs_path,
+                target,
+            })
+            .collect();
         let state = first_selected(items.len());
         self.popup = Some(Popup { title, items, state });
     }
+}
+
+/// Popup traversal carries snapshot indices alongside the existing display
+/// path and raw-name-aware ancestor chain. State grows with depth, not tree size;
+/// only retained top-N candidates copy it. No filesystem access is needed here.
+fn walk_popup<'a>(
+    node: &'a Node,
+    rel: &mut PathBuf,
+    ancestors: &mut Vec<&'a Node>,
+    indices: &mut Vec<usize>,
+    f: &mut impl FnMut(&'a Node, u64, &Path, &[&'a Node], &[usize]) -> bool,
+) {
+    stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
+        let Some(dir) = node.dir.as_deref() else { return };
+        for (i, child) in dir.children.iter().enumerate() {
+            rel.push(&*child.name);
+            indices.push(i);
+            if f(child, dir.child_dedup(i), rel, ancestors, indices) && child.is_dir() {
+                ancestors.push(child);
+                walk_popup(child, rel, ancestors, indices, f);
+                ancestors.pop();
+            }
+            indices.pop();
+            rel.pop();
+        }
+    });
 }
 
 /// Re-sort the dirs whose order can depend on the size mode: those with
@@ -893,6 +966,368 @@ mod tests {
         let names = |n: &Node| n.children().iter().map(|c| c.name.clone()).collect::<Vec<_>>();
         assert_eq!(names(a), names(b), "order under {}", a.name);
         a.children().iter().zip(b.children()).for_each(|(x, y)| same(x, y));
+    }
+
+    fn jump_file(name: &str, size: u64) -> Node {
+        Node {
+            name: name.into(),
+            size,
+            cat: reg().classify_file(name),
+            special: false,
+            hardlink: false,
+            lossy: false,
+            clone: false,
+            dir: None,
+        }
+    }
+
+    fn jump_dir(name: &str, children: Vec<Node>) -> Node {
+        let mut cats = vec![0; reg().len()].into_boxed_slice();
+        for child in &children {
+            for (total, size) in cats.iter_mut().zip(child.cats()) {
+                *total += size;
+            }
+        }
+        Node {
+            name: name.into(),
+            size: children.iter().map(|c| c.size).sum(),
+            cat: reg().other(),
+            special: false,
+            hardlink: false,
+            lossy: false,
+            clone: children.iter().any(|c| c.clone),
+            dir: Some(Box::new(crate::scan::DirInfo {
+                cats,
+                files: children.iter().map(Node::files).sum(),
+                errors: 0,
+                children,
+                free_base: 0,
+                clones: None,
+            })),
+        }
+    }
+
+    fn jump_app(root: Node) -> App {
+        App::new(root, PathBuf::from("/synthetic-not-on-disk"), Duration::ZERO, 0)
+    }
+
+    fn jump_popup(app: &mut App, key: Key) {
+        app.focus = Focus::Breakdown;
+        app.breakdown = vec![BreakdownItem {
+            key,
+            label: "fixture".into(),
+            cat: reg().other(),
+            size: 0,
+            count: None,
+        }];
+        app.breakdown_state.select(Some(0));
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+    }
+
+    fn press(app: &mut App, code: KeyCode) {
+        app.handle_key(KeyEvent::from(code));
+    }
+
+    fn consistent_history(app: &App) {
+        assert_eq!(app.states.len(), app.stack.len() + 1);
+        for (depth, &index) in app.stack.iter().enumerate() {
+            assert_eq!(app.states[depth].selected(), Some(index));
+        }
+        for depth in 0..app.states.len() {
+            let node = node_at(&app.root, &app.stack[..depth]);
+            match app.states[depth].selected() {
+                Some(i) => assert!(i < node.children().len()),
+                None => assert!(node.children().is_empty()),
+            }
+        }
+        assert!(app.rescan.is_none());
+        assert!(!app.quit);
+    }
+
+    #[test]
+    fn result_jump_files_preserve_nested_history_and_repeat() {
+        for mode in [Mode::Category, Mode::Extension] {
+            let mut app = jump_app(jump_dir(
+                "root",
+                vec![jump_dir(
+                    "start",
+                    vec![
+                        jump_file("direct.pdf", 1),
+                        jump_dir("inner", vec![jump_file("small.pdf", 2), jump_file("target.pdf", 10)]),
+                    ],
+                )],
+            ));
+            app.go_to(&["start".into()]);
+            app.mode = mode;
+            let key = || match mode {
+                Mode::Category => Key::Cat(reg().classify_file("target.pdf")),
+                Mode::Extension => Key::Ext("pdf".into()),
+            };
+            jump_popup(&mut app, key());
+            assert_eq!(app.popup.as_ref().unwrap().items[0].target, [1, 1]);
+            press(&mut app, KeyCode::Char('s'));
+            assert!(app.popup.is_none());
+            assert!(app.focus == Focus::Entries);
+            assert_eq!(app.stack, [0, 1]);
+            assert_eq!(app.selected_entry(), Some(1));
+            consistent_history(&app);
+            // Jumping to the same file from its own folder must not add history.
+            jump_popup(&mut app, key());
+            press(&mut app, KeyCode::Char('s'));
+            assert_eq!(app.stack, [0, 1]);
+            assert_eq!(app.selected_entry(), Some(1));
+            consistent_history(&app);
+            press(&mut app, KeyCode::Backspace);
+            assert_eq!(app.stack, [0]);
+            assert_eq!(app.selected_entry(), Some(1));
+            jump_popup(&mut app, key());
+            let popup = app.popup.as_mut().unwrap();
+            let direct = popup
+                .items
+                .iter()
+                .position(|i| i.path == Path::new("direct.pdf"))
+                .unwrap();
+            popup.state.select(Some(direct));
+            press(&mut app, KeyCode::Char('s'));
+            assert_eq!(app.stack, [0]);
+            assert_eq!(app.selected_entry(), Some(0));
+            consistent_history(&app);
+            press(&mut app, KeyCode::Left);
+            assert!(app.stack.is_empty());
+            assert_eq!(app.selected_entry(), Some(0));
+        }
+    }
+
+    #[test]
+    fn result_jump_directories_include_empty_and_prune_nested_matches() {
+        let cat = reg().find_by_name("node_modules").unwrap();
+        let special = |children| {
+            let mut n = jump_dir("node_modules", children);
+            n.cat = cat;
+            n.special = true;
+            n.dir.as_mut().unwrap().cats[cat.index()] = n.size;
+            n
+        };
+        let mut app = jump_app(jump_dir(
+            "root",
+            vec![
+                jump_dir("project", vec![special(vec![special(vec![jump_file("index.js", 10)])])]),
+                jump_dir("empty-project", vec![special(vec![])]),
+            ],
+        ));
+        for (row, expected) in [(0, vec![0, 0]), (1, vec![1, 0])] {
+            jump_popup(&mut app, Key::Cat(cat));
+            assert_eq!(app.popup.as_ref().unwrap().items.len(), 2);
+            app.popup.as_mut().unwrap().state.select(Some(row));
+            press(&mut app, KeyCode::Char('s'));
+            assert_eq!(app.stack, expected);
+            assert_eq!(app.selected_entry(), if row == 0 { Some(0) } else { None });
+            consistent_history(&app);
+            press(&mut app, KeyCode::Backspace);
+            press(&mut app, KeyCode::Left);
+            assert!(app.stack.is_empty());
+        }
+    }
+
+    #[test]
+    fn result_jump_uses_indices_for_colliding_display_names_without_fs_paths() {
+        let tree = || {
+            let twin = || jump_dir("d\\xffir", vec![jump_file("f\\xff.pdf", 5), jump_file("f\\xff.pdf", 5)]);
+            let mut raw = twin();
+            raw.lossy = true;
+            raw.dir.as_mut().unwrap().children[0].lossy = true;
+            let mut literal = twin();
+            literal.dir.as_mut().unwrap().children[0].lossy = true;
+            jump_dir("root", vec![raw, literal])
+        };
+        for mode in [Mode::Category, Mode::Extension] {
+            for row in 0..4 {
+                let mut app = jump_app(tree());
+                let key = if mode == Mode::Category {
+                    Key::Cat(reg().classify_file("a.pdf"))
+                } else {
+                    Key::Ext("pdf".into())
+                };
+                jump_popup(&mut app, key);
+                let popup = app.popup.as_mut().unwrap();
+                assert_eq!(popup.items.len(), 4);
+                assert!(popup.items.iter().all(|i| i.path == popup.items[0].path));
+                let expected = popup.items[row].target.clone();
+                popup.items[row].fs_path = None;
+                popup.state.select(Some(row));
+                press(&mut app, KeyCode::Char('s'));
+                assert_eq!(app.stack, expected[..1]);
+                assert_eq!(app.selected_entry(), Some(expected[1]));
+                assert_eq!(app.current().lossy, expected[0] == 0);
+                assert_eq!(app.current().children()[expected[1]].lossy, expected[1] == 0);
+                consistent_history(&app);
+            }
+        }
+    }
+
+    #[test]
+    fn result_jump_empty_unmatched_and_invalid_targets_do_not_navigate() {
+        let mut app = jump_app(jump_dir("root", vec![jump_file("a.pdf", 1)]));
+        jump_popup(&mut app, Key::Ext("absent".into()));
+        press(&mut app, KeyCode::Char('s'));
+        assert!(app.popup.is_some());
+        consistent_history(&app);
+        press(&mut app, KeyCode::Esc);
+        for selected in [None, Some(100)] {
+            jump_popup(&mut app, Key::Ext("pdf".into()));
+            app.popup.as_mut().unwrap().state.select(selected);
+            press(&mut app, KeyCode::Char('s'));
+            assert!(app.popup.is_some());
+            consistent_history(&app);
+            press(&mut app, KeyCode::Esc);
+        }
+        for target in [vec![100], vec![0, 0]] {
+            jump_popup(&mut app, Key::Ext("pdf".into()));
+            app.popup.as_mut().unwrap().items[0].target = target;
+            press(&mut app, KeyCode::Char('s'));
+            assert!(app.popup.is_none());
+            assert!(app.status.as_deref().unwrap().contains("no longer"));
+            consistent_history(&app);
+        }
+    }
+
+    #[test]
+    fn result_jump_zero_sizes_ties_and_limit_keep_targets_aligned() {
+        let mut app = jump_app(jump_dir(
+            "root",
+            (0..POPUP_LIMIT + 5)
+                .map(|i| jump_file(&format!("{i}.pdf"), 0))
+                .collect(),
+        ));
+        for mode in [SizeMode::Du, SizeMode::Dedup] {
+            app.set_size_mode(mode);
+            jump_popup(&mut app, Key::Ext("pdf".into()));
+            let popup = app.popup.as_ref().unwrap();
+            assert_eq!(popup.items.len(), POPUP_LIMIT);
+            for item in &popup.items {
+                assert_eq!(item.size, 0);
+                assert_eq!(Path::new(&*node_at(&app.root, &item.target).name), item.path);
+            }
+            let target = popup.items.last().unwrap().target[0];
+            app.popup.as_mut().unwrap().state.select(Some(POPUP_LIMIT - 1));
+            press(&mut app, KeyCode::Char('s'));
+            assert_eq!(app.selected_entry(), Some(target));
+            consistent_history(&app);
+        }
+    }
+
+    #[test]
+    fn result_jump_dedup_zero_result_targets_resorted_file() {
+        let mut large = jump_file("large.pdf", 100);
+        large.clone = true;
+        let mut root = jump_dir("root", vec![large, jump_file("small.pdf", 10)]);
+        let clones = root.dir.as_mut().unwrap().clones_mut();
+        clones.dup = 100;
+        clones.shared = vec![crate::scan::Shared {
+            idx: 0,
+            key: (1, 1),
+            is_clone: true,
+            ino: 1,
+            nlink: 1,
+            refcnt: 1,
+            dup: true,
+            reflink: None,
+        }]
+        .into_boxed_slice();
+        let mut app = jump_app(root);
+        for (mode, expected_sizes) in [(SizeMode::Du, [100, 10]), (SizeMode::Dedup, [10, 0])] {
+            app.set_size_mode(mode);
+            jump_popup(&mut app, Key::Ext("pdf".into()));
+            let popup = app.popup.as_mut().unwrap();
+            assert_eq!(popup.items.iter().map(|i| i.size).collect::<Vec<_>>(), expected_sizes);
+            let row = popup
+                .items
+                .iter()
+                .position(|i| i.path == Path::new("large.pdf"))
+                .unwrap();
+            popup.state.select(Some(row));
+            press(&mut app, KeyCode::Char('s'));
+            let selected = app.selected_entry().unwrap();
+            assert_eq!(app.current().children()[selected].name.as_ref(), "large.pdf");
+            assert_eq!(selected, if mode == SizeMode::Du { 0 } else { 1 });
+            consistent_history(&app);
+        }
+    }
+
+    #[test]
+    fn result_jump_invalidates_on_refresh_sort_and_mutable_tree_access() {
+        let tree = || {
+            let mut large = jump_dir("large", vec![jump_file("large.pdf", 100)]);
+            large.clone = true;
+            large.dir.as_mut().unwrap().clones_mut().dup = 100;
+            jump_dir("root", vec![large, jump_dir("small", vec![jump_file("small.pdf", 10)])])
+        };
+        let mut app = jump_app(tree());
+        jump_popup(&mut app, Key::Ext("pdf".into()));
+        app.set_size_mode(SizeMode::Dedup);
+        assert!(app.popup.is_none());
+        assert_eq!(app.root.children()[0].name.as_ref(), "small");
+        jump_popup(&mut app, Key::Ext("pdf".into()));
+        press(&mut app, KeyCode::Char('s'));
+        assert_eq!(app.current().name.as_ref(), "large");
+        consistent_history(&app);
+        press(&mut app, KeyCode::Left);
+        jump_popup(&mut app, Key::Ext("pdf".into()));
+        app.replace_current(jump_dir("replacement", vec![jump_file("new.pdf", 2)]), false);
+        assert!(app.popup.is_none());
+        press(&mut app, KeyCode::Char('s'));
+        assert!(app.stack.is_empty());
+        for mode in [SizeMode::Du, SizeMode::Dedup] {
+            app.set_size_mode(mode);
+            jump_popup(&mut app, Key::Ext("pdf".into()));
+            app.in_du_order(|_| ());
+            assert!(app.popup.is_none());
+        }
+    }
+
+    #[test]
+    fn result_jump_leaves_reveal_copy_and_cancel_keys_unchanged() {
+        let mut app = jump_app(jump_dir("root", vec![jump_file("a.pdf", 1)]));
+        for code in [KeyCode::Enter, KeyCode::Char('o'), KeyCode::Char('y')] {
+            jump_popup(&mut app, Key::Ext("pdf".into()));
+            app.popup.as_mut().unwrap().items[0].fs_path = None;
+            press(&mut app, code); // Cannot invoke an external action without a filesystem path.
+            assert_eq!(app.status.as_deref(), Some("cannot resolve this non-UTF-8 name"));
+            assert!(app.popup.is_some());
+            assert!(app.stack.is_empty());
+            app.popup = None;
+        }
+        for code in [KeyCode::Esc, KeyCode::Left, KeyCode::Backspace, KeyCode::Char('q')] {
+            jump_popup(&mut app, Key::Ext("pdf".into()));
+            press(&mut app, code);
+            assert!(app.popup.is_none());
+            consistent_history(&app);
+        }
+        jump_popup(&mut app, Key::Ext("pdf".into()));
+        app.show_keys = true;
+        press(&mut app, KeyCode::Char('s'));
+        assert_eq!(app.last_key, Some(("s".into(), "jump in TUI")));
+    }
+
+    #[test]
+    fn result_jump_survives_tiny_render_and_resize() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut app = jump_app(jump_dir("root", vec![jump_dir("inner", vec![jump_file("a.pdf", 1)])]));
+        jump_popup(&mut app, Key::Ext("pdf".into()));
+        for (width, height) in [(120, 32), (40, 10), (20, 5), (1, 1), (0, 0), (80, 24), (120, 32)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+            if width >= 40 {
+                let text: String = terminal.backend().buffer().content.iter().map(|c| c.symbol()).collect();
+                assert!(text.contains("jump in TUI"));
+            }
+            assert_eq!(app.popup.as_ref().unwrap().state.selected(), Some(0));
+        }
+        press(&mut app, KeyCode::Char('s'));
+        assert_eq!(app.stack, [0]);
+        consistent_history(&app);
+        press(&mut app, KeyCode::Backspace);
+        assert!(app.stack.is_empty());
     }
 
     /// `r` keeps private sizes of the rest of the tree, replaces the
@@ -1173,7 +1608,7 @@ mod tests {
         let mut app = App::new(full(&root), root.clone(), Duration::ZERO, 0);
         app.open_popup();
         let popup = app.popup.as_ref().unwrap();
-        assert_eq!(popup.items[0].2, Some(weird.join("f.bin")));
+        assert_eq!(popup.items[0].fs_path, Some(weird.join("f.bin")));
     }
 
     /// An ancestor replaced by a symlink makes the checked path unavailable,
@@ -1266,11 +1701,11 @@ mod tests {
                 .unwrap()
                 .items
                 .iter()
-                .map(|i| i.1)
+                .map(|i| i.size)
                 .collect::<Vec<_>>()
         };
         assert_eq!(sizes(&app), [6 << 20, 4 << 20, 0, 0]);
-        assert_eq!(app.popup.as_ref().unwrap().items[1].0, Path::new("orig"));
+        assert_eq!(app.popup.as_ref().unwrap().items[1].path, Path::new("orig"));
         app.popup = None;
         app.set_size_mode(SizeMode::Du);
         app.open_popup();
