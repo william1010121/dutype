@@ -159,6 +159,7 @@ struct Hardlinks {
 }
 
 impl Hardlinks {
+    #[allow(clippy::too_many_arguments)]
     fn collect(
         &mut self,
         root: &Node,
@@ -262,157 +263,269 @@ fn finish_attribution(node: &mut Node, clones: bool, cancelled: &impl Fn() -> bo
 /// unknown `refcnt`) for the whole tree. `base` is the root's path on disk,
 /// to read family sizes; without it unknown ones stay unknown.
 pub fn account(root: &mut Node, base: Option<&Path>) {
+    // Monomorphization removes checks for retained cache/app trees.
+    let _ = account_while(root, base, &|| false);
+}
+
+/// Scan-only accounting. False means the tree is partial and MUST be discarded,
+/// never displayed, cached, or merged into an existing tree. Collection clears
+/// old aggregates and apply writes incrementally; cancellation is not rollback.
+/// Sorts, running filesystem probes, and allocation destruction cannot be
+/// interrupted. Retained-tree callers must use `account` instead.
+#[must_use]
+pub fn account_cancellable(root: &mut Node, base: Option<&Path>, cancel: &AtomicBool) -> bool {
+    account_while(root, base, &|| cancel.load(AtomicOrdering::Relaxed)).is_some()
+}
+
+#[inline]
+fn check(cancelled: &(impl Fn() -> bool + Sync), i: usize) -> Option<()> {
+    if i.is_multiple_of(256) && cancelled() {
+        None
+    } else {
+        Some(())
+    }
+}
+
+fn account_while(root: &mut Node, base: Option<&Path>, cancelled: &(impl Fn() -> bool + Sync)) -> Option<()> {
+    account_with_probe(root, base, cancelled, &clone_refcnt)
+}
+
+fn account_with_probe(
+    root: &mut Node,
+    base: Option<&Path>,
+    cancelled: &(impl Fn() -> bool + Sync),
+    probe: &(impl Fn(&Path) -> Option<u32> + Sync),
+) -> Option<()> {
+    check(cancelled, 0)?;
     let mut dirs = Vec::new();
     let mut members = Vec::new();
     let mut ranges = Vec::new();
-    collect(root, 0, 0, 0, &mut dirs, &mut members, &mut ranges);
+    collect(root, 0, 0, 0, &mut dirs, &mut members, &mut ranges, cancelled)?;
     if members.is_empty() {
-        return;
+        return check(cancelled, 0);
     }
-    // Per member position: bytes in its shared extents, and the part of
-    // them counted at another file. Empty without shared extents.
-    let (held, extent_dup) = match ranges.is_empty() {
-        true => (Vec::new(), Vec::new()),
-        false => extent_dups(root, &dirs, &members, ranges),
+    let (held, extent_dup) = if ranges.is_empty() {
+        (Vec::new(), Vec::new())
+    } else {
+        extent_dups(root, &dirs, &members, ranges, cancelled)?
     };
+    check(cancelled, 0)?;
     members.sort_unstable_by_key(|m| (m.is_clone, m.key, m.ino));
-    let mut groups: Vec<&mut [Member]> = members
-        .chunk_by_mut(|a, b| (a.is_clone, a.key) == (b.is_clone, b.key))
-        .collect();
-    let tree: &Node = root;
-
-    // Family sizes not read yet, for families with two or more inodes here
-    // (one inode alone always has a clone outside).
-    if let Some(base) = base {
-        let wanted: Vec<usize> = (0..groups.len())
-            .filter(|&i| {
-                let g = &groups[i];
-                g[0].is_clone && inodes(g) >= 2 && g.iter().any(|m| m.refcnt == 0)
-            })
-            .collect();
-        let read: Vec<u32> = wanted
-            .par_iter()
-            .map(|&i| {
-                let path = member_path(tree, &dirs, base, &groups[i][0]);
-                path.and_then(|p| clone_refcnt(&p)).unwrap_or(1)
-            })
-            .collect();
-        for (i, n) in wanted.into_iter().zip(read) {
-            groups[i].iter_mut().for_each(|m| m.refcnt = n);
+    check(cancelled, 0)?;
+    // Explicit boundaries keep even a single enormous family interruptible.
+    let mut boundaries = vec![0];
+    for i in 1..members.len() {
+        check(cancelled, i)?;
+        if (members[i - 1].is_clone, members[i - 1].key) != (members[i].is_clone, members[i].key) {
+            boundaries.push(i);
         }
     }
-
+    boundaries.push(members.len());
+    let mut wanted = Vec::new();
+    if base.is_some() {
+        for (i, pair) in boundaries.windows(2).enumerate() {
+            check(cancelled, i)?;
+            let g = &members[pair[0]..pair[1]];
+            if !g[0].is_clone {
+                continue;
+            }
+            let mut n = 0;
+            let mut unknown = false;
+            for (j, m) in g.iter().enumerate() {
+                check(cancelled, pair[0] + j)?;
+                n += usize::from(j == 0 || m.ino != g[j - 1].ino);
+                unknown |= m.refcnt == 0;
+            }
+            if n >= 2 && unknown {
+                wanted.push(pair[0]..pair[1]);
+            }
+        }
+    }
+    if let Some(base) = base {
+        let read: Option<Vec<u32>> = wanted
+            .par_iter()
+            .map(|g| {
+                check(cancelled, 0)?;
+                let path = member_path(root, &dirs, base, &members[g.start]);
+                check(cancelled, 0)?;
+                Some(path.and_then(|p| probe(&p)).unwrap_or(1))
+            })
+            .collect();
+        let read = read?;
+        check(cancelled, 0)?;
+        for (group, (g, n)) in wanted.into_iter().zip(read).enumerate() {
+            check(cancelled, group)?;
+            let start = g.start;
+            for (i, m) in members[g].iter_mut().enumerate() {
+                check(cancelled, start + i)?;
+                m.refcnt = n;
+            }
+        }
+    }
     let mut dup = vec![0u64; dirs.len()];
     let mut free = vec![0u64; dirs.len()];
-    // Per member (by position before sorting): counted elsewhere, refcnt.
-    let mut out = vec![(false, 0u32); members_len(&groups)];
+    let mut out = vec![(false, 0u32); members.len()];
     let mut path_a = Vec::new();
     let mut path_b = Vec::new();
-    for g in &groups {
+    for (i, pair) in boundaries.windows(2).enumerate() {
+        check(cancelled, i)?;
+        let g = &members[pair[0]..pair[1]];
         let is_clone = g[0].is_clone;
-        let n = inodes(g);
+        let mut rep = &g[0];
+        let mut n = 0;
+        let mut refcnt = 0;
+        let mut all_links = true;
+        let mut known = true;
+        let mut links = 0u64;
+        let mut expected_links = 0u64;
+        for (j, m) in g.iter().enumerate() {
+            check(cancelled, pair[0] + j)?;
+            if j == 0 || m.ino != g[j - 1].ino {
+                n += 1;
+                expected_links = m.nlink as u64;
+            }
+            links += 1;
+            if j + 1 == g.len() || m.ino != g[j + 1].ino {
+                all_links &= links >= expected_links;
+                links = 0;
+            }
+            refcnt = refcnt.max(m.refcnt as usize);
+            known &= m.refcnt >= 1;
+        }
         if is_clone && n >= 2 {
-            let mut rep = &g[0];
-            for m in &g[1..] {
-                if compare(tree, &dirs, m, rep, &mut path_a, &mut path_b) == Ordering::Less {
+            for (j, m) in g[1..].iter().enumerate() {
+                check(cancelled, pair[0] + j + 1)?;
+                if compare(root, &dirs, m, rep, &mut path_a, &mut path_b) == Ordering::Less {
                     rep = m;
                 }
             }
-            for m in g.iter().filter(|m| m.ino != rep.ino) {
+        }
+        for (j, m) in g.iter().enumerate() {
+            check(cancelled, pair[0] + j)?;
+            if is_clone && n >= 2 && m.ino != rep.ino {
                 dup[m.dir as usize] += m.size;
                 out[m.pos as usize].0 = true;
             }
-        }
-        for m in g.iter().filter(|m| m.reflinked) {
-            dup[m.dir as usize] += extent_dup[m.pos as usize];
-        }
-        for m in g.iter() {
+            if m.reflinked {
+                dup[m.dir as usize] += extent_dup[m.pos as usize];
+            }
             out[m.pos as usize].1 = m.refcnt;
         }
-        // Every link of every inode here, and for a clone family every inode.
-        let refcnt = g.iter().map(|m| m.refcnt).max().unwrap_or(0) as usize;
-        let all_links = g
-            .chunk_by(|a, b| a.ino == b.ino)
-            .all(|l| l.len() as u64 >= l[0].nlink as u64);
-        let complete = all_links
-            && match is_clone {
-                true => refcnt >= 2 && n >= refcnt,
-                // A link that may share blocks with another inode: never.
-                false => g.iter().all(|m| m.refcnt >= 1),
-            };
-        if complete {
-            // One copy: the bytes counted on the links of one inode.
-            // Shared extents are never freeable.
-            let private = |m: &Member| match m.reflinked {
-                true if m.opaque => 0,
-                true => m.size.saturating_sub(held[m.pos as usize]),
-                false => m.size,
-            };
-            let bytes = g
-                .chunk_by(|a, b| a.ino == b.ino)
-                .map(|l| l.iter().map(private).sum::<u64>())
-                .max()
-                .unwrap_or(0);
-            let lca = g[1..].iter().fold(g[0].dir, |a, m| lca(&dirs, a, m.dir));
-            free[lca as usize] += bytes;
+        if all_links && if is_clone { refcnt >= 2 && n >= refcnt } else { known } {
+            let mut inode_bytes = 0u64;
+            let mut bytes = 0u64;
+            let mut ancestor = g[0].dir;
+            for (j, m) in g.iter().enumerate() {
+                check(cancelled, pair[0] + j)?;
+                inode_bytes += match m.reflinked {
+                    true if m.opaque => 0,
+                    true => m.size.saturating_sub(held[m.pos as usize]),
+                    false => m.size,
+                };
+                if j + 1 == g.len() || m.ino != g[j + 1].ino {
+                    bytes = bytes.max(inode_bytes);
+                    inode_bytes = 0;
+                }
+                ancestor = lca(&dirs, ancestor, m.dir);
+            }
+            free[ancestor as usize] += bytes;
         }
     }
-    // Subtree totals: children come after their parent in pre-order.
     for i in (1..dirs.len()).rev() {
+        check(cancelled, i)?;
         let p = dirs[i].parent as usize;
         dup[p] += dup[i];
         free[p] += free[i];
     }
     let mut next = 0;
-    apply(root, &dirs, &mut next, &dup, &free, &out, &extent_dup);
+    apply(root, &dirs, &mut next, &dup, &free, &out, &extent_dup, cancelled)?;
+    check(cancelled, 0)
 }
 
 /// Members with shared extents: each shared physical segment stays at one of
 /// the files holding it (the first by [`compare`]); every other file holding
 /// it does not count it. Returns, per member position, the bytes in its
 /// shared extents and the part of them counted at another file.
-fn extent_dups(root: &Node, dirs: &[Dir], members: &[Member], mut ranges: Vec<Range>) -> (Vec<u64>, Vec<u64>) {
+fn extent_dups(
+    root: &Node,
+    dirs: &[Dir],
+    members: &[Member],
+    mut ranges: Vec<Range>,
+    cancelled: &(impl Fn() -> bool + Sync),
+) -> Option<(Vec<u64>, Vec<u64>)> {
     // Rank the members with extents by the stable rule (0 = preferred).
-    let mut ids: Vec<u32> = ranges.iter().map(|r| r.3).collect();
-    ids.dedup();
+    let mut ids = Vec::with_capacity(ranges.len().min(members.len()));
+    for (i, r) in ranges.iter().enumerate() {
+        check(cancelled, i)?;
+        if ids.last() != Some(&r.3) {
+            ids.push(r.3);
+        }
+    }
+    check(cancelled, 0)?;
     let (mut pa, mut pb) = (Vec::new(), Vec::new());
     ids.sort_by(|&a, &b| compare(root, dirs, &members[a as usize], &members[b as usize], &mut pa, &mut pb));
+    check(cancelled, 0)?;
     let mut rank = vec![0u32; members.len()];
     for (r, &id) in ids.iter().enumerate() {
+        check(cancelled, r)?;
         rank[id as usize] = r as u32;
     }
     let mut held = vec![0u64; members.len()];
-    for r in &ranges {
+    for (i, r) in ranges.iter().enumerate() {
+        check(cancelled, i)?;
         held[r.3 as usize] += r.2;
     }
     let mut credited = vec![0u64; ids.len()];
+    check(cancelled, 0)?;
     ranges.sort_unstable_by_key(|r| r.0);
-    for dev in ranges.chunk_by(|a, b| a.0 == b.0) {
-        let segs: Vec<(u64, u64, u32)> = dev.iter().map(|r| (r.1, r.2, rank[r.3 as usize])).collect();
-        credit(&segs, &mut credited);
+    check(cancelled, 0)?;
+    // Build per-device segments without an uninterruptible chunk scan.
+    let mut segs = Vec::new();
+    for (i, r) in ranges.iter().enumerate() {
+        check(cancelled, i)?;
+        if i > 0 && r.0 != ranges[i - 1].0 {
+            credit_while(&segs, &mut credited, cancelled)?;
+            segs.clear();
+        }
+        segs.push((r.1, r.2, rank[r.3 as usize]));
     }
+    credit_while(&segs, &mut credited, cancelled)?;
     let mut dup = vec![0u64; members.len()];
-    for &id in &ids {
+    for (j, &id) in ids.iter().enumerate() {
+        check(cancelled, j)?;
         let i = id as usize;
         dup[i] = held[i].min(members[i].size).saturating_sub(credited[rank[i] as usize]);
     }
-    (held, dup)
+    Some((held, dup))
 }
 
 /// The sweep: `ranges` are `(start, len, file)`; every stretch covered by at
 /// least one range is credited to the smallest `file` covering it. Adds the
 /// credited bytes to `credited[file]`.
+#[cfg(test)]
 pub(crate) fn credit(ranges: &[(u64, u64, u32)], credited: &mut [u64]) {
+    let _ = credit_while(ranges, credited, &|| false);
+}
+
+fn credit_while(
+    ranges: &[(u64, u64, u32)],
+    credited: &mut [u64],
+    cancelled: &(impl Fn() -> bool + Sync),
+) -> Option<()> {
     let mut events: Vec<(u64, bool, u32)> = Vec::with_capacity(ranges.len() * 2);
-    for &(start, len, file) in ranges {
+    for (i, &(start, len, file)) in ranges.iter().enumerate() {
+        check(cancelled, i)?;
         events.push((start, true, file));
         events.push((start.saturating_add(len), false, file));
     }
+    check(cancelled, 0)?;
     events.sort_unstable_by_key(|e| e.0);
+    check(cancelled, 0)?;
     // Files covering the current position, with how many of their ranges do.
     let mut active: BTreeMap<u32, u32> = BTreeMap::new();
     let mut prev = 0;
-    for (pos, open, file) in events {
+    for (i, (pos, open, file)) in events.into_iter().enumerate() {
+        check(cancelled, i)?;
         if pos > prev
             && let Some((&first, _)) = active.first_key_value()
         {
@@ -428,19 +541,12 @@ pub(crate) fn credit(ranges: &[(u64, u64, u32)], credited: &mut [u64]) {
             }
         }
     }
-}
-
-fn members_len(groups: &[&mut [Member]]) -> usize {
-    groups.iter().map(|g| g.len()).sum()
-}
-
-/// Inodes in a group (sorted by inode).
-fn inodes(g: &[Member]) -> usize {
-    g.chunk_by(|a, b| a.ino == b.ino).count()
+    Some(())
 }
 
 /// Visit the dirs that may hold group members or old results, resetting
 /// the results and collecting the members.
+#[allow(clippy::too_many_arguments)]
 fn collect(
     node: &mut Node,
     parent: u32,
@@ -449,9 +555,13 @@ fn collect(
     dirs: &mut Vec<Dir>,
     members: &mut Vec<Member>,
     ranges: &mut Vec<Range>,
-) {
+    cancelled: &(impl Fn() -> bool + Sync),
+) -> Option<()> {
     stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
-        let Some(d) = node.dir.as_deref_mut() else { return };
+        check(cancelled, 0)?;
+        let Some(d) = node.dir.as_deref_mut() else {
+            return Some(());
+        };
         let id = dirs.len() as u32;
         dirs.push(Dir {
             parent,
@@ -464,7 +574,9 @@ fn collect(
             c.group_free = 0;
         }
         for (slot, s) in d.shared().iter().enumerate() {
-            for &(start, len) in s.reflink.as_ref().map_or(&[][..], |r| &r.extents) {
+            check(cancelled, slot)?;
+            for (j, &(start, len)) in s.reflink.as_ref().map_or(&[][..], |r| &r.extents).iter().enumerate() {
+                check(cancelled, j)?;
                 ranges.push((s.key.0, start, len, members.len() as u32));
             }
             members.push(Member {
@@ -482,15 +594,18 @@ fn collect(
             });
         }
         for (i, c) in d.children.iter_mut().enumerate() {
+            check(cancelled, i)?;
             let stale = c.dir.as_ref().is_some_and(|d| d.dup() != 0 || d.group_free() != 0);
             if c.is_dir() && (c.hardlink || c.clone || stale) {
-                collect(c, id, i as u32, depth + 1, dirs, members, ranges);
+                collect(c, id, i as u32, depth + 1, dirs, members, ranges, cancelled)?;
             }
         }
-    });
+        Some(())
+    })
 }
 
 /// Write the results back, visiting the same dirs as [`collect`].
+#[allow(clippy::too_many_arguments)]
 fn apply(
     node: &mut Node,
     dirs: &[Dir],
@@ -499,8 +614,10 @@ fn apply(
     free: &[u64],
     out: &[(bool, u32)],
     extent_dup: &[u64],
-) {
+    cancelled: &(impl Fn() -> bool + Sync),
+) -> Option<()> {
     stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
+        check(cancelled, 0)?;
         let id = *next;
         *next += 1;
         let d = node.dir.as_deref_mut().expect("a collected dir");
@@ -510,6 +627,7 @@ fn apply(
             c.group_free = free[id];
             let first = dirs[id].first as usize;
             for (k, (s, &(is_dup, refcnt))) in c.shared.iter_mut().zip(&out[first..]).enumerate() {
+                check(cancelled, k)?;
                 s.dup = is_dup;
                 s.refcnt = refcnt;
                 if let Some(r) = &mut s.reflink {
@@ -520,9 +638,10 @@ fn apply(
         }
         while *next < dirs.len() && dirs[*next].parent as usize == id {
             let c = dirs[*next].child as usize;
-            apply(&mut d.children[c], dirs, next, dup, free, out, extent_dup);
+            apply(&mut d.children[c], dirs, next, dup, free, out, extent_dup, cancelled)?;
         }
-    });
+        Some(())
+    })
 }
 
 /// Child indices from the root down to dir `id`.
@@ -1093,6 +1212,249 @@ mod synthetic {
                 assert_eq!(d.child_dedup(i), if c.lossy { 0 } else { S });
             }
         }
+    }
+
+    // Exercise one enormous family, many groups, one file with many ranges,
+    // nested/stale aggregates and apply's per-record loop on every platform.
+    fn cancellable_tree(extents: bool, many_groups: bool) -> Node {
+        let files = (0..600).map(|i| file(&format!("c{i:04}"), true)).collect();
+        let mut root = dir("root", vec![dir("nested", files), file("c_outside", true)]);
+        fn setup(node: &mut Node, extents: bool, many_groups: bool) {
+            if let Some(d) = node.dir.as_mut() {
+                for (i, s) in d.clones_mut().shared.iter_mut().enumerate() {
+                    s.ino = i as u64 + 1;
+                    s.key = (1, if many_groups { (i / 2) as u64 } else { 100 });
+                    s.refcnt = if many_groups { 2 } else { 601 };
+                    if extents {
+                        s.is_clone = false;
+                        s.refcnt = 1;
+                        s.reflink = Some(Box::new(crate::scan::Reflink {
+                            extents: if i == 0 {
+                                (0..600).map(|j| (j * 4, 4)).collect()
+                            } else {
+                                vec![(0, S)].into()
+                            },
+                            dup: 0,
+                            opaque: i == 3,
+                        }));
+                    }
+                }
+                for c in &mut d.children {
+                    setup(c, extents, many_groups);
+                }
+            }
+        }
+        setup(&mut root, extents, many_groups);
+        root
+    }
+
+    fn snapshot(node: &Node) -> Vec<(String, u64, u64, u64, Vec<Shared>)> {
+        let mut out = vec![(
+            node.name.to_string(),
+            node.size,
+            node.dedup(),
+            node.freeable(),
+            node.dir.as_ref().map_or_else(Vec::new, |d| d.shared().to_vec()),
+        )];
+        for c in node.children() {
+            out.extend(snapshot(c));
+        }
+        out
+    }
+
+    #[test]
+    fn accounting_cancels_at_every_boundary_and_matches_retained_accounting() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for extents in [false, true] {
+            for many_groups in [false, true] {
+                let mut expected = cancellable_tree(extents, many_groups);
+                account(&mut expected, None);
+                let expected = snapshot(&expected);
+                let count = AtomicUsize::new(0);
+                let mut complete = cancellable_tree(extents, many_groups);
+                assert!(
+                    super::account_while(&mut complete, None, &|| {
+                        count.fetch_add(1, Ordering::Relaxed);
+                        false
+                    })
+                    .is_some()
+                );
+                assert_eq!(snapshot(&complete), expected);
+                // Test both fresh and already-accounted trees: incomplete old
+                // metadata must never be mistaken for a valid retained tree.
+                for stale in [false, true] {
+                    for boundary in 0..count.load(Ordering::Relaxed) {
+                        let mut root = cancellable_tree(extents, many_groups);
+                        if stale {
+                            account(&mut root, None);
+                        }
+                        let calls = AtomicUsize::new(0);
+                        assert!(
+                            super::account_while(&mut root, None, &|| {
+                                calls.fetch_add(1, Ordering::Relaxed) >= boundary
+                            })
+                            .is_none()
+                        );
+                        assert_eq!(calls.load(Ordering::Relaxed), boundary + 1);
+                        // No size/category/index mutations, even during apply.
+                        fn check(n: &Node) {
+                            if let Some(d) = &n.dir {
+                                assert_eq!(n.size, d.children.iter().map(|c| c.size).sum::<u64>());
+                                assert_eq!(n.size, d.cats.iter().sum::<u64>());
+                                for s in d.shared() {
+                                    assert!(d.children[s.idx as usize].name.starts_with('c'));
+                                }
+                                for c in &d.children {
+                                    check(c);
+                                }
+                            }
+                        }
+                        check(&root);
+                        drop(root); // The only allowed use of an incomplete result.
+                    }
+                }
+                account(&mut complete, None);
+                assert_eq!(snapshot(&complete), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn identical_extent_offsets_on_different_devices_are_independent() {
+        let mut root = dir("root", (0..4).map(|i| file(&format!("c{i}"), true)).collect());
+        for (i, s) in root.dir.as_mut().unwrap().clones_mut().shared.iter_mut().enumerate() {
+            s.key = ((i / 2) as u64, i as u64);
+            s.ino = i as u64;
+            s.is_clone = false;
+            s.refcnt = 1;
+            s.reflink = Some(Box::new(crate::scan::Reflink {
+                extents: vec![(0, S)].into(),
+                dup: 0,
+                opaque: false,
+            }));
+        }
+        assert!(super::account_cancellable(
+            &mut root,
+            None,
+            &std::sync::atomic::AtomicBool::new(false)
+        ));
+        assert_eq!(root.dedup(), 2 * S);
+        assert_eq!(root.freeable(), 0);
+        let d = root.dir.as_ref().unwrap();
+        assert_eq!((0..4).map(|i| d.child_dedup(i)).collect::<Vec<_>>(), [S, 0, S, 0]);
+    }
+
+    #[test]
+    fn differing_link_snapshots_keep_first_member_semantics() {
+        for (first, last, freed) in [(1, 3, 2 * S), (3, 1, 0)] {
+            let mut root = dir("root", vec![file("ca", true), file("cb", true)]);
+            let d = root.dir.as_mut().unwrap();
+            for (s, nlink) in d.clones_mut().shared.iter_mut().zip([first, last]) {
+                s.is_clone = false;
+                s.ino = 1;
+                s.nlink = nlink;
+                s.refcnt = 1;
+            }
+            account(&mut root, None);
+            assert_eq!(root.freeable(), freed);
+        }
+    }
+
+    #[test]
+    fn cancellation_stops_family_probe_scheduling_and_refcount_application() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        // One worker gives a deterministic order while using the production
+        // Rayon path. Already-running probes are awaited, not interrupted.
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+        pool.install(|| {
+            let make = || {
+                let mut root = cancellable_tree(false, true);
+                set_refcnt(&mut root, 0);
+                root
+            };
+            let calls = AtomicUsize::new(0);
+            let probes = AtomicUsize::new(0);
+            let mut expected = make();
+            assert!(
+                super::account_with_probe(
+                    &mut expected,
+                    Some(Path::new("synthetic-root")),
+                    &|| {
+                        calls.fetch_add(1, Ordering::Relaxed);
+                        false
+                    },
+                    &|_| {
+                        probes.fetch_add(1, Ordering::Relaxed);
+                        Some(2)
+                    }
+                )
+                .is_some()
+            );
+            assert_eq!(probes.load(Ordering::Relaxed), 300);
+            let total = calls.load(Ordering::Relaxed);
+            for boundary in 0..total {
+                let mut root = make();
+                let calls = AtomicUsize::new(0);
+                let stopped = AtomicBool::new(false);
+                assert!(
+                    super::account_with_probe(
+                        &mut root,
+                        Some(Path::new("synthetic-root")),
+                        &|| {
+                            let stop = calls.fetch_add(1, Ordering::Relaxed) >= boundary;
+                            if stop {
+                                stopped.store(true, Ordering::Relaxed);
+                            }
+                            stop
+                        },
+                        &|_| {
+                            assert!(!stopped.load(Ordering::Relaxed), "probe started after cancellation");
+                            Some(2)
+                        }
+                    )
+                    .is_none()
+                );
+                drop(root);
+            }
+            let mut root = make();
+            let stopped = AtomicBool::new(false);
+            let probes = AtomicUsize::new(0);
+            assert!(
+                super::account_with_probe(
+                    &mut root,
+                    Some(Path::new("synthetic-root")),
+                    &|| stopped.load(Ordering::Relaxed),
+                    &|_| {
+                        probes.fetch_add(1, Ordering::Relaxed);
+                        stopped.store(true, Ordering::Relaxed);
+                        Some(2)
+                    }
+                )
+                .is_none()
+            );
+            assert_eq!(probes.load(Ordering::Relaxed), 1);
+            let mut complete = make();
+            assert!(
+                super::account_with_probe(&mut complete, Some(Path::new("synthetic-root")), &|| false, &|_| Some(
+                    2
+                ))
+                .is_some()
+            );
+            assert_eq!(snapshot(&complete), snapshot(&expected));
+        });
+    }
+
+    #[test]
+    fn already_cancelled_accounting_leaves_tree_untouched() {
+        let mut root = cancellable_tree(true, false);
+        account(&mut root, None);
+        let before = snapshot(&root);
+        assert!(!super::account_cancellable(
+            &mut root,
+            Some(Path::new("/not-probed")),
+            &std::sync::atomic::AtomicBool::new(true)
+        ));
+        assert_eq!(snapshot(&root), before);
     }
 
     #[test]

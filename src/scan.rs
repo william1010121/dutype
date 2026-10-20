@@ -1098,8 +1098,10 @@ fn scan_root(
         progress.reflink_fs.store(fs.code(), Ordering::Relaxed);
     }
     node.name = name;
-    if clones && !progress.cancel.load(Ordering::Relaxed) {
-        crate::account::account(&mut node, Some(root));
+    if clones && !crate::account::account_cancellable(&mut node, Some(root), &progress.cancel) {
+        // Only the scan owns this disposable partial tree. The cancelled
+        // worker is joined and its result discarded, never cached/displayed.
+        return Ok(node);
     }
     Ok(node)
 }

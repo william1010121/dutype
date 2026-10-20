@@ -511,3 +511,7 @@ fn save_tree(app: &mut App, one_fs: bool) -> Option<std::io::Error> {
     app.privates = privates;
     result
 }
+
+#[cfg(test)]
+#[path = "../bench/account-cancellation.rs"]
+mod account_cancellation_bench;
