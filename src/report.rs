@@ -308,19 +308,33 @@ struct Sizes {
 /// each node's deduplicated and freeable sizes and whether its path has a
 /// non-UTF-8 (lossy) name.
 fn walk(node: &Node, rel: &mut PathBuf, lossy: bool, f: &mut impl FnMut(&Node, Sizes, &Path, bool) -> bool) {
-    let Some(d) = &node.dir else { return };
-    for (i, c) in d.children.iter().enumerate() {
-        rel.push(&*c.name);
-        let lossy = lossy || c.lossy;
-        let sizes = Sizes {
-            dedup: d.child_dedup(i),
-            freeable: d.child_freeable(i),
-        };
-        if f(c, sizes, rel, lossy) && c.is_dir() {
-            walk(c, rel, lossy, f);
+    stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
+        let Some(d) = &node.dir else { return };
+        // Children are sorted by descending size, ascending name. Visit
+        // equal-size siblings in reverse name order to match Item's tie
+        // breaker, avoiding a heap replacement/allocation for every tied file.
+        let mut start = 0;
+        while start < d.children.len() {
+            let mut end = start + 1;
+            while end < d.children.len() && d.children[end].size == d.children[start].size {
+                end += 1;
+            }
+            for i in (start..end).rev() {
+                let c = &d.children[i];
+                rel.push(&*c.name);
+                let lossy = lossy || c.lossy;
+                let sizes = Sizes {
+                    dedup: d.child_dedup(i),
+                    freeable: d.child_freeable(i),
+                };
+                if f(c, sizes, rel, lossy) && c.is_dir() {
+                    walk(c, rel, lossy, f);
+                }
+                rel.pop();
+            }
+            start = end;
         }
-        rel.pop();
-    }
+    });
 }
 
 /// Private size of the file `n` at `rel`, if the scan read one. Never for a
@@ -363,7 +377,7 @@ pub fn build(root: &Node, root_path: &Path, meta: &Meta, top: usize) -> Report {
             return true;
         };
         let rank = mode.pick(n.size, sizes.dedup);
-        if list.accepts(|min: &Item| rank > min.rank) {
+        if list.accepts(|min: &Item| rank > min.rank || (rank == min.rank && p > min.rel.as_path())) {
             list.push(Item::of(
                 n,
                 sizes,
@@ -528,7 +542,7 @@ pub fn find(
             !n.is_dir() && n.cat == cat
         };
         let rank = mode.pick(n.size, sizes.dedup);
-        if hit && list.accepts(|min: &Item| rank > min.rank) {
+        if hit && list.accepts(|min: &Item| rank > min.rank || (rank == min.rank && p > min.rel.as_path())) {
             list.push(Item::of(n, sizes, private_of(private, n, p, lossy), p, mode, known));
         }
         !(hit && want_dirs)
@@ -565,6 +579,41 @@ pub fn find_to_text(cat: Category, items: &[Entry], mode: SizeMode) -> String {
 mod tests {
     use super::*;
     use crate::category::reg;
+
+    #[test]
+    fn top_n_ties_use_the_same_path_order_as_sorting() {
+        let root_path = std::env::temp_dir().join(format!("dutype-report-ties-{}", std::process::id()));
+        std::fs::create_dir(&root_path).unwrap();
+        for name in ["a.rs", "b.rs", "c.rs"] {
+            std::fs::write(root_path.join(name), []).unwrap();
+        }
+        let root =
+            crate::scan::scan_excluding(&root_path, true, false, &crate::scan::Progress::default(), None).unwrap();
+        let meta = Meta {
+            elapsed: Duration::ZERO,
+            cached_at: None,
+            unreadable: 0,
+            clones: false,
+            clone_ids: false,
+            clone_gaps: false,
+            shares: false,
+            size_mode: SizeMode::Du,
+            private: None,
+            reflink_fs: None,
+        };
+        let report = build(&root, &root_path, &meta, 2);
+        let cat = reg().classify_file("a.rs");
+        let found = find(&root, &root_path, cat, 2, SizeMode::Du, true, None);
+        std::fs::remove_dir_all(&root_path).unwrap();
+        let names = |items: &[Entry]| {
+            items
+                .iter()
+                .map(|e| Path::new(&e.path).file_name().unwrap().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&report.largest_files), ["c.rs", "b.rs"]);
+        assert_eq!(names(&found), ["c.rs", "b.rs"]);
+    }
 
     /// A private size kept for a valid name never shows on a non-UTF-8
     /// file that renders the same (`\xff` and a raw 0xff byte).

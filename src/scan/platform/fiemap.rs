@@ -253,8 +253,15 @@ mod tests {
         let got = p.probe(&d, &cancel).unwrap();
         assert!(got.extents.is_none() && !got.opaque && got.id == (0, 0));
         // Not cancelled: the file is read (its id is known).
-        let got = p.probe(&d, &AtomicBool::new(false)).unwrap();
-        assert_ne!(got.id, (0, 0));
+        match p.probe(&d, &AtomicBool::new(false)) {
+            Ok(got) => assert_ne!(got.id, (0, 0)),
+            Err(e) if matches!(e.raw_os_error(), Some(libc::ENOTTY | libc::EOPNOTSUPP)) => {
+                // Cancellation above is still tested on filesystems without
+                // FIEMAP (e.g. tmpfs). Other failures must not be hidden.
+                eprintln!("FIEMAP unsupported on this test filesystem: {e}");
+            }
+            Err(e) => panic!("unexpected FIEMAP failure: {e}"),
+        }
         std::fs::remove_file(&d).unwrap();
     }
     use std::io;

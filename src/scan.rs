@@ -180,6 +180,19 @@ impl Node {
     }
 }
 
+// A deep tree may be dropped on a small MCP/background thread stack. Drain
+// descendants explicitly so Box/Vec destruction cannot recurse down the tree.
+impl Drop for DirInfo {
+    fn drop(&mut self) {
+        let mut pending = std::mem::take(&mut self.children);
+        while let Some(mut child) = pending.pop() {
+            if let Some(mut dir) = child.dir.take() {
+                pending.append(&mut dir.children);
+            }
+        }
+    }
+}
+
 impl DirInfo {
     /// Files of this dir with hard links or clone siblings (`--clones`).
     pub fn shared(&self) -> &[Shared] {
@@ -816,6 +829,17 @@ impl ReadStats {
 /// Reads `path` with `read_dir` + `lstat`, appending to `out`. Stops early
 /// once `progress.cancel` is set.
 fn read_entries_std(path: &Path, progress: &Progress, out: &mut Vec<Entry>) -> io::Result<ReadStats> {
+    read_entries_std_with(path, progress, out, |_| {})
+}
+
+// The empty production callback is optimized away. Tests can deterministically
+// remove an entry after enumeration, before its metadata lookup.
+fn read_entries_std_with(
+    path: &Path,
+    progress: &Progress,
+    out: &mut Vec<Entry>,
+    mut before_metadata: impl FnMut(&fs::DirEntry),
+) -> io::Result<ReadStats> {
     let mut stats = ReadStats::default();
     let mut reported = out.len();
     for (i, e) in fs::read_dir(path)?.enumerate() {
@@ -829,7 +853,10 @@ fn read_entries_std(path: &Path, progress: &Progress, out: &mut Vec<Entry>) -> i
             reported = out.len();
         }
         // DirEntry::metadata does not follow symlinks.
-        match e.and_then(|e| Ok((e.file_name(), e.metadata()?))) {
+        match e.and_then(|e| {
+            before_metadata(&e);
+            Ok((e.file_name(), e.metadata()?))
+        }) {
             Ok((n, m)) => out.push(Entry::from_metadata(n, &m)),
             Err(_) => stats.errors += 1,
         }
@@ -1189,26 +1216,28 @@ fn collect_files(
     dirs: &mut Vec<Vec<u32>>,
     jobs: &mut Vec<(u32, u32, Option<PathBuf>)>,
 ) {
-    let id = dirs.len() as u32;
-    let mut any = false;
-    for (i, c) in node.children().iter().enumerate() {
-        if !c.is_dir() && c.size > 0 {
-            jobs.push((id, i as u32, resolve_child(base, c)));
-            any = true;
+    stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
+        let id = dirs.len() as u32;
+        let mut any = false;
+        for (i, c) in node.children().iter().enumerate() {
+            if !c.is_dir() && c.size > 0 {
+                jobs.push((id, i as u32, resolve_child(base, c)));
+                any = true;
+            }
         }
-    }
-    if any {
-        dirs.push(path.clone());
-    }
-    for (i, c) in node.children().iter().enumerate() {
-        if c.is_dir()
-            && let Some(p) = resolve_child(base, c)
-        {
-            path.push(i as u32);
-            collect_files(c, &p, path, dirs, jobs);
-            path.pop();
+        if any {
+            dirs.push(path.clone());
         }
-    }
+        for (i, c) in node.children().iter().enumerate() {
+            if c.is_dir()
+                && let Some(p) = resolve_child(base, c)
+            {
+                path.push(i as u32);
+                collect_files(c, &p, path, dirs, jobs);
+                path.pop();
+            }
+        }
+    });
 }
 
 /// Mark `node` and the dirs down `path` as holding files that may share
@@ -1216,18 +1245,35 @@ fn collect_files(
 /// bytes and adding `gaps` files that could not be probed.
 #[cfg(target_os = "linux")]
 fn mark_sharing(node: &mut Node, path: &[u32], freed: u64, gaps: u64) {
-    node.clone = true;
-    let d = node.dir.as_mut().expect("a dir");
-    d.free_base -= freed;
-    if gaps > 0 {
-        d.clones_mut().gaps += gaps;
-    }
-    if let Some((&i, rest)) = path.split_first() {
-        mark_sharing(&mut d.children[i as usize], rest, freed, gaps);
-    }
+    stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
+        node.clone = true;
+        let d = node.dir.as_mut().expect("a dir");
+        d.free_base -= freed;
+        if gaps > 0 {
+            d.clones_mut().gaps += gaps;
+        }
+        if let Some((&i, rest)) = path.split_first() {
+            mark_sharing(&mut d.children[i as usize], rest, freed, gaps);
+        }
+    });
 }
 
 fn scan_dir(
+    path: &Path,
+    name: Box<str>,
+    parent_name: &str,
+    inherited: Option<Category>,
+    own_size: u64,
+    ctx: &Ctx,
+) -> Node {
+    // Rayon may execute a narrow chain on one thread. Grow only near the
+    // stack limit, rather than reserving a huge stack for every worker.
+    stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
+        scan_dir_inner(path, name, parent_name, inherited, own_size, ctx)
+    })
+}
+
+fn scan_dir_inner(
     path: &Path,
     name: Box<str>,
     parent_name: &str,
@@ -1414,27 +1460,31 @@ pub fn walk_with_ancestors<'a>(
     ancestors: &mut Vec<&'a Node>,
     f: &mut impl FnMut(&'a Node, u64, &Path, &[&'a Node]) -> bool,
 ) {
-    let Some(d) = node.dir.as_deref() else { return };
-    for (i, c) in d.children.iter().enumerate() {
-        rel.push(&*c.name);
-        if f(c, d.child_dedup(i), rel, ancestors) && c.is_dir() {
-            ancestors.push(c);
-            walk_with_ancestors(c, rel, ancestors, f);
-            ancestors.pop();
+    stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
+        let Some(d) = node.dir.as_deref() else { return };
+        for (i, c) in d.children.iter().enumerate() {
+            rel.push(&*c.name);
+            if f(c, d.child_dedup(i), rel, ancestors) && c.is_dir() {
+                ancestors.push(c);
+                walk_with_ancestors(c, rel, ancestors, f);
+                ancestors.pop();
+            }
+            rel.pop();
         }
-        rel.pop();
-    }
+    });
 }
 
 /// Depth-first walk below `node`; `f` returns false to skip descending into a dir.
 pub fn walk(node: &Node, rel: &mut PathBuf, f: &mut impl FnMut(&Node, &Path) -> bool) {
-    for c in node.children() {
-        rel.push(&*c.name);
-        if f(c, rel) && c.is_dir() {
-            walk(c, rel, f);
+    stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
+        for c in node.children() {
+            rel.push(&*c.name);
+            if f(c, rel) && c.is_dir() {
+                walk(c, rel, f);
+            }
+            rel.pop();
         }
-        rel.pop();
-    }
+    });
 }
 
 /// Keeps the `n` largest items seen (items are ordered by their first field).
@@ -2197,5 +2247,90 @@ pub(crate) mod reflink_tests {
         assert_eq!(z.dedup(), z.size);
         assert_eq!(z.freeable(), z.size - files);
         fs::remove_dir_all(&d).unwrap();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod disappearing_entry_tests {
+    use super::*;
+
+    #[test]
+    fn disappeared_entry_is_counted_without_losing_healthy_sibling() {
+        let dir = std::env::temp_dir().join(format!("dutype-disappeared-{}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("vanished.txt"), b"gone").unwrap();
+        fs::write(dir.join("healthy.txt"), b"kept").unwrap();
+        let mut entries = Vec::new();
+        let stats = read_entries_std_with(&dir, &Progress::default(), &mut entries, |entry| {
+            if entry.file_name() == "vanished.txt" {
+                fs::remove_file(entry.path()).unwrap();
+            }
+        })
+        .unwrap();
+        let expected = platform::allocated(&fs::metadata(dir.join("healthy.txt")).unwrap());
+        let disappeared = !dir.join("vanished.txt").exists();
+        fs::remove_dir_all(dir).unwrap();
+        assert!(disappeared);
+        assert_eq!(stats.errors, 1);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "healthy.txt");
+        assert_eq!(entries[0].alloc, expected);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod deep_stack_tests {
+    use super::*;
+
+    #[test]
+    fn deep_scan_report_account_and_drop_on_small_stack() {
+        let root = std::env::temp_dir().join(format!("dutype-small-stack-{}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        let mut paths = vec![root.clone()];
+        let mut leaf = root.clone();
+        for _ in 0..350 {
+            leaf.push("d");
+            fs::create_dir(&leaf).unwrap();
+            paths.push(leaf.clone());
+        }
+        fs::write(leaf.join("one.rs"), b"allocated").unwrap();
+        fs::hard_link(leaf.join("one.rs"), leaf.join("two.rs")).unwrap();
+        let scanned = root.clone();
+        let result = std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(move || {
+                let node = scan_excluding(&scanned, true, true, &Progress::default(), None).unwrap();
+                assert_eq!(node.files(), 2);
+                let meta = crate::report::Meta {
+                    elapsed: std::time::Duration::ZERO,
+                    cached_at: None,
+                    unreadable: 0,
+                    clones: true,
+                    clone_ids: false,
+                    clone_gaps: false,
+                    shares: false,
+                    size_mode: crate::report::SizeMode::Du,
+                    private: None,
+                    reflink_fs: None,
+                };
+                let report = crate::report::build(&node, &scanned, &meta, 2);
+                assert_eq!(report.largest_files.len(), 2);
+                serde_json::to_string(&report).unwrap();
+                let mut count = 0;
+                walk(&node, &mut PathBuf::new(), &mut |_, _| {
+                    count += 1;
+                    true
+                });
+                assert_eq!(count, 352);
+                drop(node);
+            })
+            .unwrap()
+            .join();
+        fs::remove_file(leaf.join("one.rs")).unwrap();
+        fs::remove_file(leaf.join("two.rs")).unwrap();
+        for path in paths.iter().rev() {
+            fs::remove_dir(path).unwrap();
+        }
+        result.unwrap();
     }
 }
