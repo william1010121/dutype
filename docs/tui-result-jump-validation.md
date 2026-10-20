@@ -43,10 +43,10 @@ screen. No external reveal, clipboard, or file-opening key is sent in a popup.
 
 ## Verified results
 
-Against base `f0ac49f1482cdfbda2418f3add5f46541dc4c419`, stable fmt/clippy and
+On Linux, against base `f0ac49f1482cdfbda2418f3add5f46541dc4c419`, stable fmt/clippy and
 both full test suites passed: 149 passed and 2 existing ignored tests per
 suite. The nine focused tests and the five-process/13-jump PTY run also passed
-an independent rerun. Tiny-render testing found an existing zero-width bar
+an independent Linux rerun. Tiny-render testing found an existing zero-width bar
 clamp panic; the minimal width guard is covered by the tests.
 
 Inotify observed 2–32 open/access events during each initial scan and zero
@@ -56,3 +56,21 @@ strace attempt was unavailable because the environment returned kernel EPERM
 for ptrace; it was not retried. Source inspection confirms the jump itself
 uses captured tree indices and an in-memory breakdown refresh, with no rescan
 or filesystem path resolution.
+
+## Windows collision-fixture correction
+
+The first Windows CI run failed the synthetic collision test, before navigation:
+it used Unix-style `d\xffir` / `f\xff.pdf` display names on Windows. Each backslash
+is a Windows path separator, so these impossible Windows entry names added two
+components per traversal push while pop removed only one. The resulting display
+paths therefore differed. Production Windows lossy-name rendering uses U+FFFD
+for unpaired surrogates, not Unix backslash escapes; real entry names cannot
+contain separators.
+
+The test remains enabled on every platform and still checks all four colliding
+node identities in both category and extension mode. It now uses the platform's
+rendering shape (Unix escapes or non-Unix U+FFFD) and asserts that every fixture
+name has exactly one path component. Production code is unchanged. Local Linux
+stable fmt/clippy/full tests and Rust 1.88 full tests were rerun after this
+correction. No native Windows runtime was available locally; Windows acceptance
+requires the PR's Windows CI rather than inference from the Linux tests.

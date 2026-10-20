@@ -1131,8 +1131,23 @@ mod tests {
 
     #[test]
     fn result_jump_uses_indices_for_colliding_display_names_without_fs_paths() {
+        // Unix renders invalid bytes as backslash escapes; Windows renders
+        // unpaired surrogates as U+FFFD. A Unix escape is not a valid Windows
+        // entry name: its backslash would add another PathBuf component.
+        let (dir_name, file_name) = if cfg!(unix) {
+            ("d\\xffir", "f\\xff.pdf")
+        } else {
+            ("d\u{fffd}ir", "f\u{fffd}.pdf")
+        };
+        for name in [dir_name, file_name] {
+            assert_eq!(
+                Path::new(name).components().count(),
+                1,
+                "fixture must be one entry name"
+            );
+        }
         let tree = || {
-            let twin = || jump_dir("d\\xffir", vec![jump_file("f\\xff.pdf", 5), jump_file("f\\xff.pdf", 5)]);
+            let twin = || jump_dir(dir_name, vec![jump_file(file_name, 5), jump_file(file_name, 5)]);
             let mut raw = twin();
             raw.lossy = true;
             raw.dir.as_mut().unwrap().children[0].lossy = true;
