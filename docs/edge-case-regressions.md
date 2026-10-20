@@ -43,6 +43,13 @@ because macOS has a smaller path-length limit. Windows/macOS were not run locall
   cancellation assertion still always runs; only `ENOTTY`/`EOPNOTSUPP` from the
   additional non-cancelled probe are accepted as unsupported. Other errors fail.
 
+Remote review additionally caught schema-valid integral representations such as
+`top: 20.0` being rejected by the new validation. Two regression assertions failed
+before the follow-up fix. Validation and conversion now share an integral/range
+check: `1.0`, `20.0`, `500.0` and `1e0` work and honor the requested limit; fractional
+and out-of-range values remain errors. Integral numeric request IDs are accepted
+without converting their stored JSON value, and echoed unchanged.
+
 ## Implementation notes
 
 Recursive scan/report/account/cache-write paths use conditional stack growth;
