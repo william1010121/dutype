@@ -703,6 +703,34 @@ fn disk_cache_rewrites_do_not_change_live_cursors_and_restart_always_invalidates
     assert_eq!(cache_files(&fixture), rewritten_disk);
 }
 
+// Some Unix filesystems (notably APFS) reject invalid UTF-8 names. Apply
+// this capability guard only to the first invalid-name fixture operation,
+// never to subsequent filesystem operations or the behavior under test.
+#[cfg(unix)]
+fn invalid_name_fixture_supported(result: std::io::Result<()>) -> std::io::Result<bool> {
+    match result {
+        Ok(()) => Ok(true),
+        Err(error) if error.raw_os_error() == Some(libc::EILSEQ) => {
+            eprintln!("skipping invalid-name fixture: this filesystem rejects non-UTF-8 names (EILSEQ)");
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn invalid_name_fixture_guard_skips_only_eilseq() {
+    assert!(invalid_name_fixture_supported(Ok(())).unwrap());
+    assert!(!invalid_name_fixture_supported(Err(std::io::Error::from_raw_os_error(libc::EILSEQ))).unwrap());
+    for code in [libc::EACCES, libc::ENOENT, libc::ENOSPC, libc::ENAMETOOLONG] {
+        let error = invalid_name_fixture_supported(Err(std::io::Error::from_raw_os_error(code))).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(code));
+    }
+    let error = invalid_name_fixture_supported(Err(std::io::Error::other("fixture failure"))).unwrap_err();
+    assert_eq!(error.to_string(), "fixture failure");
+}
+
 #[cfg(unix)]
 #[test]
 fn continuation_uses_emitted_path_for_non_utf8_canonical_roots_without_filesystem_lookup() {
@@ -713,7 +741,9 @@ fn continuation_uses_emitted_path_for_non_utf8_canonical_roots_without_filesyste
     let fixture = Fixture::new();
     fixture.pdfs(3);
     let raw_root = fixture.base.join(OsStr::from_bytes(b"raw\xff-root"));
-    fs::rename(&fixture.root, &raw_root).unwrap();
+    if !invalid_name_fixture_supported(fs::rename(&fixture.root, &raw_root)).unwrap() {
+        return;
+    }
     let entrypoint = fixture.base.join("readable-link");
     symlink(&raw_root, &entrypoint).unwrap();
     let canonical = fs::canonicalize(&entrypoint).unwrap();
@@ -742,7 +772,9 @@ fn equal_displayed_paths_have_distinct_cursor_boundaries() {
     use std::os::unix::ffi::OsStrExt;
 
     let fixture = Fixture::new();
-    fs::write(fixture.root.join(OsStr::from_bytes(b"bad\xff.pdf")), b"").unwrap();
+    if !invalid_name_fixture_supported(fs::write(fixture.root.join(OsStr::from_bytes(b"bad\xff.pdf")), b"")).unwrap() {
+        return;
+    }
     fs::write(fixture.root.join("bad\\xff.pdf"), b"").unwrap();
     let expected = fixture.cli(&fixture.root, Some("PDF"), 10, &[], "2");
     assert_eq!(expected["matched_items"], 2);
