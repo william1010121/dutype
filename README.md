@@ -417,7 +417,7 @@ run.
 
 **MCP server** — `dutype --mcp` exposes two read-only tools,
 `disk_usage(path, top?, cross_fs?, refresh?, clones?, size_mode?, private?)` and
-`find_by_category(path, category, top?, cross_fs?, refresh?, clones?, size_mode?, private?)`
+`find_by_category(path, category, top?, cross_fs?, refresh?, clones?, size_mode?, private?, paginate?, cursor?)`
 (`clones: true`, `size_mode: "dedup"` or `private: true` turns on clone detection).
 They never write files.
 With `dutype --mcp --cache`, repeated calls on the same path reuse the scan from
@@ -425,6 +425,64 @@ memory (or a snapshot the CLI saved in `~/.cache/dutype`) instead of walking the
 disk again. `refresh: true` rescans and replaces only that session's in-memory
 snapshot; MCP never writes or replaces the CLI's disk cache. A new MCP session
 can still load the old disk snapshot until a CLI run with `--refresh` updates it.
+
+
+### Sequential category pages
+
+For an occasional complete category inventory beyond 500 matches, start the
+server with `dutype --mcp --cache` (without server-wide `--refresh`) and opt in:
+
+```json
+{"path":"/data/projects","category":"node_modules","top":500,"paginate":true}
+```
+
+The result keeps every existing category field and adds:
+
+```json
+{"pagination":{"snapshot_id":"opaque-generation-id","offset":0,"has_more":true,"next_cursor":"opaque-token"}}
+```
+
+For the next page, repeat the exact absolute `path` returned by the first page,
+the category, and effective query options, and pass `cursor: next_cursor`.
+Cursor presence implies pagination; `top` may change between pages (1–500,
+default 50). Omitted options still use their usual defaults, so repeat any
+nondefault `size_mode`, `cross_fs`, `clones`, and `private` settings. Category
+aliases are equivalent; `dedup` or `private: true` still imply clones. A cursor
+cannot be combined with `refresh: true` or `paginate: false`.
+
+- `snapshot_id` identifies one retained tree generation, not its timestamp.
+  `offset` is how many matches precede this page in the category's ranking.
+- Stop when `has_more` is false and `next_cursor` is null. For 600 matches,
+  pages of 500 and 100 both have `items_truncated: true`: that field still means
+  `matched_items > items.length`, not that another page exists. Empty categories
+  have no cursor. `unreadable` remains the same scan-wide warning on every page.
+- Ordering is selected size descending, then relative path descending. Only
+  exact size/path collisions use a snapshot-local visit ordinal, so lossy
+  displayed names do not cause matches to disappear between pages.
+- Pages describe one completed scan, not an atomic filesystem snapshot or
+  current deletion savings. Filesystem edits, root removal and CLI disk-cache
+  rewrites do not change its results. Continuations perform no filesystem scan,
+  path canonicalization, sharing probe or clone/private I/O.
+- A successful refresh through either MCP tool, or replacement to satisfy a
+  more demanding clone/private request for that same root/filesystem policy,
+  invalidates previous cursors. Failed refreshes retain the previous tree;
+  requests on other roots do not invalidate it. Restarting the server always
+  requires a new cursor, including when it reloads the same disk snapshot.
+  Stale cursors return `isError: true` with structured
+  `{"code":"stale_cursor","restart_required":true,"message":"..."}`. Start
+  again without a cursor; add `refresh: true` to that first request for new data.
+  Invalid cursor formats and changed queries are JSON-RPC `-32602` errors.
+- No cursor means no pagination unless `paginate: true`; legacy defaults and
+  output remain unchanged. Pagination in non-cache or server-wide refresh mode
+  is an execution error. MCP never persists cursor state or writes disk caches.
+
+The cache keeps one current tree per root/filesystem policy for the session;
+old generations are not pinned by cursors and there is no per-cursor registry.
+Each page retains at most 500 candidates, constructs only that page's entries,
+and makes one tree traversal initially or at most two on continuation. Deep
+traversal is stack-safe. Enumerating many small pages trades repeated tree
+walks for bounded page memory; it is not an indexed database listing. The
+existing session cache's total memory across different roots is not capped.
 
 Add the server to an MCP client:
 

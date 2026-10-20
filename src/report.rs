@@ -5,6 +5,8 @@ use crate::category::{Category, by_size, dominant};
 use crate::scan::{Node, PrivateSizes, ReflinkFs, TopN};
 use crate::ui::human;
 use serde::Serialize;
+use std::cmp::{Ordering, Reverse};
+use std::collections::BinaryHeap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -576,6 +578,246 @@ pub fn find(
     }
 }
 
+/// One bounded page from an immutable scan. `items_truncated` retains the
+/// legacy meaning (total matches exceed this page's length), not `has_more`.
+pub struct CategoryPage {
+    pub matched_items: u64,
+    pub items_truncated: bool,
+    pub items: Vec<Entry>,
+    pub offset: u64,
+    pub has_more: bool,
+    /// Last returned visit ordinal, only when another page remains.
+    pub next_after: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CategoryPageError {
+    InvalidTop,
+    InvalidBoundary,
+    CountOverflow,
+}
+
+impl std::fmt::Display for CategoryPageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::InvalidTop => "page size must be an integer from 1 to 500",
+            Self::InvalidBoundary => "cursor boundary does not identify a category match in this snapshot",
+            Self::CountOverflow => "category page count exceeds the supported range",
+        })
+    }
+}
+
+impl std::error::Error for CategoryPageError {}
+
+/// Preserve the legacy rank/path ordering. Only exact collisions use visit
+/// order: the earlier visit wins, avoiding replacements for otherwise equal
+/// candidates. Ordinals are local to this snapshot and category traversal.
+fn page_cmp(rank: u64, rel: &Path, ordinal: u64, other_rank: u64, other_rel: &Path, other: u64) -> Ordering {
+    rank.cmp(&other_rank)
+        .then_with(|| rel.cmp(other_rel))
+        .then_with(|| other.cmp(&ordinal))
+}
+
+struct PageItem {
+    item: Item,
+    ordinal: u64,
+}
+
+impl PartialEq for PageItem {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+impl Eq for PageItem {}
+impl PartialOrd for PageItem {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for PageItem {
+    fn cmp(&self, other: &Self) -> Ordering {
+        page_cmp(
+            self.item.rank,
+            &self.item.rel,
+            self.ordinal,
+            other.item.rank,
+            &other.item.rel,
+            other.ordinal,
+        )
+    }
+}
+
+fn page_increment(value: &mut u64) -> Result<(), CategoryPageError> {
+    *value = value.checked_add(1).ok_or(CategoryPageError::CountOverflow)?;
+    Ok(())
+}
+
+/// Use the existing stack-safe walk and exactly the category pruning of
+/// `find`. Ordinals count all visited nodes, not only category matches, with
+/// zero reserved for an invalid boundary. A rejected match still prunes.
+fn walk_page(
+    root: &Node,
+    cat: Category,
+    mut visit: impl FnMut(&Node, Sizes, &Path, bool, u64) -> Result<(), CategoryPageError>,
+) -> Result<(), CategoryPageError> {
+    #[cfg(test)]
+    page_metrics::record(|m| m.walks += 1);
+    let want_dirs = cat.is_dir_kind();
+    let mut ordinal = 0;
+    let mut error = None;
+    walk(root, &mut PathBuf::new(), false, &mut |n, sizes, rel, lossy| {
+        if error.is_some() {
+            return false;
+        }
+        if let Err(e) = page_increment(&mut ordinal) {
+            error = Some(e);
+            return false;
+        }
+        #[cfg(test)]
+        page_metrics::record(|m| m.visited_nodes += 1);
+        let hit = if want_dirs {
+            n.special && n.cat == cat
+        } else {
+            !n.is_dir() && n.cat == cat
+        };
+        if hit {
+            error = visit(n, sizes, rel, lossy, ordinal).err();
+        }
+        !(hit && want_dirs)
+    });
+    error.map_or(Ok(()), Err)
+}
+
+/// Select at most 500 matches without materializing a full result or an
+/// offset-sized prefix. The caller must validate the process-local cursor
+/// fingerprint and snapshot/query binding before passing its boundary ordinal here.
+///
+/// A first page takes one tree walk. A continuation first recovers one owned
+/// boundary path, rejecting nonexistent/nonmatching ordinals before building
+/// any candidates, then walks again to count and select the best `top` items
+/// strictly after it. Workspace is O(depth + path length + top * path length).
+#[allow(clippy::too_many_arguments)]
+pub fn find_page(
+    root: &Node,
+    root_path: &Path,
+    cat: Category,
+    top: usize,
+    mode: SizeMode,
+    known: bool,
+    private: Option<&PrivateSizes>,
+    after: Option<u64>,
+) -> Result<CategoryPage, CategoryPageError> {
+    if !(1..=500).contains(&top) {
+        return Err(CategoryPageError::InvalidTop);
+    }
+    if after == Some(0) {
+        return Err(CategoryPageError::InvalidBoundary);
+    }
+    let boundary = if let Some(after) = after {
+        let mut boundary = None;
+        walk_page(root, cat, |n, sizes, rel, _, ordinal| {
+            if ordinal == after {
+                #[cfg(test)]
+                page_metrics::record(|m| m.boundary_paths += 1);
+                boundary = Some((mode.pick(n.size, sizes.dedup), rel.to_path_buf(), ordinal));
+            }
+            Ok(())
+        })?;
+        Some(boundary.ok_or(CategoryPageError::InvalidBoundary)?)
+    } else {
+        None
+    };
+
+    let mut list: BinaryHeap<Reverse<PageItem>> = BinaryHeap::with_capacity(top);
+    let mut matched_items = 0;
+    let mut offset = 0;
+    walk_page(root, cat, |n, sizes, rel, lossy, ordinal| {
+        page_increment(&mut matched_items)?;
+        let rank = mode.pick(n.size, sizes.dedup);
+        if let Some((boundary_rank, boundary_rel, boundary_ordinal)) = &boundary
+            && !page_cmp(rank, rel, ordinal, *boundary_rank, boundary_rel, *boundary_ordinal).is_lt()
+        {
+            page_increment(&mut offset)?;
+            return Ok(());
+        }
+        // The same accepts-before-owned-path invariant as TopN. Evict first
+        // so even a replacement has at most `top` live candidate paths.
+        let accepts = list.len() < top
+            || list.peek().is_some_and(|Reverse(min)| {
+                page_cmp(rank, rel, ordinal, min.item.rank, &min.item.rel, min.ordinal).is_gt()
+            });
+        if accepts {
+            if list.len() == top {
+                list.pop();
+            }
+            list.push(Reverse(PageItem {
+                item: Item::of(n, sizes, private_of(private, n, rel, lossy), rel, mode, known),
+                ordinal,
+            }));
+            #[cfg(test)]
+            page_metrics::record(|m| {
+                m.candidate_paths += 1;
+                m.max_live_candidates = m.max_live_candidates.max(list.len());
+            });
+        }
+        Ok(())
+    })?;
+    let mut selected: Vec<_> = list.into_iter().map(|Reverse(item)| item).collect();
+    selected.sort_unstable_by(|a, b| b.cmp(a));
+    let shown = u64::try_from(selected.len()).map_err(|_| CategoryPageError::CountOverflow)?;
+    let has_more = offset.checked_add(shown).ok_or(CategoryPageError::CountOverflow)? < matched_items;
+    let next_after = if has_more {
+        selected.last().map(|item| item.ordinal)
+    } else {
+        None
+    };
+    let mut items = Vec::with_capacity(selected.len());
+    for selected in selected {
+        items.push(selected.item.entry(root_path));
+        #[cfg(test)]
+        page_metrics::record(|m| m.max_output_entries = m.max_output_entries.max(items.len()));
+    }
+    Ok(CategoryPage {
+        matched_items,
+        items_truncated: matched_items > shown,
+        items,
+        offset,
+        has_more,
+        next_after,
+    })
+}
+
+#[cfg(test)]
+mod page_metrics {
+    use std::cell::RefCell;
+
+    #[derive(Clone, Copy, Default, Debug)]
+    pub(super) struct Metrics {
+        pub walks: usize,
+        pub visited_nodes: usize,
+        pub boundary_paths: usize,
+        pub candidate_paths: usize,
+        pub max_live_candidates: usize,
+        pub max_output_entries: usize,
+    }
+
+    thread_local! {
+        static METRICS: RefCell<Metrics> = RefCell::new(Metrics::default());
+    }
+
+    pub(super) fn record(update: impl FnOnce(&mut Metrics)) {
+        METRICS.with(|m| update(&mut m.borrow_mut()));
+    }
+
+    pub(super) fn reset() {
+        record(|m| *m = Metrics::default());
+    }
+
+    pub(super) fn get() -> Metrics {
+        METRICS.with(|m| *m.borrow())
+    }
+}
+
 /// Text for [`find`]'s items, showing the sizes they were ranked by and any
 /// cached-snapshot/scan-wide unreadable notices.
 pub fn find_to_text(cat: Category, found: &CategoryMatches, meta: &Meta) -> String {
@@ -728,6 +970,477 @@ mod tests {
             assert_eq!(found.items_truncated, top < 2);
             assert!(found.items.iter().all(|e| !e.path.contains("nested")));
         }
+    }
+
+    fn page_items(page: &CategoryPage) -> serde_json::Value {
+        serde_json::to_value(&page.items).unwrap()
+    }
+
+    fn assert_page_bounds(top: usize, walks: usize) {
+        let metrics = page_metrics::get();
+        assert_eq!(metrics.walks, walks, "{metrics:?}");
+        assert!(metrics.boundary_paths <= usize::from(walks == 2), "{metrics:?}");
+        assert!(metrics.max_live_candidates <= top, "{metrics:?}");
+        assert!(metrics.max_output_entries <= top, "{metrics:?}");
+    }
+
+    #[test]
+    fn category_pages_partition_600_matches_replay_and_change_length() {
+        let cat = reg().find_by_name("node_modules").unwrap();
+        let root = directory(
+            "root",
+            reg().other(),
+            false,
+            (0..600)
+                .map(|i| {
+                    directory(
+                        &format!("p{i:03}"),
+                        cat,
+                        true,
+                        vec![file("inherited", (i % 11) as u64, cat)],
+                    )
+                })
+                .collect(),
+        );
+        let full = find(&root, Path::new("root"), cat, 600, SizeMode::Du, true, None);
+        let expected = serde_json::to_value(&full.items).unwrap();
+        for top in [500, 137] {
+            let mut after = None;
+            let mut collected = Vec::new();
+            let mut lengths = Vec::new();
+            loop {
+                page_metrics::reset();
+                let page = find_page(&root, Path::new("root"), cat, top, SizeMode::Du, true, None, after).unwrap();
+                assert_page_bounds(top, if after.is_some() { 2 } else { 1 });
+                assert_eq!(page_metrics::get().candidate_paths, page.items.len());
+                assert_eq!(page.matched_items, 600);
+                assert_eq!(page.offset as usize, collected.len());
+                assert!(page.items_truncated);
+                let replay = find_page(&root, Path::new("root"), cat, top, SizeMode::Du, true, None, after).unwrap();
+                assert_eq!(page_items(&replay), page_items(&page));
+                assert_eq!(replay.offset, page.offset);
+                assert_eq!(replay.next_after, page.next_after);
+                lengths.push(page.items.len());
+                collected.extend(page_items(&page).as_array().unwrap().iter().cloned());
+                assert_eq!(page.has_more, collected.len() < 600);
+                assert_eq!(page.next_after.is_some(), page.has_more);
+                after = page.next_after;
+                if !page.has_more {
+                    break;
+                }
+            }
+            assert_eq!(serde_json::Value::Array(collected), expected);
+            assert_eq!(
+                lengths,
+                if top == 500 {
+                    vec![500, 100]
+                } else {
+                    vec![137, 137, 137, 137, 52]
+                }
+            );
+        }
+        let first = find_page(&root, Path::new("root"), cat, 137, SizeMode::Du, true, None, None).unwrap();
+        let rest = find_page(
+            &root,
+            Path::new("root"),
+            cat,
+            500,
+            SizeMode::Du,
+            true,
+            None,
+            first.next_after,
+        )
+        .unwrap();
+        assert_eq!(rest.offset, 137);
+        assert_eq!(rest.items.len(), 463);
+        assert!(!rest.has_more);
+        let mut joined = page_items(&first).as_array().unwrap().clone();
+        joined.extend(page_items(&rest).as_array().unwrap().iter().cloned());
+        assert_eq!(serde_json::Value::Array(joined), expected);
+    }
+
+    #[test]
+    fn category_page_boundaries_follow_rank_not_walk_position_and_keep_only_one_page() {
+        let cat = reg().find_by_name("PDF").unwrap();
+        // Walk order is the reverse of match rank: larger containing folders
+        // carry smaller matching files. Every late candidate replaces an early
+        // one, exercising the live-path bound rather than only a sorted input.
+        let root = directory(
+            "root",
+            reg().other(),
+            false,
+            (0..600)
+                .map(|i| {
+                    directory(
+                        &format!("p{i:03}"),
+                        reg().other(),
+                        false,
+                        vec![file("hit.pdf", i, cat), file("padding", 2000 - 2 * i, reg().other())],
+                    )
+                })
+                .collect(),
+        );
+        let full = find(&root, Path::new("root"), cat, 600, SizeMode::Du, true, None);
+        page_metrics::reset();
+        let first = find_page(&root, Path::new("root"), cat, 500, SizeMode::Du, true, None, None).unwrap();
+        assert_page_bounds(500, 1);
+        assert_eq!(page_metrics::get().candidate_paths, 600);
+        page_metrics::reset();
+        let last = find_page(
+            &root,
+            Path::new("root"),
+            cat,
+            7,
+            SizeMode::Du,
+            true,
+            None,
+            first.next_after,
+        )
+        .unwrap();
+        assert_page_bounds(7, 2);
+        assert_eq!(page_metrics::get().candidate_paths, 100);
+        assert_eq!(page_metrics::get().max_live_candidates, 7);
+        assert_eq!(last.offset, 500);
+        assert_eq!(last.items.len(), 7);
+        assert_eq!(page_items(&last), serde_json::to_value(&full.items[500..507]).unwrap(),);
+        assert!(last.has_more);
+    }
+
+    #[test]
+    fn category_pages_preserve_ties_collisions_private_and_lossy_ancestry() {
+        let cat = reg().find_by_name("PDF").unwrap();
+        let mut lossy = file("same.pdf", 40, cat);
+        lossy.lossy = true;
+        let mut parent = directory("lossy", reg().other(), false, vec![file("child.pdf", 5, cat)]);
+        parent.lossy = true;
+        let root = directory(
+            "root",
+            reg().other(),
+            false,
+            vec![
+                file("same.pdf", 40, cat),
+                lossy,
+                file("a.pdf", 40, cat),
+                file("z.pdf", 40, cat),
+                parent,
+                file("zero.pdf", 0, cat),
+            ],
+        );
+        let mut private = PrivateSizes::default();
+        private.0.insert(PathBuf::from("same.pdf"), 9);
+        private.0.insert(Path::new("lossy").join("child.pdf"), 3);
+        let mut after = None;
+        let mut entries = Vec::new();
+        let mut ordinals = Vec::new();
+        loop {
+            let page = find_page(
+                &root,
+                Path::new("root"),
+                cat,
+                1,
+                SizeMode::Du,
+                true,
+                Some(&private),
+                after,
+            )
+            .unwrap();
+            assert_eq!(page.matched_items, 6);
+            assert_eq!(page.offset as usize, entries.len());
+            assert!(page.items_truncated);
+            let replay = find_page(
+                &root,
+                Path::new("root"),
+                cat,
+                1,
+                SizeMode::Du,
+                true,
+                Some(&private),
+                after,
+            )
+            .unwrap();
+            assert_eq!(page_items(&replay), page_items(&page));
+            after = page.next_after;
+            if let Some(ordinal) = after {
+                assert!(!ordinals.contains(&ordinal));
+                ordinals.push(ordinal);
+            }
+            entries.extend(page.items);
+            if !page.has_more {
+                break;
+            }
+        }
+        let names: Vec<_> = entries
+            .iter()
+            .map(|e| Path::new(&e.path).file_name().unwrap().to_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            ["z.pdf", "same.pdf", "same.pdf", "a.pdf", "child.pdf", "zero.pdf"]
+        );
+        let mut twin_private: Vec<_> = entries[1..3].iter().map(|e| e.private_bytes).collect();
+        twin_private.sort();
+        assert_eq!(twin_private, [None, Some(9)]);
+        assert_eq!(entries[4].private_bytes, None);
+        assert_eq!(entries[5].size_bytes, 0);
+        // Exact-collision tie order is the first visit, never an allocation or
+        // an accidental heap ordering. Neither legacy Item nor find is changed.
+        assert!(page_cmp(40, Path::new("same.pdf"), 1, 40, Path::new("same.pdf"), 2).is_gt());
+    }
+
+    #[test]
+    fn category_pages_prune_exclude_root_and_reject_nonmatching_boundaries_before_candidates() {
+        let cat = reg().find_by_name("node_modules").unwrap();
+        let root = directory(
+            "root",
+            cat,
+            true,
+            vec![
+                directory("a", cat, true, vec![directory("nested", cat, true, vec![])]),
+                directory(
+                    "ordinary",
+                    reg().other(),
+                    false,
+                    vec![directory("b", cat, true, vec![])],
+                ),
+                file("inherited", 0, cat),
+            ],
+        );
+        page_metrics::reset();
+        let first = find_page(&root, Path::new("root"), cat, 1, SizeMode::Du, true, None, None).unwrap();
+        assert_eq!(first.matched_items, 2);
+        assert_eq!(page_metrics::get().visited_nodes, 4);
+        assert_eq!(
+            first.items[0].path,
+            Path::new("root").join("ordinary").join("b").display().to_string()
+        );
+        let last = find_page(
+            &root,
+            Path::new("root"),
+            cat,
+            1,
+            SizeMode::Du,
+            true,
+            None,
+            first.next_after,
+        )
+        .unwrap();
+        assert_eq!(last.matched_items, 2);
+        assert_eq!(last.offset, 1);
+        assert!(last.items_truncated);
+        assert!(!last.has_more);
+        assert_eq!(last.items[0].path, Path::new("root").join("a").display().to_string());
+        // Visits are ordinary=1, b=2, inherited=3, a=4; the nested match
+        // never gets an ordinal because its matching parent prunes it.
+        for after in [0, 1, 3, 5, u64::MAX] {
+            page_metrics::reset();
+            let result = find_page(&root, Path::new("root"), cat, 1, SizeMode::Du, true, None, Some(after));
+            assert!(matches!(result, Err(CategoryPageError::InvalidBoundary)), "{after}");
+            let metrics = page_metrics::get();
+            assert_eq!(metrics.walks, usize::from(after != 0));
+            assert_eq!(metrics.candidate_paths, 0);
+            assert_eq!(metrics.boundary_paths, 0);
+            assert_eq!(metrics.max_output_entries, 0);
+        }
+        let terminal = find_page(&root, Path::new("root"), cat, 1, SizeMode::Du, true, None, Some(4)).unwrap();
+        assert_eq!(terminal.offset, 2);
+        assert_eq!(terminal.matched_items, 2);
+        assert!(terminal.items.is_empty() && terminal.items_truncated && !terminal.has_more);
+        assert!(terminal.next_after.is_none());
+        let empty = find_page(
+            &root,
+            Path::new("root"),
+            reg().find_by_name("PDF").unwrap(),
+            10,
+            SizeMode::Du,
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(empty.matched_items, 0);
+        assert_eq!(empty.offset, 0);
+        assert!(empty.items.is_empty() && !empty.items_truncated && !empty.has_more);
+        assert!(empty.next_after.is_none());
+    }
+
+    #[test]
+    fn category_pages_use_snapshot_dedup_hardlink_and_freeable_sizes() {
+        use crate::scan::Shared;
+
+        let cat = reg().find_by_name("PDF").unwrap();
+        let mut cloned = file("clone.pdf", 100, cat);
+        cloned.clone = true;
+        let mut linked = file("link.pdf", 0, cat);
+        linked.hardlink = true;
+        let mut root = directory(
+            "root",
+            reg().other(),
+            false,
+            vec![cloned, file("owner.pdf", 50, cat), linked, file("zero.pdf", 0, cat)],
+        );
+        root.dir.as_mut().unwrap().clones_mut().shared = vec![Shared {
+            idx: 0,
+            key: (1, 1),
+            is_clone: true,
+            ino: 1,
+            nlink: 1,
+            refcnt: 2,
+            dup: true,
+            reflink: None,
+        }]
+        .into_boxed_slice();
+        for mode in [SizeMode::Du, SizeMode::Dedup] {
+            for known in [false, true] {
+                let full = find(&root, Path::new("root"), cat, 4, mode, known, None);
+                let first = find_page(&root, Path::new("root"), cat, 2, mode, known, None, None).unwrap();
+                let last = find_page(&root, Path::new("root"), cat, 2, mode, known, None, first.next_after).unwrap();
+                assert_eq!(first.matched_items, 4);
+                assert_eq!(last.matched_items, 4);
+                assert_eq!(last.offset, 2);
+                assert!(first.items_truncated && last.items_truncated);
+                let mut joined = page_items(&first).as_array().unwrap().clone();
+                joined.extend(page_items(&last).as_array().unwrap().iter().cloned());
+                assert_eq!(
+                    serde_json::Value::Array(joined),
+                    serde_json::to_value(&full.items).unwrap()
+                );
+                assert_eq!(
+                    Path::new(&first.items[0].path).file_name().unwrap(),
+                    if mode == SizeMode::Du { "clone.pdf" } else { "owner.pdf" },
+                );
+                assert_eq!(first.items[0].freeable_min_bytes.is_some(), known);
+            }
+        }
+    }
+
+    #[test]
+    fn category_page_size_and_counter_arithmetic_are_checked() {
+        let cat = reg().find_by_name("PDF").unwrap();
+        let root = directory("root", reg().other(), false, vec![file("file.pdf", 1, cat)]);
+        for top in [0, 501, usize::MAX] {
+            page_metrics::reset();
+            let result = find_page(&root, Path::new("root"), cat, top, SizeMode::Du, true, None, None);
+            assert!(matches!(result, Err(CategoryPageError::InvalidTop)));
+            assert_eq!(page_metrics::get().walks, 0);
+            assert_eq!(page_metrics::get().candidate_paths, 0);
+        }
+        let mut value = u64::MAX - 1;
+        assert_eq!(page_increment(&mut value), Ok(()));
+        assert_eq!(value, u64::MAX);
+        assert_eq!(page_increment(&mut value), Err(CategoryPageError::CountOverflow));
+        assert_eq!(value, u64::MAX);
+        let page = find_page(&root, Path::new("root"), cat, 500, SizeMode::Du, true, None, None).unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert!(!page.items_truncated && !page.has_more && page.next_after.is_none());
+    }
+
+    #[test]
+    fn category_page_work_counters() {
+        let cat = reg().find_by_name("PDF").unwrap();
+        for count in [600, 20_000] {
+            let root = directory(
+                "root",
+                reg().other(),
+                false,
+                (0..count).map(|i| file(&format!("f{i:05}.pdf"), 1, cat)).collect(),
+            );
+            page_metrics::reset();
+            let first = find_page(&root, Path::new("root"), cat, 50, SizeMode::Du, true, None, None).unwrap();
+            let first_metrics = page_metrics::get();
+            assert_page_bounds(50, 1);
+            assert_eq!(first_metrics.visited_nodes, count);
+            assert_eq!(first_metrics.candidate_paths, 50);
+            assert_eq!(first_metrics.boundary_paths, 0);
+            assert_eq!(first_metrics.max_live_candidates, 50);
+            assert_eq!(first_metrics.max_output_entries, 50);
+            assert_eq!(first.offset, 0);
+            assert_eq!(first.matched_items, count as u64);
+            assert_eq!(first.items.len(), 50);
+            assert!(first.has_more);
+
+            // Advance using legal bounded pages, never an all-results or
+            // offset-sized helper. Keep only the cursor between calls.
+            let target = count - 50;
+            let mut offset = 0;
+            let mut after = None;
+            while offset < target {
+                let step = (target - offset).min(500);
+                let page = find_page(&root, Path::new("root"), cat, step, SizeMode::Du, true, None, after).unwrap();
+                assert_eq!(page.offset, offset as u64);
+                assert_eq!(page.items.len(), step);
+                offset += step;
+                after = page.next_after;
+                assert!(after.is_some());
+            }
+            page_metrics::reset();
+            let late = find_page(&root, Path::new("root"), cat, 50, SizeMode::Du, true, None, after).unwrap();
+            let late_metrics = page_metrics::get();
+            assert_page_bounds(50, 2);
+            assert_eq!(late_metrics.visited_nodes, 2 * count);
+            assert_eq!(late_metrics.candidate_paths, 50);
+            assert_eq!(late_metrics.boundary_paths, 1);
+            assert_eq!(late_metrics.max_live_candidates, 50);
+            assert_eq!(late_metrics.max_output_entries, 50);
+            assert_eq!(late.offset, target as u64);
+            assert_eq!(late.matched_items, count as u64);
+            assert_eq!(late.items.len(), 50);
+            assert!(!late.has_more);
+            assert!(late.items_truncated);
+            for (phase, offset, metrics) in [("first", 0, first_metrics), ("late", target, late_metrics)] {
+                println!(
+                    "pagination_work matches={count} phase={phase} offset={offset} top=50 walks={} visited_nodes={} candidate_path_constructions={} boundary_path_constructions={} max_live_candidates={} max_output_entries={}",
+                    metrics.walks,
+                    metrics.visited_nodes,
+                    metrics.candidate_paths,
+                    metrics.boundary_paths,
+                    metrics.max_live_candidates,
+                    metrics.max_output_entries,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn category_pages_handle_deep_paths_on_a_small_stack() {
+        std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(|| {
+                let cat = reg().find_by_name("PDF").unwrap();
+                let mut root = directory(
+                    "leaf",
+                    reg().other(),
+                    false,
+                    vec![file("a.pdf", 0, cat), file("z.pdf", 0, cat)],
+                );
+                for _ in 0..3000 {
+                    root = directory("d", reg().other(), false, vec![root]);
+                }
+                page_metrics::reset();
+                let first = find_page(&root, Path::new("root"), cat, 1, SizeMode::Du, true, None, None).unwrap();
+                assert_page_bounds(1, 1);
+                assert!(first.items[0].path.ends_with("z.pdf"));
+                page_metrics::reset();
+                let last = find_page(
+                    &root,
+                    Path::new("root"),
+                    cat,
+                    1,
+                    SizeMode::Du,
+                    true,
+                    None,
+                    first.next_after,
+                )
+                .unwrap();
+                assert_page_bounds(1, 2);
+                assert_eq!(last.matched_items, 2);
+                assert_eq!(last.offset, 1);
+                assert!(last.items[0].path.ends_with("a.pdf"));
+                assert!(last.items_truncated && !last.has_more);
+                drop(root);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]

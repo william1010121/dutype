@@ -7,10 +7,12 @@ use crate::report;
 use crate::scan::{self, Progress};
 use serde_json::{Value, json};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, hash_map::RandomState};
+use std::hash::{BuildHasher, Hash};
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime};
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -60,13 +62,17 @@ fn tools() -> Value {
                 the top limit; a matching directory counts once, without its descendants. \
                 items_truncated is true when matched_items exceeds items.length. \
                 unreadable counts entries that could not be read across the \
-                whole scan, not just this category: unreadable entries may be unclassifiable. Read-only.",
+                whole scan, not just this category: unreadable entries may be unclassifiable. \
+                Optional pagination uses one retained completed scan, not an atomic filesystem snapshot. \
+                Stop on pagination.has_more/next_cursor, not items_truncated. Read-only.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "Directory to scan."},
                     "category": {"type": "string", "enum": categories, "description": "Category name."},
                     "top": {"type": "integer", "minimum": 1, "maximum": 500, "default": 50},
+                    "paginate": {"type": "boolean", "default": false, "description": "Opt in to snapshot-consistent sequential pages (requires --mcp --cache without --refresh)."},
+                    "cursor": {"type": "string", "description": "Opaque next_cursor from the preceding page; implies pagination. Repeat its returned absolute path, category and effective options. top may change; refresh is forbidden."},
                     "cross_fs": {"type": "boolean", "default": false},
                     "refresh": {"type": "boolean", "default": false},
                     "clones": {"type": "boolean", "default": false},
@@ -110,9 +116,161 @@ fn top_value(value: &Value) -> Option<usize> {
     (integral_number(value) && (1.0..=500.0).contains(&number)).then_some(number as usize)
 }
 
-fn call_tool(name: &str, args: &Value, opts: CacheOpts) -> Result<Value, String> {
+/// Only the current generation is retained. Cursors do not own trees or add
+/// per-query/per-page state. `shares` freezes the scan's rendering context.
+struct Retained {
+    snapshot: Snapshot,
+    generation: u64,
+    shares: bool,
+}
+
+#[derive(Debug)]
+enum ToolError {
+    Argument(String),
+    Execution(String),
+    StaleCursor,
+}
+
+impl From<String> for ToolError {
+    fn from(message: String) -> Self {
+        Self::Execution(message)
+    }
+}
+
+impl From<&str> for ToolError {
+    fn from(message: &str) -> Self {
+        Self::Execution(message.into())
+    }
+}
+
+/// Process-local opaque identifiers, not authentication credentials or a
+/// cryptographic security boundary. Independent randomized hash seeds make a
+/// new process epoch even if it reloads identical disk snapshots in the same
+/// clock tick. No timestamp is used as a generation identity. As with a random
+/// UUID, cross-process uniqueness is probabilistic (128 bits), not persistent.
+struct CursorState {
+    epoch: [u64; 2],
+    query: [RandomState; 2],
+    integrity: [RandomState; 2],
+    next_generation: AtomicU64,
+}
+
+fn fingerprint(states: &[RandomState; 2], value: impl Hash) -> [u64; 2] {
+    [states[0].hash_one(&value), states[1].hash_one(&value)]
+}
+
+impl CursorState {
+    fn new() -> Self {
+        Self {
+            epoch: fingerprint(
+                &[RandomState::new(), RandomState::new()],
+                ("dutype-mcp-epoch", std::process::id()),
+            ),
+            query: [RandomState::new(), RandomState::new()],
+            integrity: [RandomState::new(), RandomState::new()],
+            next_generation: AtomicU64::new(1),
+        }
+    }
+
+    fn generation(&self) -> Result<u64, ToolError> {
+        // Never wrap, reuse an ID, or invalidate the previous tree on failure.
+        let mut current = self.next_generation.load(Ordering::Relaxed);
+        loop {
+            let next = current.checked_add(1).ok_or_else(|| {
+                ToolError::Execution("snapshot generation IDs exhausted; restart the MCP server".into())
+            })?;
+            match self
+                .next_generation
+                .compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => return Ok(current),
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    fn snapshot_id(&self, generation: u64) -> String {
+        format!("{:016x}{:016x}-{:016x}", self.epoch[0], self.epoch[1], generation)
+    }
+}
+
+fn cursor_state() -> &'static CursorState {
+    static STATE: OnceLock<CursorState> = OnceLock::new();
+    STATE.get_or_init(CursorState::new)
+}
+
+#[derive(Clone, Copy, Hash)]
+struct Cursor {
+    epoch: [u64; 2],
+    generation: u64,
+    query: [u64; 2],
+    after: u64,
+}
+
+impl Cursor {
+    // Fixed-width lower-case hex rejects alternate encodings, unbounded input,
+    // unknown versions, numeric overflow, zero ordinals, and trailing fields.
+    fn parse(token: &str) -> Result<(Self, [u64; 2]), ToolError> {
+        const LEN: usize = 3 + 8 * 16;
+        let invalid = || ToolError::Argument("invalid or unsupported category cursor".into());
+        if token.len() != LEN || !token.starts_with("v1.") {
+            return Err(invalid());
+        }
+        let body = &token.as_bytes()[3..];
+        if !body.iter().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b)) {
+            return Err(invalid());
+        }
+        let mut fields = [0; 8];
+        for (field, chunk) in fields.iter_mut().zip(body.as_chunks::<16>().0) {
+            *field =
+                u64::from_str_radix(std::str::from_utf8(chunk).map_err(|_| invalid())?, 16).map_err(|_| invalid())?;
+        }
+        if fields[2] == 0 || fields[5] == 0 {
+            return Err(invalid());
+        }
+        Ok((
+            Self {
+                epoch: [fields[0], fields[1]],
+                generation: fields[2],
+                query: [fields[3], fields[4]],
+                after: fields[5],
+            },
+            [fields[6], fields[7]],
+        ))
+    }
+
+    fn encode(self, state: &CursorState) -> String {
+        let tag = fingerprint(&state.integrity, self);
+        format!(
+            "v1.{:016x}{:016x}{:016x}{:016x}{:016x}{:016x}{:016x}{:016x}",
+            self.epoch[0], self.epoch[1], self.generation, self.query[0], self.query[1], self.after, tag[0], tag[1]
+        )
+    }
+
+    fn decode(token: &str, state: &CursorState) -> Result<Self, ToolError> {
+        let (cursor, tag) = Self::parse(token)?;
+        if cursor.epoch != state.epoch {
+            return Err(ToolError::StaleCursor);
+        }
+        if fingerprint(&state.integrity, cursor) != tag {
+            return Err(ToolError::Argument("invalid category cursor fingerprint".into()));
+        }
+        Ok(cursor)
+    }
+}
+
+/// Keep all filesystem entry points out of continuation handling. The test
+/// counter covers canonicalization, sharing probes, cache loading, device
+/// lookup and scanning (including clone/private I/O inside that scan).
+fn filesystem<T>(f: impl FnOnce() -> T) -> T {
+    #[cfg(test)]
+    FILESYSTEM_CALLS.with(|count| count.set(count.get() + 1));
+    f()
+}
+
+fn call_tool(name: &str, args: &Value, opts: CacheOpts) -> Result<Value, ToolError> {
     let use_cache = opts.use_cache;
-    let path = args
+    let requested_path = args
         .get("path")
         .and_then(Value::as_str)
         .ok_or("missing required argument: path")?;
@@ -127,9 +285,8 @@ fn call_tool(name: &str, args: &Value, opts: CacheOpts) -> Result<Value, String>
         None => report::SizeMode::Du,
         Some(v) if v == "du" => report::SizeMode::Du,
         Some(v) if v == "dedup" => report::SizeMode::Dedup,
-        Some(v) => return Err(format!("unknown size_mode {v} (du or dedup)")),
+        Some(v) => return Err(format!("unknown size_mode {v} (du or dedup)").into()),
     };
-    // Private sizes need the clone flags to pick partial clones.
     let clones =
         size_mode == report::SizeMode::Dedup || private || args.get("clones").and_then(Value::as_bool).unwrap_or(false);
     let category = match name {
@@ -141,64 +298,142 @@ fn call_tool(name: &str, args: &Value, opts: CacheOpts) -> Result<Value, String>
                 .ok_or("missing required argument: category")?;
             Some(reg().find_by_name(c).ok_or_else(|| format!("unknown category {c:?}"))?)
         }
-        _ => return Err(format!("unknown tool {name:?}")),
+        _ => return Err(format!("unknown tool {name:?}").into()),
     };
-
-    let path = std::fs::canonicalize(expand(path)).map_err(|e| format!("{path}: {e}"))?;
+    let token = args.get("cursor").and_then(Value::as_str);
+    let paginate = category.is_some() && (token.is_some() || args.get("paginate") == Some(&Value::Bool(true)));
+    if paginate && (!use_cache || opts.always_refresh) {
+        return Err("category pagination requires dutype --mcp --cache without --refresh".into());
+    }
+    let state = cursor_state();
+    let cursor = token.map(|token| Cursor::decode(token, state)).transpose()?;
     let one_fs = !cross_fs;
-    let shares = scan::may_share_blocks(&path, one_fs);
-    let render = |snap: &Snapshot| -> Result<Value, String> {
-        let meta = report::Meta {
-            elapsed: snap.scan_time,
-            cached_at: snap.cached_at,
-            unreadable: snap.errors,
-            clones: snap.clones,
-            clone_ids: snap.clone_ids,
-            clone_gaps: snap.clone_gaps,
-            shares,
-            size_mode,
-            private: snap.private_table(),
-            reflink_fs: snap.reflink_fs,
-        };
-        match category {
-            None => serde_json::to_value(report::build(&snap.root, &path, &meta, top.unwrap_or(20))),
-            Some(c) => {
-                let found = report::find(
+    let query = |path: &std::path::Path, c: crate::category::Category| {
+        fingerprint(
+            &state.query,
+            (path, c, size_mode == report::SizeMode::Dedup, one_fs, clones, private),
+        )
+    };
+    let render =
+        |snap: &Snapshot, path: &std::path::Path, shares: bool, generation: Option<u64>| -> Result<Value, ToolError> {
+            let meta = report::Meta {
+                elapsed: snap.scan_time,
+                cached_at: snap.cached_at,
+                unreadable: snap.errors,
+                clones: snap.clones,
+                clone_ids: snap.clone_ids,
+                clone_gaps: snap.clone_gaps,
+                shares,
+                size_mode,
+                private: snap.private_table(),
+                reflink_fs: snap.reflink_fs,
+            };
+            let Some(c) = category else {
+                return serde_json::to_value(report::build(&snap.root, path, &meta, top.unwrap_or(20)))
+                    .map_err(|e| e.to_string().into());
+            };
+            let known = report::freeable_known(report::detected(snap.clones, snap.clone_ids, snap.reflink_fs), shares);
+            let (matched_items, items_truncated, items, pagination) = if paginate {
+                let generation = generation.ok_or("pagination needs a retained snapshot")?;
+                let page = report::find_page(
                     &snap.root,
-                    &path,
+                    path,
                     c,
                     top.unwrap_or(50),
                     size_mode,
-                    report::freeable_known(report::detected(snap.clones, snap.clone_ids, snap.reflink_fs), shares),
+                    known,
                     meta.private,
-                );
-                serde_json::to_value(json!({
-                    "path": path.display().to_string(),
-                    "category": c.label(),
-                    "cached_at": report::unix_secs(snap.cached_at),
-                    "unreadable": meta.unreadable,
-                    "accounting": report::accounting(&meta),
-                    "matched_items": found.matched_items,
-                    "items_truncated": found.items_truncated,
-                    "items": found.items,
-                }))
+                    cursor.map(|cursor| cursor.after),
+                )
+                .map_err(|e| ToolError::Argument(format!("invalid category cursor boundary: {e}")))?;
+                let next_cursor = page.next_after.map(|after| {
+                    Cursor {
+                        epoch: state.epoch,
+                        generation,
+                        query: query(path, c),
+                        after,
+                    }
+                    .encode(state)
+                });
+                (
+                    page.matched_items,
+                    page.items_truncated,
+                    page.items,
+                    Some(json!({
+                        "snapshot_id": state.snapshot_id(generation),
+                        "offset": page.offset,
+                        "has_more": page.has_more,
+                        "next_cursor": next_cursor,
+                    })),
+                )
+            } else {
+                let found = report::find(&snap.root, path, c, top.unwrap_or(50), size_mode, known, meta.private);
+                (found.matched_items, found.items_truncated, found.items, None)
+            };
+            let mut result = json!({
+                "path": path.display().to_string(),
+                "category": c.label(),
+                "cached_at": report::unix_secs(snap.cached_at),
+                "unreadable": meta.unreadable,
+                "accounting": report::accounting(&meta),
+                "matched_items": matched_items,
+                "items_truncated": items_truncated,
+                "items": items,
+            });
+            if let Some(pagination) = pagination {
+                result["pagination"] = pagination;
             }
-        }
-        .map_err(|e| e.to_string())
-    };
+            Ok(result)
+        };
 
-    // The tools are read-only, so MCP never writes snapshots. With --cache it
-    // reuses scans from this session (in memory) and snapshots the CLI saved.
+    if let Some(cursor) = cursor {
+        // No expansion, canonicalization, filesystem probe, cache read or scan.
+        // Find only a current generation; old trees are never pinned by cursors.
+        return MEMORY.with_borrow(|memory| {
+            let ((path, stored_one_fs), retained) = memory
+                .iter()
+                .find(|(_, retained)| retained.generation == cursor.generation)
+                .ok_or(ToolError::StaleCursor)?;
+            if requested_path != path.display().to_string()
+                || one_fs != *stored_one_fs
+                || cursor.query != query(path, category.ok_or("cursor needs a category")?)
+            {
+                return Err(ToolError::Argument(
+                    "cursor query does not match; repeat the returned absolute path, category and effective options"
+                        .into(),
+                ));
+            }
+            render(&retained.snapshot, path, retained.shares, Some(retained.generation))
+        });
+    }
+
+    let path =
+        filesystem(|| std::fs::canonicalize(expand(requested_path))).map_err(|e| format!("{requested_path}: {e}"))?;
+    let shares = filesystem(|| scan::may_share_blocks(&path, one_fs));
+    // MCP never writes disk snapshots. --cache retains one current tree per
+    // canonical root/filesystem policy, with no per-cursor state.
     MEMORY.with_borrow_mut(|memory| {
         let key = (path.clone(), one_fs);
         if use_cache && !refresh {
             let fits = |s: &Snapshot| cache::answers(s, clones) && s.serves(private);
-            if let Some(snap) = memory.get(&key).filter(|s| fits(s)) {
-                return render(snap);
+            if let Some(retained) = memory.get(&key).filter(|r| fits(&r.snapshot)) {
+                return render(
+                    &retained.snapshot,
+                    &path,
+                    if paginate { retained.shares } else { shares },
+                    Some(retained.generation),
+                );
             }
-            if let Some(snap) = cache::load(&path, one_fs, clones).filter(|s| s.serves(private)) {
-                let value = render(&snap);
-                memory.insert(key, snap);
+            if let Some(snap) = filesystem(|| cache::load(&path, one_fs, clones)).filter(|s| s.serves(private)) {
+                let retained = Retained {
+                    snapshot: snap,
+                    generation: state.generation()?,
+                    shares,
+                };
+                let value = render(&retained.snapshot, &path, shares, Some(retained.generation));
+                if let Some(old) = memory.insert(key, retained) {
+                    std::thread::spawn(move || drop(old));
+                }
                 return value;
             }
         }
@@ -207,8 +442,9 @@ fn call_tool(name: &str, args: &Value, opts: CacheOpts) -> Result<Value, String>
             ..Progress::default()
         };
         let started = Instant::now();
-        let root_dev = scan::device_of(&path).ok();
-        let root = scan::scan(&path, one_fs, clones, &progress).map_err(|e| format!("{}: {e}", path.display()))?;
+        let root_dev = filesystem(|| scan::device_of(&path)).ok();
+        let root = filesystem(|| scan::scan(&path, one_fs, clones, &progress))
+            .map_err(|e| format!("{}: {e}", path.display()))?;
         let snap = Snapshot {
             root,
             cached_at: None,
@@ -224,14 +460,21 @@ fn call_tool(name: &str, args: &Value, opts: CacheOpts) -> Result<Value, String>
             privates: progress.take_private(),
             reflink_fs: scan::ReflinkFs::from_code(progress.reflink_fs.load(Ordering::Relaxed)),
         };
-        let value = render(&snap);
-        if use_cache {
+        let generation = use_cache.then(|| state.generation()).transpose()?;
+        let value = render(&snap, &path, shares, generation);
+        if let Some(generation) = generation {
             let snap = Snapshot {
                 cached_at: Some(SystemTime::now()),
                 ..snap
             };
-            // Replacing an older tree frees it; do that off the request path.
-            if let Some(old) = memory.insert(key, snap) {
+            if let Some(old) = memory.insert(
+                key,
+                Retained {
+                    snapshot: snap,
+                    generation,
+                    shares,
+                },
+            ) {
                 std::thread::spawn(move || drop(old));
             }
         } else {
@@ -243,7 +486,9 @@ fn call_tool(name: &str, args: &Value, opts: CacheOpts) -> Result<Value, String>
 
 thread_local! {
     /// Scans kept for the server's lifetime with `--mcp --cache`.
-    static MEMORY: RefCell<HashMap<(PathBuf, bool), Snapshot>> = RefCell::new(HashMap::new());
+    static MEMORY: RefCell<HashMap<(PathBuf, bool), Retained>> = RefCell::new(HashMap::new());
+    #[cfg(test)]
+    static FILESYSTEM_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn rpc_error(code: i32, message: impl Into<String>) -> Value {
@@ -270,6 +515,23 @@ fn validate_tool_args(name: &str, args: &Value) -> Result<(), String> {
         if reg().find_by_name(category).is_none() {
             return Err(format!("unknown category {category:?}"));
         }
+    }
+    if name == "find_by_category" {
+        if args.get("paginate").is_some_and(|value| !value.is_boolean()) {
+            return Err("paginate must be a boolean".into());
+        }
+        if let Some(cursor) = args.get("cursor") {
+            let cursor = cursor.as_str().ok_or("cursor must be a string")?;
+            Cursor::parse(cursor).map_err(|_| "invalid or unsupported category cursor")?;
+            if args.get("paginate") == Some(&Value::Bool(false)) {
+                return Err("cursor cannot be combined with paginate: false".into());
+            }
+            if args.get("refresh") == Some(&Value::Bool(true)) {
+                return Err("cursor cannot be combined with refresh: true".into());
+            }
+        }
+    } else if args.get("paginate").is_some() || args.get("cursor").is_some() {
+        return Err("pagination is only supported by find_by_category".into());
     }
     if let Some(top) = args.get("top")
         && top_value(top).is_none()
@@ -304,7 +566,13 @@ fn handle_tool_call(params: &Value, opts: CacheOpts) -> Result<Value, Value> {
             "structuredContent": value,
             "isError": false
         }),
-        Err(error) => json!({"content": [{"type": "text", "text": error}], "isError": true}),
+        Err(ToolError::Argument(error)) => return Err(rpc_error(-32602, error)),
+        Err(ToolError::Execution(error)) => json!({"content": [{"type": "text", "text": error}], "isError": true}),
+        Err(ToolError::StaleCursor) => {
+            let error = json!({"code": "stale_cursor", "restart_required": true,
+                "message": "The cursor snapshot is no longer retained; start again without a cursor."});
+            json!({"content": [{"type": "text", "text": error.to_string()}], "structuredContent": error, "isError": true})
+        }
     })
 }
 
@@ -377,6 +645,254 @@ mod tests {
         }
     }
 
+    struct PaginationFixture {
+        path: PathBuf,
+    }
+
+    impl PaginationFixture {
+        fn new(shares: bool, private: bool) -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "dutype-pagination-unit-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&dir).unwrap();
+            for name in ["a.pdf", "b.pdf", "c.pdf"] {
+                std::fs::write(dir.join(name), b"pdf").unwrap();
+            }
+            let path = std::fs::canonicalize(dir).unwrap();
+            let root = scan::scan_excluding(&path, true, false, &Progress::default(), None).unwrap();
+            let mut privates = scan::PrivateSizes::default();
+            for (i, name) in ["a.pdf", "b.pdf", "c.pdf"].into_iter().enumerate() {
+                privates.0.insert(PathBuf::from(name), i as u64 + 10);
+            }
+            let snapshot = Snapshot {
+                root,
+                cached_at: Some(SystemTime::UNIX_EPOCH),
+                scan_time: std::time::Duration::ZERO,
+                errors: 7,
+                root_dev: None,
+                clones: private,
+                clone_ids: private,
+                clone_gaps: private,
+                private,
+                private_sizes: private,
+                private_missing: false,
+                privates,
+                reflink_fs: None,
+            };
+            MEMORY.with_borrow_mut(|memory| {
+                memory.insert(
+                    (path.clone(), true),
+                    Retained {
+                        snapshot,
+                        generation: cursor_state().generation().unwrap(),
+                        shares,
+                    },
+                );
+            });
+            Self { path }
+        }
+
+        fn args(&self) -> Value {
+            json!({"path": self.path, "category": "PDF", "paginate": true, "top": 1})
+        }
+
+        fn call(&self, args: Value) -> Result<Value, Value> {
+            handle_tool_call(
+                &json!({"name": "find_by_category", "arguments": args}),
+                CacheOpts {
+                    use_cache: true,
+                    always_refresh: false,
+                },
+            )
+        }
+
+        fn page(&self, args: Value) -> Value {
+            let result = self.call(args).unwrap();
+            assert_eq!(result["isError"], false, "{result}");
+            let text: Value = serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+            assert_eq!(text, result["structuredContent"]);
+            result["structuredContent"].clone()
+        }
+    }
+
+    impl Drop for PaginationFixture {
+        fn drop(&mut self) {
+            MEMORY.with_borrow_mut(|memory| {
+                memory.remove(&(self.path.clone(), true));
+            });
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[test]
+    fn paginated_metadata_and_frozen_context_survive_without_filesystem_work() {
+        for (shares, private) in [(false, false), (true, false), (true, true)] {
+            let fixture = PaginationFixture::new(shares, private);
+            let mut args = fixture.args();
+            args["private"] = json!(private);
+            let first = fixture.page(args.clone());
+            assert_eq!(first["unreadable"], 7);
+            assert_eq!(first["accounting"]["private"], private);
+            assert_eq!(first["items"][0]["private_bytes"].is_number(), private);
+            assert_eq!(first["items"][0]["freeable_min_bytes"].is_null(), shares && !private);
+            assert_eq!(first["pagination"]["offset"], 0);
+            std::fs::remove_dir_all(&fixture.path).unwrap();
+            let before = MEMORY.with_borrow(HashMap::len);
+            let mut page = first.clone();
+            for offset in [1, 2] {
+                args["cursor"] = page["pagination"]["next_cursor"].clone();
+                FILESYSTEM_CALLS.with(|count| count.set(0));
+                page = fixture.page(args.clone());
+                assert_eq!(FILESYSTEM_CALLS.with(std::cell::Cell::get), 0);
+                assert_eq!(page["unreadable"], first["unreadable"]);
+                assert_eq!(page["accounting"], first["accounting"]);
+                assert_eq!(page["cached_at"], first["cached_at"]);
+                assert_eq!(page["matched_items"], 3);
+                assert_eq!(page["items_truncated"], true);
+                assert_eq!(page["pagination"]["snapshot_id"], first["pagination"]["snapshot_id"]);
+                assert_eq!(page["pagination"]["offset"], offset);
+                assert_eq!(page["items"][0]["freeable_min_bytes"].is_null(), shares && !private);
+                assert_eq!(page["items"][0]["private_bytes"].is_number(), private);
+            }
+            assert_eq!(page["pagination"]["has_more"], false);
+            assert!(page["pagination"]["next_cursor"].is_null());
+            assert_eq!(MEMORY.with_borrow(HashMap::len), before, "pages add no retained state");
+        }
+    }
+
+    #[test]
+    fn invalid_page_queries_and_tokens_never_touch_the_filesystem() {
+        let fixture = PaginationFixture::new(false, false);
+        let first = fixture.page(fixture.args());
+        let token = first["pagination"]["next_cursor"].as_str().unwrap();
+        let mut base = fixture.args();
+        base["cursor"] = json!(token);
+        for (key, value) in [
+            ("path", json!(fixture.path.join("missing"))),
+            ("path", json!(format!("{}/.", fixture.path.display()))),
+            ("category", json!("Video")),
+            ("size_mode", json!("dedup")),
+            ("clones", json!(true)),
+            ("private", json!(true)),
+            ("cross_fs", json!(true)),
+            ("paginate", json!(false)),
+            ("refresh", json!(true)),
+            ("cursor", Value::Null),
+            ("cursor", json!(false)),
+            ("cursor", json!("")),
+            ("cursor", json!(format!("{token}0"))),
+            ("cursor", json!(token.to_uppercase())),
+            ("cursor", json!(token.replacen("v1.", "v2.", 1))),
+            ("cursor", json!("x".repeat(10_000))),
+        ] {
+            let mut args = base.clone();
+            args[key] = value;
+            FILESYSTEM_CALLS.with(|count| count.set(0));
+            let error = fixture.call(args.clone()).unwrap_err();
+            assert_eq!(error["code"], -32602, "{args}: {error}");
+            assert_eq!(FILESYSTEM_CALLS.with(std::cell::Cell::get), 0);
+        }
+        let (mut cursor, _) = Cursor::parse(token).unwrap();
+        // A canonical but tampered ordinal must fail the fingerprint before
+        // even resolving a tree boundary. Internally generated out-of-range
+        // boundaries are independently rejected by the bounded report helper.
+        let mut tampered = token.as_bytes().to_vec();
+        tampered[3 + 5 * 16] = if tampered[3 + 5 * 16] == b'0' { b'1' } else { b'0' };
+        for bad in [String::from_utf8(tampered).unwrap(), {
+            cursor.after = u64::MAX;
+            cursor.encode(cursor_state())
+        }] {
+            let mut args = base.clone();
+            args["cursor"] = json!(bad);
+            FILESYSTEM_CALLS.with(|count| count.set(0));
+            assert_eq!(fixture.call(args).unwrap_err()["code"], -32602);
+            assert_eq!(FILESYSTEM_CALLS.with(std::cell::Cell::get), 0);
+        }
+        for invalid in [json!(1), json!("true"), Value::Null] {
+            let mut args = fixture.args();
+            args["paginate"] = invalid;
+            FILESYSTEM_CALLS.with(|count| count.set(0));
+            assert_eq!(fixture.call(args).unwrap_err()["code"], -32602);
+            assert_eq!(FILESYSTEM_CALLS.with(std::cell::Cell::get), 0);
+        }
+    }
+
+    #[test]
+    fn stale_cursors_are_machine_readable_execution_errors_without_scans() {
+        let fixture = PaginationFixture::new(false, false);
+        let first = fixture.page(fixture.args());
+        let (cursor, _) = Cursor::parse(first["pagination"]["next_cursor"].as_str().unwrap()).unwrap();
+        for stale in [
+            Cursor {
+                generation: u64::MAX,
+                ..cursor
+            },
+            Cursor {
+                epoch: [!cursor.epoch[0], cursor.epoch[1]],
+                ..cursor
+            },
+        ] {
+            let mut args = fixture.args();
+            args["cursor"] = json!(stale.encode(cursor_state()));
+            FILESYSTEM_CALLS.with(|count| count.set(0));
+            let result = fixture.call(args).unwrap();
+            assert_eq!(result["isError"], true);
+            assert_eq!(result["structuredContent"]["code"], "stale_cursor");
+            assert_eq!(result["structuredContent"]["restart_required"], true);
+            let text: Value = serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+            assert_eq!(text, result["structuredContent"]);
+            assert_eq!(FILESYSTEM_CALLS.with(std::cell::Cell::get), 0);
+        }
+    }
+
+    #[test]
+    fn process_epoch_and_generation_do_not_depend_on_cached_timestamp_or_wrap() {
+        let a = CursorState::new();
+        let b = CursorState::new();
+        assert_ne!(a.epoch, b.epoch);
+        assert_ne!(a.snapshot_id(1), b.snapshot_id(1));
+        assert_ne!(a.snapshot_id(1), a.snapshot_id(2));
+        a.next_generation.store(u64::MAX - 1, Ordering::Relaxed);
+        assert_eq!(a.generation().unwrap(), u64::MAX - 1);
+        assert!(matches!(a.generation(), Err(ToolError::Execution(_))));
+        assert!(matches!(a.generation(), Err(ToolError::Execution(_))));
+        assert_eq!(a.next_generation.load(Ordering::Relaxed), u64::MAX);
+    }
+
+    #[test]
+    fn pagination_requires_cache_and_is_not_a_disk_usage_option() {
+        let args = json!({"path": "nonexistent-pagination-root", "category": "PDF", "paginate": true});
+        for opts in [
+            CacheOpts {
+                use_cache: false,
+                always_refresh: false,
+            },
+            CacheOpts {
+                use_cache: true,
+                always_refresh: true,
+            },
+        ] {
+            FILESYSTEM_CALLS.with(|count| count.set(0));
+            let result = handle_tool_call(&json!({"name": "find_by_category", "arguments": args}), opts).unwrap();
+            assert_eq!(result["isError"], true);
+            assert!(
+                result["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("--mcp --cache without --refresh")
+            );
+            assert_eq!(FILESYSTEM_CALLS.with(std::cell::Cell::get), 0);
+        }
+        assert!(validate_tool_args("disk_usage", &args).is_err());
+        let schemas = tools();
+        assert!(schemas[0]["inputSchema"]["properties"].get("paginate").is_none());
+        assert_eq!(schemas[1]["inputSchema"]["properties"]["paginate"]["default"], false);
+        assert_eq!(schemas[1]["inputSchema"]["properties"]["cursor"]["type"], "string");
+    }
+
     #[test]
     fn category_results_serialize_scan_wide_snapshot_errors_including_empty_matches() {
         use std::time::{Duration, UNIX_EPOCH};
@@ -411,7 +927,16 @@ mod tests {
                     privates: scan::PrivateSizes::default(),
                     reflink_fs: None,
                 };
-                MEMORY.with_borrow_mut(|memory| memory.insert(key.clone(), snap));
+                MEMORY.with_borrow_mut(|memory| {
+                    memory.insert(
+                        key.clone(),
+                        Retained {
+                            snapshot: snap,
+                            generation: cursor_state().generation().unwrap(),
+                            shares: scan::may_share_blocks(&path, true),
+                        },
+                    )
+                });
                 for (tool, category) in [
                     ("disk_usage", "PDF"),
                     ("find_by_category", "PDF"),

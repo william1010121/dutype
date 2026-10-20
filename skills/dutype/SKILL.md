@@ -120,7 +120,7 @@ per folder.
 
 `dutype --mcp` is an MCP server on stdio with two read-only tools,
 `disk_usage(path, top?, cross_fs?, refresh?, clones?, size_mode?, private?)` and
-`find_by_category(path, category, top?, cross_fs?, refresh?, clones?, size_mode?, private?)`,
+`find_by_category(path, category, top?, cross_fs?, refresh?, clones?, size_mode?, private?, paginate?, cursor?)`,
 with the same fields as `--json`. `size_mode` is `"du"` (default) or `"dedup"`
 (implies `clones: true`); `private: true` adds `private_bytes` (implies
 `clones: true`).
@@ -128,3 +128,22 @@ With `dutype --mcp --cache`, `refresh: true` replaces the session's in-memory
 snapshot only; MCP never writes or replaces the CLI's disk cache. Use a CLI
 run with `--refresh` to update the disk snapshot used by future sessions.
 Claude Code: `claude mcp add dutype -- npx -y dutype --mcp`.
+
+
+For category inventories beyond 500 matches, use `dutype --mcp --cache` without
+server-wide `--refresh`. Start with `paginate: true`; follow
+`pagination.next_cursor`, repeating the returned absolute `path`, category and
+effective options. `top` remains 1–500 (default 50) and may change between pages.
+Cursor presence implies pagination; never combine it with `refresh: true` or
+`paginate: false`. Stop on `pagination.has_more: false` / `next_cursor: null`,
+not `items_truncated`, which still compares all matches to this page's length.
+Pages keep one completed scan's counts, hard-link attribution, accounting and
+scan-wide `unreadable` warnings, not atomic/live filesystem truth. Continuation
+works even if the root disappears and does not rescan. Successful refresh via
+either tool, capability replacement or server restart invalidates old cursors;
+failed refresh and other roots do not. On structured `stale_cursor` with
+`restart_required: true`, start again without a cursor (optionally refresh).
+One current tree per root/filesystem policy remains in session memory; cursors
+never pin old trees or persist to disk. Each page selects at most 500 candidates
+in at most two tree walks; many small pages repeat that work. Without opt-in,
+legacy responses/defaults remain unchanged.
