@@ -33,6 +33,8 @@ impl SizeMode {
 pub struct Meta<'a> {
     pub elapsed: Duration,
     pub cached_at: Option<SystemTime>,
+    /// Scan-wide unreadable count, even for a single-category report: an
+    /// unreadable entry may not have a known category.
     pub unreadable: u64,
     /// The scan looked for APFS clones (`--clones`).
     pub clones: bool,
@@ -161,7 +163,7 @@ pub struct Report {
     pub scan_seconds: f64,
     /// Unix time of the scan when it was read from the `--cache`, else null.
     pub cached_at: Option<u64>,
-    /// Entries that could not be read (permissions, races).
+    /// Scan-wide count of entries that could not be read (permissions, races).
     pub unreadable: u64,
     /// Every category with a non-zero size, biggest first.
     pub categories: Vec<CategoryShare>,
@@ -445,6 +447,17 @@ fn shared_label(clone_detection: &str) -> &'static str {
     }
 }
 
+/// Snapshot provenance and scan-wide errors, shared by full/category text.
+fn scan_notices(out: &mut String, cached_at: Option<u64>, unreadable: u64) {
+    use std::fmt::Write as _;
+    if let Some(at) = cached_at {
+        let _ = writeln!(out, "(from cache, scanned {}; --refresh to rescan)", crate::ui::ago(at));
+    }
+    if unreadable > 0 {
+        let _ = writeln!(out, "({unreadable} entries unreadable)");
+    }
+}
+
 pub fn to_text(r: &Report, root: &Node) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
@@ -464,12 +477,7 @@ pub fn to_text(r: &Report, root: &Node) -> String {
             frees
         );
     }
-    if let Some(at) = r.cached_at {
-        let _ = writeln!(out, "(from cache, scanned {}; --refresh to rescan)", crate::ui::ago(at));
-    }
-    if r.unreadable > 0 {
-        let _ = writeln!(out, "({} entries unreadable)", r.unreadable);
-    }
+    scan_notices(&mut out, r.cached_at, r.unreadable);
     let _ = writeln!(out, "\nBy category:");
     for c in &r.categories {
         let _ = writeln!(out, "  {:<14} {:>10}  {:5.1}%", c.name, c.size, c.percent);
@@ -550,13 +558,18 @@ pub fn find(
     list.into_sorted().into_iter().map(|i| i.entry(root_path)).collect()
 }
 
-/// Text for [`find`]'s items, showing the sizes they were ranked by.
-pub fn find_to_text(cat: Category, items: &[Entry], mode: SizeMode) -> String {
+/// Text for [`find`]'s items, showing the sizes they were ranked by and any
+/// cached-snapshot/scan-wide unreadable notices.
+pub fn find_to_text(cat: Category, items: &[Entry], meta: &Meta) -> String {
     use std::fmt::Write as _;
+    let mode = meta.size_mode;
     let size = |e: &Entry| mode.pick(e.size_bytes, e.dedup_bytes);
     let total: u64 = items.iter().map(size).sum();
-    let mut out = format!(
-        "Largest {} ({} shown, {} total{}):\n",
+    let mut out = String::new();
+    scan_notices(&mut out, unix_secs(meta.cached_at), meta.unreadable);
+    let _ = writeln!(
+        out,
+        "Largest {} ({} shown, {} total{}):",
         cat.label(),
         items.len(),
         human(total),
@@ -579,6 +592,75 @@ pub fn find_to_text(cat: Category, items: &[Entry], mode: SizeMode) -> String {
 mod tests {
     use super::*;
     use crate::category::reg;
+
+    fn plain_meta() -> Meta<'static> {
+        Meta {
+            elapsed: Duration::ZERO,
+            cached_at: None,
+            unreadable: 0,
+            clones: false,
+            clone_ids: false,
+            clone_gaps: false,
+            shares: false,
+            size_mode: SizeMode::Du,
+            private: None,
+            reflink_fs: None,
+        }
+    }
+
+    #[test]
+    fn category_and_full_text_share_scan_notices_with_exact_placement() {
+        let root = Node {
+            name: "root".into(),
+            size: 0,
+            cat: reg().other(),
+            special: false,
+            hardlink: false,
+            lossy: false,
+            clone: false,
+            dir: Some(Box::new(crate::scan::DirInfo {
+                cats: vec![0; reg().len()].into_boxed_slice(),
+                files: 0,
+                errors: 0,
+                children: Vec::new(),
+                free_base: 0,
+                clones: None,
+            })),
+        };
+        // Future timestamps use a stable "just now" label, independent of
+        // the test runner's clock or a minute boundary during the assertion.
+        let cached = UNIX_EPOCH + Duration::from_secs(7_258_118_400);
+        for (cached_at, unreadable, notices) in [
+            (None, 0, ""),
+            (None, 7, "(7 entries unreadable)\n"),
+            (Some(cached), 0, "(from cache, scanned just now; --refresh to rescan)\n"),
+            (
+                Some(cached),
+                7,
+                "(from cache, scanned just now; --refresh to rescan)\n(7 entries unreadable)\n",
+            ),
+        ] {
+            let meta = Meta {
+                cached_at,
+                unreadable,
+                ..plain_meta()
+            };
+            let cat = reg().find_by_name("PDF").unwrap();
+            let items = find(&root, Path::new("root"), cat, 20, SizeMode::Du, true, None);
+            assert!(items.is_empty());
+            assert_eq!(
+                find_to_text(cat, &items, &meta),
+                format!("{notices}Largest PDF (0 shown, 0 B total):\n")
+            );
+            let report = build(&root, Path::new("root"), &meta, 20);
+            assert!(to_text(&report, &root).starts_with(&format!(
+                "root  —  0 B  ·  0 files  ·  0.00s\n{notices}\nBy category:\n"
+            )));
+            let json = serde_json::to_value(&report).unwrap();
+            assert_eq!(json["unreadable"].as_u64(), Some(unreadable));
+            assert_eq!(json["cached_at"], serde_json::json!(unix_secs(cached_at)));
+        }
+    }
 
     #[test]
     fn top_n_ties_use_the_same_path_order_as_sorting() {
@@ -752,10 +834,27 @@ mod tests {
             private_bytes: None,
         };
         let items = [item("/a", 3 << 20, 3 << 20), item("/b", 2 << 20, 0)];
-        let du = find_to_text(reg().other(), &items, SizeMode::Du);
+        let du = find_to_text(reg().other(), &items, &plain_meta());
         assert!(du.contains("5.0 MiB total)") && du.contains("2.0 MiB  /b"), "{du}");
-        let dedup = find_to_text(reg().other(), &items, SizeMode::Dedup);
+        let dedup = find_to_text(
+            reg().other(),
+            &items,
+            &Meta {
+                size_mode: SizeMode::Dedup,
+                ..plain_meta()
+            },
+        );
         assert!(dedup.contains("3.0 MiB total, clones counted once)"), "{dedup}");
         assert!(dedup.contains("0 B  /b"), "{dedup}");
+        let warned = find_to_text(
+            reg().other(),
+            &items,
+            &Meta {
+                unreadable: 2,
+                size_mode: SizeMode::Dedup,
+                ..plain_meta()
+            },
+        );
+        assert_eq!(warned, format!("(2 entries unreadable)\n{dedup}"));
     }
 }

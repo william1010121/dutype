@@ -205,13 +205,14 @@ fn run(args: Args) -> Result<(), String> {
                     "path": path.display().to_string(),
                     "category": cat.label(),
                     "cached_at": report::unix_secs(snap.cached_at),
+                    "unreadable": meta.unreadable,
                     "accounting": report::accounting(&meta),
                     "items": items,
                 });
                 print(&serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?);
                 print("\n");
             } else {
-                print(&report::find_to_text(cat, &items, args.size_mode));
+                print(&report::find_to_text(cat, &items, &meta));
             }
         } else {
             let r = report::build(root, &path, &meta, args.top);

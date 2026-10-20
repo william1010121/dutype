@@ -56,7 +56,8 @@ fn tools() -> Value {
             "description": "List the largest items of one category below a directory, e.g. every \
                 node_modules or Python env with its size, or the biggest PDF / video files. \
                 Directory categories return the matching directories, file categories \
-                return files. Read-only.",
+                return files. unreadable counts entries that could not be read across the \
+                whole scan, not just this category: unreadable entries may be unclassifiable. Read-only.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -162,6 +163,7 @@ fn call_tool(name: &str, args: &Value, opts: CacheOpts) -> Result<Value, String>
                 "path": path.display().to_string(),
                 "category": c.label(),
                 "cached_at": report::unix_secs(snap.cached_at),
+                "unreadable": meta.unreadable,
                 "accounting": report::accounting(&meta),
                 "items": report::find(
                     &snap.root,
@@ -365,6 +367,80 @@ mod tests {
             use_cache: false,
             always_refresh: false,
         }
+    }
+
+    #[test]
+    fn category_results_serialize_scan_wide_snapshot_errors_including_empty_matches() {
+        use std::time::{Duration, UNIX_EPOCH};
+
+        let dir = std::env::temp_dir().join(format!("dutype-mcp-scan-errors-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("paper.pdf"), b"pdf").unwrap();
+        let path = std::fs::canonicalize(&dir).unwrap();
+        let key = (path.clone(), true);
+        let cached = UNIX_EPOCH + Duration::from_secs(1_234_567_890);
+        let mut expected_items = None;
+        for cached_at in [None, Some(cached)] {
+            for errors in [0, 7, u64::MAX] {
+                let root = scan::scan_excluding(&path, true, false, &Progress::default(), None).unwrap();
+                assert_eq!(root.errors(), 0);
+                // Synthetic scan-wide metadata makes this test portable even
+                // where chmod(000) cannot make a directory unreadable. The
+                // response must use Snapshot.errors, not category matches or
+                // the root's independently stored subtree error count.
+                let snap = Snapshot {
+                    root,
+                    cached_at,
+                    scan_time: Duration::ZERO,
+                    errors,
+                    root_dev: None,
+                    clones: false,
+                    clone_ids: false,
+                    clone_gaps: false,
+                    private: false,
+                    private_sizes: false,
+                    private_missing: false,
+                    privates: scan::PrivateSizes::default(),
+                    reflink_fs: None,
+                };
+                MEMORY.with_borrow_mut(|memory| memory.insert(key.clone(), snap));
+                for (tool, category) in [
+                    ("disk_usage", "PDF"),
+                    ("find_by_category", "PDF"),
+                    ("find_by_category", "Video"),
+                ] {
+                    let response = handle(
+                        &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                            "params": {"name": tool, "arguments": {"path": path, "category": category}}}),
+                        CacheOpts {
+                            use_cache: true,
+                            always_refresh: false,
+                        },
+                    )
+                    .unwrap();
+                    let result = &response["result"];
+                    assert_eq!(result["isError"], false, "{response}");
+                    let content = &result["structuredContent"];
+                    let text: Value = serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+                    assert_eq!(&text, content);
+                    assert_eq!(content["unreadable"].as_u64(), Some(errors));
+                    assert_eq!(content["cached_at"], json!(report::unix_secs(cached_at)));
+                    if tool == "find_by_category" {
+                        assert!(content.get("complete").is_none());
+                        if category == "Video" {
+                            assert_eq!(content["items"], json!([]));
+                        } else if let Some(expected) = &expected_items {
+                            assert_eq!(&content["items"], expected);
+                        } else {
+                            assert_eq!(content["items"].as_array().unwrap().len(), 1);
+                            expected_items = Some(content["items"].clone());
+                        }
+                    }
+                }
+            }
+        }
+        MEMORY.with_borrow_mut(|memory| memory.remove(&key));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
