@@ -1083,7 +1083,11 @@ fn scan_root(
     let parent = root.parent().map(file_name_of).unwrap_or_default();
     let own_size = platform::allocated(&meta);
     let mut node = scan_dir(root, file_name_of(root).into(), &parent, inherited, own_size, &ctx);
-    crate::account::attribute_hardlinks(&mut node, clones);
+    if !crate::account::attribute_hardlinks(&mut node, clones, &progress.cancel) {
+        // The UI joins and discards a cancelled scan; do no more accounting.
+        node.name = name;
+        return Ok(node);
+    }
     // Only a probed tree reports its extents as read (a file root is not:
     // it may share blocks, so nothing about it is freeable for sure).
     #[cfg(target_os = "linux")]
@@ -1094,7 +1098,7 @@ fn scan_root(
         progress.reflink_fs.store(fs.code(), Ordering::Relaxed);
     }
     node.name = name;
-    if clones {
+    if clones && !progress.cancel.load(Ordering::Relaxed) {
         crate::account::account(&mut node, Some(root));
     }
     Ok(node)

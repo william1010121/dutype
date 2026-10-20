@@ -33,6 +33,7 @@ use rayon::prelude::*;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
 /// A visited dir, in pre-order.
 struct Dir {
@@ -73,19 +74,34 @@ type Range = (u64, u64, u64, u32);
 /// link, before probing shared extents or accounting for clone families.
 /// Temporary `Shared` records also exist in default scans, but only for
 /// hard links: neither ordinary files nor `Node` gain extra storage.
-pub fn attribute_hardlinks(root: &mut Node, clones: bool) {
+/// Returns false on cancellation; the partial tree must then be discarded.
+pub fn attribute_hardlinks(root: &mut Node, clones: bool, cancel: &AtomicBool) -> bool {
+    attribute_hardlinks_while(root, clones, &|| cancel.load(AtomicOrdering::Relaxed))
+}
+
+/// A cancelled result is partial and must be discarded by the caller. Check
+/// between bounded batches, never halfway through an inode's byte transfer.
+fn attribute_hardlinks_while(root: &mut Node, clones: bool, cancelled: &impl Fn() -> bool) -> bool {
+    if cancelled() {
+        return false;
+    }
     if !root.hardlink {
-        return;
+        return true;
     }
     let mut links = Hardlinks::default();
-    links.collect(root, root, 0, 0, 0);
+    if !links.collect(root, root, 0, 0, 0, cancelled) {
+        return false;
+    }
     let Hardlinks {
         dirs,
         groups,
         mut path_a,
         ..
     } = links;
-    for (rep, counted) in groups.into_values() {
+    for (i, (rep, counted)) in groups.into_values().enumerate() {
+        if i % 256 == 0 && cancelled() {
+            return false;
+        }
         if rep.file == counted.file || counted.size == 0 {
             continue;
         }
@@ -117,7 +133,7 @@ pub fn attribute_hardlinks(root: &mut Node, clones: bool) {
             }
         }
     }
-    finish_attribution(root, clones);
+    finish_attribution(root, clones, cancelled)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -143,9 +159,20 @@ struct Hardlinks {
 }
 
 impl Hardlinks {
-    fn collect(&mut self, root: &Node, node: &Node, parent: u32, child: u32, depth: u32) {
+    fn collect(
+        &mut self,
+        root: &Node,
+        node: &Node,
+        parent: u32,
+        child: u32,
+        depth: u32,
+        cancelled: &impl Fn() -> bool,
+    ) -> bool {
         stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
-            let Some(d) = node.dir.as_ref() else { return };
+            if cancelled() {
+                return false;
+            }
+            let Some(d) = node.dir.as_ref() else { return true };
             let id = self.dirs.len() as u32;
             self.dirs.push(Dir {
                 parent,
@@ -153,7 +180,13 @@ impl Hardlinks {
                 depth,
                 first: 0,
             });
-            for (slot, s) in d.shared().iter().enumerate().filter(|(_, s)| s.nlink > 1) {
+            for (slot, s) in d.shared().iter().enumerate() {
+                if slot % 256 == 0 && cancelled() {
+                    return false;
+                }
+                if s.nlink <= 1 {
+                    continue;
+                }
                 let candidate = Link {
                     file: FileRef {
                         dir: id,
@@ -186,29 +219,43 @@ impl Hardlinks {
                 }
             }
             for (i, c) in d.children.iter().enumerate() {
-                if c.is_dir() && c.hardlink {
-                    self.collect(root, c, id, i as u32, depth + 1);
+                if i % 256 == 0 && cancelled() {
+                    return false;
+                }
+                if c.is_dir() && c.hardlink && !self.collect(root, c, id, i as u32, depth + 1, cancelled) {
+                    return false;
                 }
             }
-        });
+            true
+        })
     }
 }
 
 /// Restore size ordering only after all index paths have been used. Sorting
 /// remaps `Shared.idx`; a default scan releases its temporary records first.
-fn finish_attribution(node: &mut Node, clones: bool) {
+fn finish_attribution(node: &mut Node, clones: bool, cancelled: &impl Fn() -> bool) -> bool {
     stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
-        let Some(d) = node.dir.as_mut() else { return };
-        for c in &mut d.children {
-            if c.hardlink {
-                finish_attribution(c, clones);
+        if cancelled() {
+            return false;
+        }
+        let Some(d) = node.dir.as_mut() else { return true };
+        for (i, c) in d.children.iter_mut().enumerate() {
+            if i % 256 == 0 && cancelled() {
+                return false;
             }
+            if c.is_dir() && c.hardlink && !finish_attribution(c, clones, cancelled) {
+                return false;
+            }
+        }
+        if cancelled() {
+            return false;
         }
         if !clones {
             d.clones = None;
         }
         d.sort_children(false);
-    });
+        !cancelled()
+    })
 }
 
 /// Recompute `dup`, `group_free` and the `Shared` records' `dup` (and
@@ -765,7 +812,7 @@ mod tests {
 /// Hand-built trees, so the clone rules are tested on every platform.
 #[cfg(test)]
 mod synthetic {
-    use super::{account, attribute_hardlinks};
+    use super::{account, attribute_hardlinks, attribute_hardlinks_while};
     use crate::category::reg;
     use crate::scan::{CloneInfo, DirInfo, Node, Shared};
     use std::path::Path;
@@ -861,6 +908,122 @@ mod synthetic {
         out
     }
 
+    fn hardlink_tree(inodes: usize) -> Node {
+        let mut dirs = Vec::new();
+        for link in 0..8 {
+            let mut files = Vec::with_capacity(inodes);
+            for ino in 0..inodes {
+                let mut node = file(&format!("c{ino:08}.rs"), false);
+                node.hardlink = true;
+                node.size = if link == 7 { S } else { 0 };
+                files.push(node);
+            }
+            let mut node = dir(&format!("d{link}"), files);
+            let d = node.dir.as_mut().unwrap();
+            d.free_base = 0;
+            for (ino, shared) in d.clones.as_mut().unwrap().shared.iter_mut().enumerate() {
+                shared.key = (1, ino as u64 + 1);
+                shared.ino = ino as u64 + 1;
+                shared.nlink = 8;
+                shared.is_clone = false;
+                shared.refcnt = 1;
+            }
+            dirs.push(node);
+        }
+        dir("synthetic", dirs)
+    }
+
+    #[test]
+    fn cancellation_preserves_complete_inode_transfers() {
+        use std::cell::Cell;
+        for clones in [false, true] {
+            let mut saw_partial_transfer = false;
+            let mut saw_completion = false;
+            let total = Cell::new(0);
+            assert!(attribute_hardlinks_while(&mut hardlink_tree(600), clones, &|| {
+                total.set(total.get() + 1);
+                false
+            }));
+            for budget in 1..=total.get() + 1 {
+                let mut root = hardlink_tree(600);
+                let calls = Cell::new(0);
+                let complete = attribute_hardlinks_while(&mut root, clones, &|| {
+                    calls.set(calls.get() + 1);
+                    calls.get() >= budget
+                });
+                fn check(node: &Node) {
+                    if let Some(d) = &node.dir {
+                        assert_eq!(node.size, d.children.iter().map(|c| c.size).sum::<u64>());
+                        assert_eq!(node.size, d.cats.iter().sum::<u64>());
+                        assert_eq!(d.free_base, 0);
+                        for child in &d.children {
+                            check(child);
+                        }
+                    }
+                }
+                check(&root);
+                assert_eq!(root.size, 600 * S);
+                let dirs = &root.dir.as_ref().unwrap().children;
+                let moved = dirs.iter().find(|d| &*d.name == "d0").unwrap().size / S;
+                let remaining = dirs.iter().find(|d| &*d.name == "d7").unwrap().size / S;
+                assert_eq!(moved + remaining, 600);
+                let mut sizes = rustc_hash::FxHashMap::default();
+                for dir in dirs {
+                    for file in &dir.dir.as_ref().unwrap().children {
+                        *sizes.entry(&file.name).or_insert(0) += file.size;
+                    }
+                }
+                assert_eq!(sizes.len(), 600);
+                assert!(sizes.values().all(|&size| size == S));
+                if moved > 0 && moved < 600 {
+                    saw_partial_transfer = true;
+                    assert!(!complete);
+                    assert_eq!(moved % 256, 0);
+                }
+                if complete {
+                    saw_completion = true;
+                    assert_eq!(moved, 600);
+                }
+                // Cancelled partial trees are safe to drop, never publish/cache.
+            }
+            assert!(saw_partial_transfer);
+            assert!(saw_completion);
+        }
+    }
+
+    #[test]
+    #[ignore = "manual cancellation-boundary benchmark"]
+    fn measure_cancelled_hardlink_postpass() {
+        use std::sync::atomic::Ordering;
+        use std::time::Instant;
+        for inodes in [20_000usize, 160_000] {
+            for run in 0..5 {
+                let mut root = hardlink_tree(inodes);
+                let progress = crate::scan::Progress::default();
+                // The UI has requested cancellation just as traversal ends.
+                progress.cancel.store(true, Ordering::Relaxed);
+                let started = Instant::now();
+                assert!(!attribute_hardlinks(&mut root, false, &progress.cancel));
+                let elapsed = started.elapsed();
+                assert_eq!(root.size, inodes as u64 * S);
+                eprintln!(
+                    "links={} run={} cancelled_postpass_ms={:.3}",
+                    inodes * 8,
+                    run,
+                    elapsed.as_secs_f64() * 1000.0
+                );
+                let dropped = Instant::now();
+                drop(root);
+                eprintln!(
+                    "links={} run={} tree_drop_ms={:.3}",
+                    inodes * 8,
+                    run,
+                    dropped.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+        }
+    }
+
     #[test]
     fn hard_link_transfer_precedes_clone_accounting_without_filesystem_access() {
         for flip in [false, true] {
@@ -889,7 +1052,7 @@ mod synthetic {
             }
             identities(&mut root);
             for _ in 0..2 {
-                attribute_hardlinks(&mut root, true);
+                attribute_hardlinks(&mut root, true, &std::sync::atomic::AtomicBool::new(false));
                 account(&mut root, None);
                 assert_eq!(root.size, 2 * S);
                 assert_eq!(root.cats()[reg().other().index()], 2 * S);
