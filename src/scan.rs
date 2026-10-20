@@ -1508,7 +1508,9 @@ impl<T: Ord> TopN<T> {
     pub fn new(n: usize) -> Self {
         TopN {
             n,
-            heap: BinaryHeap::with_capacity(n + 1),
+            // Bound only the initial allocation, never the requested limit.
+            // A huge `--top` must not overflow or reserve memory for unseen items.
+            heap: BinaryHeap::with_capacity(n.min(1024)),
         }
     }
 
@@ -1532,6 +1534,26 @@ impl<T: Ord> TopN<T> {
         let mut v: Vec<T> = self.heap.into_iter().map(|Reverse(t)| t).collect();
         v.sort_by(|a, b| b.cmp(a));
         v
+    }
+}
+
+#[cfg(test)]
+mod top_n_tests {
+    use super::TopN;
+
+    #[test]
+    fn limits_bound_results_not_initial_allocation() {
+        for limit in [0, 1, 2, 1024, 1025, usize::MAX] {
+            let mut top = TopN::new(limit);
+            assert!(top.heap.capacity() <= 1024);
+            for value in 0..2048 {
+                if top.accepts(|&min| value > min) {
+                    top.push(value);
+                }
+            }
+            let expected: Vec<_> = (0..2048).rev().take(limit).collect();
+            assert_eq!(top.into_sorted(), expected, "limit {limit}");
+        }
     }
 }
 
@@ -1966,7 +1988,7 @@ mod bulk_tests {
         }
         let other = crate::category::reg().other();
         let found = crate::report::find(&node, &d, other, 20, meta.size_mode, true, meta.private);
-        let partial = found.iter().find(|e| e.path.ends_with("/partial")).unwrap();
+        let partial = found.items.iter().find(|e| e.path.ends_with("/partial")).unwrap();
         assert_eq!(partial.private_bytes, size);
         let plain_meta = crate::report::Meta { private: None, ..meta };
         let r = serde_json::to_value(crate::report::build(&node, &d, &plain_meta, 20)).unwrap();

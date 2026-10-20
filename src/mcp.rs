@@ -56,7 +56,10 @@ fn tools() -> Value {
             "description": "List the largest items of one category below a directory, e.g. every \
                 node_modules or Python env with its size, or the biggest PDF / video files. \
                 Directory categories return the matching directories, file categories \
-                return files. unreadable counts entries that could not be read across the \
+                return files. matched_items counts matches in the scanned snapshot before \
+                the top limit; a matching directory counts once, without its descendants. \
+                items_truncated is true when matched_items exceeds items.length. \
+                unreadable counts entries that could not be read across the \
                 whole scan, not just this category: unreadable entries may be unclassifiable. Read-only.",
             "inputSchema": {
                 "type": "object",
@@ -159,13 +162,8 @@ fn call_tool(name: &str, args: &Value, opts: CacheOpts) -> Result<Value, String>
         };
         match category {
             None => serde_json::to_value(report::build(&snap.root, &path, &meta, top.unwrap_or(20))),
-            Some(c) => serde_json::to_value(json!({
-                "path": path.display().to_string(),
-                "category": c.label(),
-                "cached_at": report::unix_secs(snap.cached_at),
-                "unreadable": meta.unreadable,
-                "accounting": report::accounting(&meta),
-                "items": report::find(
+            Some(c) => {
+                let found = report::find(
                     &snap.root,
                     &path,
                     c,
@@ -173,8 +171,18 @@ fn call_tool(name: &str, args: &Value, opts: CacheOpts) -> Result<Value, String>
                     size_mode,
                     report::freeable_known(report::detected(snap.clones, snap.clone_ids, snap.reflink_fs), shares),
                     meta.private,
-                ),
-            })),
+                );
+                serde_json::to_value(json!({
+                    "path": path.display().to_string(),
+                    "category": c.label(),
+                    "cached_at": report::unix_secs(snap.cached_at),
+                    "unreadable": meta.unreadable,
+                    "accounting": report::accounting(&meta),
+                    "matched_items": found.matched_items,
+                    "items_truncated": found.items_truncated,
+                    "items": found.items,
+                }))
+            }
         }
         .map_err(|e| e.to_string())
     };

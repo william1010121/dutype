@@ -119,6 +119,20 @@ fn payload(response: &Value) -> &Value {
     );
     assert!(text.get("cached_at").is_some());
     assert!(text["cached_at"].is_null() || text["cached_at"].is_u64());
+    if let Some(items) = text["items"].as_array() {
+        let matched = text["matched_items"]
+            .as_u64()
+            .expect("matched_items must be an unsigned integer");
+        assert!(matched >= items.len() as u64);
+        assert_eq!(text["items_truncated"], matched > items.len() as u64);
+    } else {
+        for key in ["matched_items", "items_truncated"] {
+            assert!(
+                text.get(key).is_none(),
+                "category-only field {key} leaked into full report"
+            );
+        }
+    }
     &result["structuredContent"]
 }
 
@@ -170,6 +184,7 @@ fn tool_text_and_structured_content_agree_and_execution_errors_stay_results() {
     assert_eq!(responses[0]["result"]["protocolVersion"], "2025-06-18");
     assert_eq!(responses[1]["result"]["tools"].as_array().unwrap().len(), 2);
     for response in &responses[2..4] {
+        payload(response);
         let result = &response["result"];
         assert_eq!(result["isError"], false);
         assert_eq!(result["content"].as_array().unwrap().len(), 1);
@@ -187,6 +202,8 @@ fn tool_text_and_structured_content_agree_and_execution_errors_stay_results() {
     assert!(report["size_bytes"].is_u64());
     assert_eq!(report["children"], json!([]));
     assert_eq!(responses[3]["result"]["structuredContent"]["items"], json!([]));
+    assert_eq!(responses[3]["result"]["structuredContent"]["matched_items"], 0);
+    assert_eq!(responses[3]["result"]["structuredContent"]["items_truncated"], false);
     assert_eq!(responses[4]["result"]["isError"], true);
     assert!(responses[4].get("error").is_none());
     assert!(responses[4]["result"].get("structuredContent").is_none());
@@ -235,7 +252,7 @@ fn deep_scans_survive_repeated_requests_cache_replacement_and_shutdown() {
         let responses = fixture.run_with_args(&input, args);
         assert_eq!(responses.len(), 4);
         for response in &responses {
-            assert_eq!(response["result"]["isError"], false, "{response}");
+            payload(response);
         }
         assert_eq!(responses[0]["result"]["structuredContent"]["files"], 0);
         assert_eq!(responses[0]["result"]["structuredContent"]["unreadable"], 0);
@@ -284,9 +301,113 @@ fn missing_category_reports_complete_fresh_and_cached_scans_without_writing_cach
         for index in [0, 1, 3] {
             assert_eq!(reports[index]["category"], "PDF");
             assert_eq!(reports[index]["items"], json!([]));
+            assert_eq!(reports[index]["matched_items"], 0);
+            assert_eq!(reports[index]["items_truncated"], false);
         }
         assert_eq!(reports[0], reports[3]);
         assert_eq!(reports[1]["cached_at"], reports[2]["cached_at"]);
+        assert!(!fixture.0.join("cache").exists(), "MCP must not write cache files");
+    }
+}
+
+#[test]
+fn category_maximum_top_counts_omitted_items_and_keeps_validation_bounds() {
+    let fixture = Fixture::new();
+    let directory = fixture.0.join("tree");
+    fs::create_dir(&directory).unwrap();
+    for i in 0..501 {
+        fs::write(directory.join(format!("{i:04}.pdf")), b"").unwrap();
+    }
+    let mut input = vec![json!({"jsonrpc":"2.0", "id":"schema", "method":"tools/list"})];
+    input.extend([1, 500, 0, 501, u64::MAX].into_iter().map(|top| {
+        json!({"jsonrpc":"2.0", "id":top, "method":"tools/call", "params":{
+            "name":"find_by_category", "arguments":{"path":directory, "category":"PDF", "top":top}}})
+    }));
+    let responses = fixture.run(&input.iter().map(Value::to_string).collect::<Vec<_>>().join("\n"));
+    assert_eq!(responses.len(), 6);
+    let tools = responses[0]["result"]["tools"].as_array().unwrap();
+    let find = tools.iter().find(|tool| tool["name"] == "find_by_category").unwrap();
+    assert_eq!(find["inputSchema"]["properties"]["top"]["minimum"], 1);
+    assert_eq!(find["inputSchema"]["properties"]["top"]["maximum"], 500);
+    for (response, top) in responses[1..3].iter().zip([1, 500]) {
+        let report = payload(response);
+        assert_eq!(report["matched_items"], 501);
+        assert_eq!(report["items_truncated"], true);
+        let items = report["items"].as_array().unwrap();
+        assert_eq!(items.len(), top);
+        assert!(items[0]["path"].as_str().unwrap().ends_with("0500.pdf"));
+        assert!(
+            items[top - 1]["path"]
+                .as_str()
+                .unwrap()
+                .ends_with(&format!("{:04}.pdf", 501 - top))
+        );
+    }
+    for response in &responses[3..] {
+        assert_eq!(response["error"]["code"], -32602, "{response}");
+        assert!(response["error"]["message"].as_str().unwrap().contains("1 to 500"));
+        assert!(response.get("result").is_none());
+    }
+}
+
+#[test]
+fn category_counts_follow_cached_snapshot_and_prune_matching_directories() {
+    for mode in ["du", "dedup"] {
+        let fixture = Fixture::new();
+        let directory = fixture.0.join("tree");
+        for relative in ["node_modules/pkg/node_modules", "bower_components"] {
+            fs::create_dir_all(directory.join(relative)).unwrap();
+            fs::write(directory.join(relative).join("inherited.pdf"), b"").unwrap();
+        }
+        for name in ["a.pdf", "z.pdf"] {
+            fs::write(directory.join(name), b"").unwrap();
+        }
+        let call = |id, category, top, refresh| {
+            json!({"jsonrpc":"2.0", "id":id, "method":"tools/call", "params":{
+                "name":"find_by_category", "arguments":{"path":directory, "category":category,
+                    "top":top, "refresh":refresh, "size_mode":mode}}})
+        };
+        let input = [call(1, "node_modules", 1, false), call(2, "PDF", 1, false)]
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let responses = fixture.run_with_args_then(&input, &["--cache"], 2, || {
+            fs::create_dir_all(directory.join("new/node_modules")).unwrap();
+            fs::write(directory.join("m.pdf"), b"").unwrap();
+            [
+                call(3, "node_modules", 2, false),
+                call(4, "PDF", 2, false),
+                call(5, "node_modules", 2, true),
+                call(6, "PDF", 2, false),
+            ]
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+        });
+        assert_eq!(responses.len(), 6);
+        let reports: Vec<_> = responses.iter().map(payload).collect();
+        for (index, report) in reports.iter().enumerate() {
+            assert_eq!(report["matched_items"], if index < 4 { 2 } else { 3 });
+            assert_eq!(report["items_truncated"], !matches!(index, 2 | 3));
+            assert_eq!(report["items"].as_array().unwrap().len(), if index < 2 { 1 } else { 2 });
+            assert_eq!(report["cached_at"].is_null(), matches!(index, 0 | 4));
+            assert_eq!(report["accounting"]["size_mode"], mode);
+        }
+        let mut matched_paths: Vec<_> = reports[2]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| PathBuf::from(item["path"].as_str().unwrap()))
+            .collect();
+        matched_paths.sort();
+        let root = fs::canonicalize(&directory).unwrap();
+        assert_eq!(
+            matched_paths,
+            [root.join("bower_components"), root.join("node_modules")]
+        );
+        assert_eq!(reports[1]["cached_at"], reports[3]["cached_at"]);
         assert!(!fixture.0.join("cache").exists(), "MCP must not write cache files");
     }
 }
@@ -314,7 +435,7 @@ fn partial_category_cache_keeps_scan_errors_after_permissions_recover_until_refr
         };
         if !deny_root {
             fs::create_dir(&denied).unwrap();
-            fs::write(directory.join("visible.txt"), b"readable sibling").unwrap();
+            fs::write(directory.join("visible.pdf"), b"readable sibling").unwrap();
         }
         fs::write(denied.join("hidden.pdf"), b"hidden").unwrap();
         let permissions = RestorePermissions(denied.clone(), fs::metadata(&denied).unwrap().permissions());
@@ -332,7 +453,7 @@ fn partial_category_cache_keeps_scan_errors_after_permissions_recover_until_refr
         }
         let call = |id, tool, refresh| {
             json!({"jsonrpc":"2.0", "id":id, "method":"tools/call", "params":{
-            "name":tool, "arguments":{"path":directory, "category":"PDF", "refresh":refresh}}})
+            "name":tool, "arguments":{"path":directory, "category":"PDF", "top":1, "refresh":refresh}}})
         };
         let input = [
             call(1, "find_by_category", false),
@@ -362,7 +483,16 @@ fn partial_category_cache_keeps_scan_errors_after_permissions_recover_until_refr
             assert_eq!(report["cached_at"].is_null(), matches!(index, 0 | 4));
         }
         for index in [0, 2, 3] {
-            assert_eq!(reports[index]["items"], json!([]));
+            assert_eq!(
+                reports[index]["items"].as_array().unwrap().len(),
+                usize::from(!deny_root)
+            );
+            assert_eq!(
+                reports[index]["matched_items"],
+                u64::from(!deny_root),
+                "unreadable entries are not known matches"
+            );
+            assert_eq!(reports[index]["items_truncated"], false);
         }
         assert_eq!(reports[1]["cached_at"], reports[2]["cached_at"]);
         assert_eq!(
@@ -370,6 +500,8 @@ fn partial_category_cache_keeps_scan_errors_after_permissions_recover_until_refr
             "restoring permissions must not silently refresh a cached scan"
         );
         assert_eq!(reports[4]["items"].as_array().unwrap().len(), 1);
+        assert_eq!(reports[4]["matched_items"], if deny_root { 1 } else { 2 });
+        assert_eq!(reports[4]["items_truncated"], !deny_root);
         assert_eq!(reports[5]["files"], if deny_root { 1 } else { 2 });
         assert!(!fixture.0.join("cache").exists(), "MCP must not write cache files");
     }
@@ -387,6 +519,7 @@ fn relative_tool_paths_are_absolute_in_both_payloads() {
     let responses = fixture.run(&input);
     assert_eq!(responses.len(), 2);
     for response in &responses {
+        payload(response);
         let result = &response["result"];
         assert_eq!(result["isError"], false);
         let payload = &result["structuredContent"];

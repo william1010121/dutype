@@ -41,13 +41,17 @@ impl Fixture {
     }
 
     fn command_for(&self, format: &str) -> Command {
+        self.command_for_top(format, 100)
+    }
+
+    fn command_for_top(&self, format: &str, top: usize) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_dutype"));
         command
             .arg(format)
             .arg("--config")
             .arg(&self.config)
             .arg("--top")
-            .arg("100")
+            .arg(top.to_string())
             .arg(&self.root)
             .env("DUTYPE_CACHE_DIR", self.base.join("unused-cache"))
             .env("RAYON_NUM_THREADS", "4")
@@ -58,7 +62,11 @@ impl Fixture {
     }
 
     fn output(&self, format: &str, args: &[&str]) -> String {
-        let output = bounded_output(self.command_for(format).args(args).spawn().unwrap());
+        self.output_with_top(format, 100, args)
+    }
+
+    fn output_with_top(&self, format: &str, top: usize, args: &[&str]) -> String {
+        let output = bounded_output(self.command_for_top(format, top).args(args).spawn().unwrap());
         assert!(
             output.status.success() && output.stderr.is_empty(),
             "report failed: status={}, stderr={}",
@@ -69,15 +77,22 @@ impl Fixture {
     }
 
     fn category_report(&self, args: &[&str]) -> Value {
+        self.category_report_with_top("PDF", 100, args)
+    }
+
+    fn category_report_with_top(&self, category: &str, top: usize, args: &[&str]) -> Value {
         let mut args = args.to_vec();
-        args.extend(["--category", "PDF"]);
-        let report: Value = serde_json::from_str(&self.output("--json", &args)).unwrap();
+        args.extend(["--category", category]);
+        let report: Value = serde_json::from_str(&self.output_with_top("--json", top, &args)).unwrap();
         assert_absolute_path(&report);
-        assert_eq!(report["category"], "PDF");
+        assert_eq!(report["category"], category);
         assert_u64(&report, "unreadable");
         assert_optional_u64(&report, "cached_at");
         assert!(report["accounting"].is_object());
-        assert!(report["items"].is_array());
+        let shown = report["items"].as_array().unwrap().len() as u64;
+        let matched = assert_u64(&report, "matched_items");
+        assert!(matched >= shown);
+        assert_eq!(report["items_truncated"], matched > shown);
         report
     }
 
@@ -193,6 +208,12 @@ fn assert_category_schema(category: &Value) {
 
 fn assert_report_schema(report: &Value, root: &Path) {
     assert_absolute_path(report);
+    for key in ["matched_items", "items_truncated"] {
+        assert!(
+            report.get(key).is_none(),
+            "category-only field {key} leaked into full report"
+        );
+    }
     assert_eq!(
         report["path"].as_str().unwrap(),
         fs::canonicalize(root).unwrap().to_str().unwrap()
@@ -289,8 +310,11 @@ fn missing_category_keeps_zero_errors_explicit_in_fresh_and_cached_reports() {
     assert_eq!(fresh["unreadable"], 0);
     assert!(fresh["cached_at"].is_null());
     assert!(fresh["items"].as_array().unwrap().is_empty());
+    assert_eq!(fresh["matched_items"], 0);
+    assert_eq!(fresh["items_truncated"], false);
+    assert_eq!(fixture.category_report_with_top("PDF", 0, &[]), fresh);
     let text = fixture.output("--report", &["--category", "PDF"]);
-    assert_eq!(text, "Largest PDF (0 shown, 0 B total):\n");
+    assert_eq!(text, "Largest PDF (0 of 0 shown, 0 B displayed total):\n");
 
     let before = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
     assert_eq!(fixture.category_report(&["--cache"]), fresh);
@@ -314,51 +338,157 @@ fn missing_category_keeps_zero_errors_explicit_in_fresh_and_cached_reports() {
 }
 
 #[test]
+fn category_limits_count_all_matches_without_changing_tie_order() {
+    let fixture = Fixture::new("category-limits");
+    for name in ["a.pdf", "z.pdf", "m.pdf"] {
+        // Zero-byte files still match, and tie independently of allocation size.
+        fs::write(fixture.root.join(name), b"").unwrap();
+    }
+    fs::write(fixture.root.join("ignored.txt"), b"not a PDF").unwrap();
+    let full: Value = serde_json::from_str(&fixture.output_with_top("--json", usize::MAX, &[])).unwrap();
+    assert_report_schema(&full, &fixture.root);
+    assert_eq!(full["largest_files"].as_array().unwrap().len(), 4);
+    for mode in ["du", "dedup"] {
+        let all = fixture.category_report(&["--size-mode", mode]);
+        let names: Vec<_> = all["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| {
+                Path::new(item["path"].as_str().unwrap())
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(names, ["z.pdf", "m.pdf", "a.pdf"]);
+        for top in [0, 1, 3, 4, usize::MAX] {
+            let report = fixture.category_report_with_top("PDF", top, &["--size-mode", mode]);
+            let mut expected = all.clone();
+            expected["items"].as_array_mut().unwrap().truncate(top);
+            expected["items_truncated"] = (top < 3).into();
+            assert_eq!(report, expected, "top={top}, mode={mode}");
+            assert_eq!(report["matched_items"], 3);
+
+            let text = fixture.output_with_top("--report", top, &["--category", "PDF", "--size-mode", mode]);
+            let suffix = if mode == "dedup" { ", clones counted once" } else { "" };
+            assert_eq!(
+                text.lines().next().unwrap(),
+                format!("Largest PDF ({} of 3 shown, 0 B displayed total{suffix}):", top.min(3))
+            );
+            assert_eq!(text.lines().count(), top.min(3) + 1);
+            for (line, item) in text.lines().skip(1).zip(report["items"].as_array().unwrap()) {
+                assert!(line.ends_with(item["path"].as_str().unwrap()), "{line}");
+            }
+        }
+    }
+}
+
+#[test]
+fn directory_category_counts_prune_matching_subtrees_and_exclude_inherited_files() {
+    let fixture = Fixture::new("category-pruning");
+    for directory in ["a/node_modules/pkg/node_modules", "b/node_modules", "ordinary"] {
+        fs::create_dir_all(fixture.root.join(directory)).unwrap();
+        fs::write(fixture.root.join(directory).join("paper.pdf"), b"content").unwrap();
+    }
+    fs::write(fixture.root.join("visible.pdf"), b"content").unwrap();
+    for mode in ["du", "dedup"] {
+        let args = ["--size-mode", mode];
+        let all = fixture.category_report_with_top("node_modules", usize::MAX, &args);
+        assert_eq!(all["matched_items"], 2);
+        assert_eq!(all["items_truncated"], false);
+        let mut paths: Vec<_> = all["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| PathBuf::from(item["path"].as_str().unwrap()))
+            .collect();
+        paths.sort();
+        let root = fs::canonicalize(&fixture.root).unwrap();
+        assert_eq!(paths, [root.join("a/node_modules"), root.join("b/node_modules")]);
+        for top in [0, 1, 2, 3] {
+            let limited = fixture.category_report_with_top("node_modules", top, &args);
+            let mut expected = all.clone();
+            expected["items"].as_array_mut().unwrap().truncate(top);
+            expected["items_truncated"] = (top < 2).into();
+            assert_eq!(limited, expected);
+        }
+        let files = fixture.category_report_with_top("PDF", usize::MAX, &args);
+        assert_eq!(
+            files["matched_items"], 2,
+            "PDFs inside node_modules inherit its category"
+        );
+        assert_eq!(files["items_truncated"], false);
+        assert_eq!(files["items"].as_array().unwrap().len(), 2);
+    }
+}
+
+#[test]
 fn cli_and_mcp_category_reports_keep_the_same_schema_and_ranked_items() {
     let fixture = Fixture::new("category-schema-parity");
     for (name, size) in [("small.pdf", 1), ("large.pdf", 16384), ("medium.pdf", 8192)] {
         fs::write(fixture.root.join(name), vec![b'x'; size]).unwrap();
     }
-    let cli = fixture.category_report(&[]);
-    let full = fixture.report();
-    assert_eq!(cli["path"], full["path"]);
-    assert_eq!(cli["accounting"], full["accounting"]);
-    assert_eq!(cli["unreadable"], full["unreadable"]);
-    assert_eq!(cli["items"], full["largest_files"]);
-    assert_eq!(cli["items"].as_array().unwrap().len(), 3);
+    for mode in ["du", "dedup"] {
+        let cli = fixture.category_report(&["--size-mode", mode]);
+        let full: Value = serde_json::from_str(&fixture.output("--json", &["--size-mode", mode])).unwrap();
+        assert_eq!(cli["path"], full["path"]);
+        assert_eq!(cli["accounting"], full["accounting"]);
+        assert_eq!(cli["unreadable"], full["unreadable"]);
+        assert_eq!(cli["items"], full["largest_files"]);
+        assert_eq!(cli["items"].as_array().unwrap().len(), 3);
+        assert_eq!(cli["matched_items"], 3);
+        assert_eq!(cli["items_truncated"], false);
+        if mode == "du" {
+            let text = fixture.output_with_top("--report", 1, &["--category", "PDF"]);
+            assert_eq!(
+                text.lines().next().unwrap(),
+                format!(
+                    "Largest PDF (1 of 3 shown, {} displayed total):",
+                    cli["items"][0]["size"].as_str().unwrap()
+                )
+            );
+        }
 
-    let mut child = fixture.command_for("--mcp").stdin(Stdio::piped()).spawn().unwrap();
-    let input = [
-        json!({"jsonrpc":"2.0", "id":1, "method":"tools/call", "params":{
-            "name":"find_by_category", "arguments":{"path":fixture.root, "category":"PDF", "top":100}}}),
-        json!({"jsonrpc":"2.0", "id":2, "method":"tools/call", "params":{
-            "name":"find_by_category", "arguments":{"path":fixture.root, "category":"PDF", "top":2}}}),
-    ]
-    .iter()
-    .map(Value::to_string)
-    .collect::<Vec<_>>()
-    .join("\n");
-    child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
-    let output = bounded_output(child);
-    assert!(output.status.success());
-    assert!(output.stderr.is_empty(), "{}", String::from_utf8_lossy(&output.stderr));
-    let responses: Vec<Value> = String::from_utf8(output.stdout)
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .collect();
-    assert_eq!(responses.len(), 2);
-    for response in &responses {
-        let result = &response["result"];
-        assert_eq!(result["isError"], false);
-        let text: Value = serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
-        assert_eq!(text, result["structuredContent"]);
-        assert_u64(&text, "unreadable");
+        let limits = [1, 3, 4, 500];
+        let mut child = fixture.command_for("--mcp").stdin(Stdio::piped()).spawn().unwrap();
+        let input = limits
+            .iter()
+            .enumerate()
+            .map(|(id, top)| {
+                json!({"jsonrpc":"2.0", "id":id, "method":"tools/call", "params":{
+                "name":"find_by_category", "arguments":{
+                    "path":fixture.root, "category":"PDF", "top":top, "size_mode":mode}}})
+                .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+        let output = bounded_output(child);
+        assert!(output.status.success());
+        assert!(output.stderr.is_empty(), "{}", String::from_utf8_lossy(&output.stderr));
+        let responses: Vec<Value> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(responses.len(), limits.len());
+        for (response, top) in responses.iter().zip(limits) {
+            let result = &response["result"];
+            assert_eq!(result["isError"], false);
+            let text: Value = serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+            assert_eq!(text, result["structuredContent"]);
+            assert_eq!(
+                text,
+                fixture.category_report_with_top("PDF", top, &["--size-mode", mode])
+            );
+            let mut expected = cli.clone();
+            expected["items"].as_array_mut().unwrap().truncate(top);
+            expected["items_truncated"] = (top < 3).into();
+            assert_eq!(text, expected);
+        }
     }
-    assert_eq!(responses[0]["result"]["structuredContent"], cli);
-    let mut limited = cli;
-    limited["items"].as_array_mut().unwrap().truncate(2);
-    assert_eq!(responses[1]["result"]["structuredContent"], limited);
     assert!(!fixture.base.join("unused-cache").exists(), "MCP must remain read-only");
 }
 
@@ -497,7 +627,7 @@ fn unreadable_root_is_explicitly_reported_as_partial() {
     assert!(category["items"].as_array().unwrap().is_empty());
     assert_eq!(
         fixture.output("--report", &["--category", "PDF"]),
-        "(1 entries unreadable)\nLargest PDF (0 shown, 0 B total):\n"
+        "(1 entries unreadable)\nLargest PDF (0 of 0 shown, 0 B displayed total):\n"
     );
 }
 
@@ -525,7 +655,7 @@ fn unreadable_descendant_does_not_hide_readable_siblings() {
     assert!(category["items"].as_array().unwrap().is_empty());
     assert_eq!(
         fixture.output("--report", &["--category", "PDF"]),
-        "(1 entries unreadable)\nLargest PDF (0 shown, 0 B total):\n"
+        "(1 entries unreadable)\nLargest PDF (0 of 0 shown, 0 B displayed total):\n"
     );
 }
 
@@ -544,6 +674,8 @@ fn cached_partial_category_stays_partial_after_permissions_recover_until_refresh
     assert_eq!(fresh["unreadable"], 1);
     assert!(fresh["cached_at"].is_null());
     assert_eq!(fresh["items"].as_array().unwrap().len(), 1);
+    assert_eq!(fresh["matched_items"], 1, "unreadable entries are not known matches");
+    assert_eq!(fresh["items_truncated"], false);
     assert!(fresh["items"][0]["path"].as_str().unwrap().ends_with("visible.pdf"));
     let cached = fixture.category_report(&["--cache"]);
     assert_u64(&cached, "cached_at");
@@ -551,6 +683,11 @@ fn cached_partial_category_stays_partial_after_permissions_recover_until_refresh
 
     drop(permissions);
     assert_eq!(fixture.category_report(&["--cache"]), cached);
+    let hidden = fixture.category_report_with_top("PDF", 0, &["--cache"]);
+    assert_eq!(hidden["matched_items"], 1);
+    assert_eq!(hidden["items_truncated"], true);
+    assert_eq!(hidden["items"], json!([]));
+    assert_eq!(hidden["cached_at"], cached["cached_at"]);
     let full: Value = serde_json::from_str(&fixture.output("--json", &["--cache"])).unwrap();
     assert_eq!(full["unreadable"], cached["unreadable"]);
     assert_eq!(full["cached_at"], cached["cached_at"]);
@@ -561,18 +698,23 @@ fn cached_partial_category_stays_partial_after_permissions_recover_until_refresh
     assert!(notice.starts_with("(from cache, scanned "), "{text}");
     assert!(notice.ends_with("; --refresh to rescan)"), "{text}");
     assert_eq!(lines.next(), Some("(1 entries unreadable)"));
-    assert!(lines.next().unwrap().starts_with("Largest PDF (1 shown, "));
+    assert!(lines.next().unwrap().starts_with("Largest PDF (1 of 1 shown, "));
 
     let refreshed = fixture.category_report(&["--refresh"]);
     assert_eq!(refreshed["unreadable"], 0);
     assert!(refreshed["cached_at"].is_null());
     assert_eq!(refreshed["items"].as_array().unwrap().len(), 2);
+    assert_eq!(refreshed["matched_items"], 2);
+    assert_eq!(refreshed["items_truncated"], false);
+    let limited = fixture.category_report_with_top("PDF", 1, &["--cache"]);
+    assert_eq!(limited["matched_items"], 2);
+    assert_eq!(limited["items_truncated"], true);
     let cached_refreshed = fixture.category_report(&["--cache"]);
     assert_u64(&cached_refreshed, "cached_at");
     assert_eq!(cached_refreshed["unreadable"], 0);
     assert_eq!(cached_refreshed["items"], refreshed["items"]);
     let text = fixture.output("--report", &["--category", "PDF", "--refresh"]);
-    assert!(text.starts_with("Largest PDF (2 shown, "));
+    assert!(text.starts_with("Largest PDF (2 of 2 shown, "));
     assert!(!text.contains("entries unreadable") && !text.contains("from cache"));
 }
 

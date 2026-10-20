@@ -377,6 +377,21 @@ filesystem state. Both text report forms show cached-snapshot and unreadable
 notices when applicable. A cached partial scan keeps its unreadable count
 even after permissions change; use `--refresh` (MCP: `refresh: true`) to rescan.
 
+Category JSON (`--category` and MCP `find_by_category`) also includes:
+
+- `matched_items` (unsigned integer): matching items below the root in the
+  scanned snapshot, before the top-N limit. A matching directory counts once
+  and its descendants are not searched; zero-byte matches count too.
+- `items_truncated` (boolean): `matched_items > items.length`. This describes
+  list truncation only, not scan completeness: unreadable entries are not
+  inferred or counted as matches. Cached counts describe the cached snapshot.
+
+Category text shows, for example, `1 of 4 shown` and a `displayed total` for
+only the returned items, using the selected size mode, not all matches.
+CLI `--top 0` shows no items but still counts matches; MCP keeps its existing
+`top` range of 1–500. Larger CLI limits do not reserve memory for the entire
+requested limit up front, and do not impose a new result cap.
+
 **Private sizes (`--private`, macOS/APFS)** — a file that was cloned and then
 changed (a *partial clone*) shares only some blocks with other files, so neither
 `size_bytes` nor the clone-family numbers say what deleting it frees. With

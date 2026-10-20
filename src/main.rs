@@ -199,7 +199,7 @@ fn run(args: Args) -> Result<(), String> {
         if let Some(cat) = only {
             let detected = report::detected(snap.clones, snap.clone_ids, snap.reflink_fs);
             let known = report::freeable_known(detected, meta.shares);
-            let items = report::find(root, &path, cat, args.top, args.size_mode, known, meta.private);
+            let found = report::find(root, &path, cat, args.top, args.size_mode, known, meta.private);
             if args.json {
                 let doc = serde_json::json!({
                     "path": path.display().to_string(),
@@ -207,12 +207,14 @@ fn run(args: Args) -> Result<(), String> {
                     "cached_at": report::unix_secs(snap.cached_at),
                     "unreadable": meta.unreadable,
                     "accounting": report::accounting(&meta),
-                    "items": items,
+                    "matched_items": found.matched_items,
+                    "items_truncated": found.items_truncated,
+                    "items": found.items,
                 });
                 print(&serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?);
                 print("\n");
             } else {
-                print(&report::find_to_text(cat, &items, &meta));
+                print(&report::find_to_text(cat, &found, &meta));
             }
         } else {
             let r = report::build(root, &path, &meta, args.top);
