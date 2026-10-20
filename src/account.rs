@@ -463,7 +463,7 @@ fn extent_dups(
     }
     check(cancelled, 0)?;
     let (mut pa, mut pb) = (Vec::new(), Vec::new());
-    ids.sort_by(|&a, &b| compare(root, dirs, &members[a as usize], &members[b as usize], &mut pa, &mut pb));
+    ids.sort_by(|&a, &b| compare_local(root, dirs, &members[a as usize], &members[b as usize], &mut pa, &mut pb));
     check(cancelled, 0)?;
     let mut rank = vec![0u32; members.len()];
     for (r, &id) in ids.iter().enumerate() {
@@ -497,6 +497,22 @@ fn extent_dups(
         dup[i] = held[i].min(members[i].size).saturating_sub(credited[rank[i] as usize]);
     }
     Some((held, dup))
+}
+
+/// Extent ranking can compare files in one directory without rebuilding two
+/// identical paths. This needs no per-member cache or copied names.
+fn compare_local(root: &Node, dirs: &[Dir], a: &Member, b: &Member, pa: &mut Vec<u32>, pb: &mut Vec<u32>) -> Ordering {
+    if a.dir != b.dir {
+        return compare(root, dirs, a, b, pa, pb);
+    }
+    let mut dir = root;
+    if a.dir != 0 {
+        index_path(dirs, a.dir, pa);
+        for &i in pa.iter() {
+            dir = &dir.children()[i as usize];
+        }
+    }
+    name_order(file_at(dir, a.slot), file_at(dir, b.slot)).then(a.ino.cmp(&b.ino))
 }
 
 /// The sweep: `ranges` are `(start, len, file)`; every stretch covered by at
@@ -937,6 +953,119 @@ mod synthetic {
     use std::path::Path;
 
     const S: u64 = 4096;
+
+    #[test]
+    fn local_rank_comparator_matches_all_pairs_and_stable_ids() {
+        use super::{collect, compare, compare_local};
+        let mut lossy_file = file("c\\xff", true);
+        lossy_file.lossy = true;
+        let mut lossy_dir = dir("\\xfe", vec![file("ca", true), file("ca", true)]);
+        lossy_dir.lossy = true;
+        let mut root = dir(
+            "root",
+            vec![
+                file("cz", true),
+                file("ca", true),
+                file("ca", true),
+                dir("z", vec![file("cb", true), file("ca", true)]),
+                dir("\\xfe", vec![file("ca", true), file("c\\xff", true), lossy_file]),
+                lossy_dir,
+                dir(
+                    "a",
+                    vec![dir("deep", vec![file("ca", true), file("cz", true)]), file("cz", true)],
+                ),
+            ],
+        );
+        fn permute(n: &mut Node) {
+            if let Some(d) = &mut n.dir {
+                d.clones_mut().shared.reverse();
+                for c in &mut d.children {
+                    permute(c);
+                }
+            }
+        }
+        // Shared slots deliberately do not match child indices.
+        permute(&mut root);
+        let (mut dirs, mut members, mut ranges) = (Vec::new(), Vec::new(), Vec::new());
+        collect(&mut root, 0, 0, 0, &mut dirs, &mut members, &mut ranges, &|| false).unwrap();
+        // Duplicate names include both inode ties and distinct inodes.
+        for (i, m) in members.iter_mut().enumerate() {
+            m.ino = (i % 3) as u64;
+        }
+        members[1].ino = members[0].ino;
+        let (mut pa, mut pb) = (Vec::new(), Vec::new());
+        assert_eq!(
+            compare(&root, &dirs, &members[0], &members[1], &mut pa, &mut pb),
+            std::cmp::Ordering::Equal
+        );
+        for a in 0..members.len() {
+            for b in 0..members.len() {
+                let old = compare(&root, &dirs, &members[a], &members[b], &mut pa, &mut pb);
+                assert_eq!(
+                    old,
+                    compare_local(&root, &dirs, &members[a], &members[b], &mut pa, &mut pb),
+                    "direct a={a} b={b}"
+                );
+            }
+        }
+        for rotation in 0..members.len() {
+            let mut old: Vec<_> = (0..members.len()).collect();
+            old.rotate_left(rotation);
+            if rotation % 2 == 0 {
+                old.reverse();
+            }
+            let mut direct = old.clone();
+            old.sort_by(|&a, &b| compare(&root, &dirs, &members[a], &members[b], &mut pa, &mut pb));
+            direct.sort_by(|&a, &b| compare_local(&root, &dirs, &members[a], &members[b], &mut pa, &mut pb));
+            assert_eq!(old, direct);
+        }
+    }
+
+    #[test]
+    fn local_rank_comparator_resolves_deep_directory() {
+        use super::{collect, compare, compare_local};
+        let mut root = dir("deep", vec![file("cz", true), file("ca", true)]);
+        for _ in 0..2048 {
+            root = dir("deep", vec![root]);
+        }
+        let (mut dirs, mut members, mut ranges) = (Vec::new(), Vec::new(), Vec::new());
+        collect(&mut root, 0, 0, 0, &mut dirs, &mut members, &mut ranges, &|| false).unwrap();
+        assert_eq!(dirs.len(), 2049);
+        let (mut pa, mut pb) = (Vec::new(), Vec::new());
+        assert_eq!(
+            compare(&root, &dirs, &members[0], &members[1], &mut pa, &mut pb),
+            compare_local(&root, &dirs, &members[0], &members[1], &mut pa, &mut pb)
+        );
+    }
+
+    #[test]
+    fn local_rank_sparse_extents_preserve_full_credit() {
+        use super::{collect, compare, credit, extent_dups};
+        use crate::scan::Reflink;
+        let mut root = dir("root", (0..1025).map(|i| file(&format!("c{i:04}"), true)).collect());
+        for i in [0, 512, 1024] {
+            let s = &mut root.dir.as_mut().unwrap().clones_mut().shared[i];
+            s.reflink = Some(Box::new(Reflink {
+                extents: vec![(0, S)].into(),
+                dup: 0,
+                opaque: false,
+            }));
+            s.is_clone = false;
+        }
+        let (mut dirs, mut members, mut ranges) = (Vec::new(), Vec::new(), Vec::new());
+        collect(&mut root, 0, 0, 0, &mut dirs, &mut members, &mut ranges, &|| false).unwrap();
+        let mut ids = [0usize, 512, 1024];
+        let (mut pa, mut pb) = (Vec::new(), Vec::new());
+        ids.sort_by(|&a, &b| compare(&root, &dirs, &members[a], &members[b], &mut pa, &mut pb));
+        let mut credited = vec![0; ids.len()];
+        credit(&[(0, S, 0), (0, S, 1), (0, S, 2)], &mut credited);
+        let (held, dup) = extent_dups(&root, &dirs, &members, ranges, &|| false).unwrap();
+        for i in 0..members.len() {
+            let rank = ids.iter().position(|&id| id == i);
+            assert_eq!(held[i], if rank.is_some() { S } else { 0 });
+            assert_eq!(dup[i], rank.map_or(0, |r| S - credited[r]));
+        }
+    }
 
     fn file(name: &str, clone: bool) -> Node {
         Node {
