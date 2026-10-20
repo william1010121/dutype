@@ -117,9 +117,9 @@ dutype                 # current directory, interactive
 dutype ~/Projects      # any directory
 dutype --report ~      # plain-text report
 dutype --json ~        # JSON report
-dutype --json --category node_modules ~   # every node_modules with its size
+dutype --json --category node_modules ~   # largest node_modules with sizes (default: 20)
 dutype --cache ~       # reuse the last scan of ~ (instant), save new ones
-dutype --refresh ~     # rescan and update the cache
+dutype --refresh ~     # rescan and update the disk cache
 dutype --json --private ~/.cache/uv   # macOS: also what deleting each partial clone frees
 dutype --clones --size-mode dedup /data     # count clones / reflinked extents once
 ```
@@ -422,7 +422,11 @@ run.
 They never write files.
 With `dutype --mcp --cache`, repeated calls on the same path reuse the scan from
 memory (or a snapshot the CLI saved in `~/.cache/dutype`) instead of walking the
-disk again (`refresh: true` forces a rescan):
+disk again. `refresh: true` rescans and replaces only that session's in-memory
+snapshot; MCP never writes or replaces the CLI's disk cache. A new MCP session
+can still load the old disk snapshot until a CLI run with `--refresh` updates it.
+
+Add the server to an MCP client:
 
 ```bash
 claude mcp add dutype -- npx -y dutype --mcp      # Claude Code

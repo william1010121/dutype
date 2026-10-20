@@ -11,7 +11,8 @@ Agent usage: always pass `--json` or `--report`; plain `dutype PATH` opens an in
 - `dutype --top N`: list lengths (default 20). `--cross-fs`: descend into other mounts.
 - `dutype --json --clones PATH`: detect shared blocks (slower): APFS clones on macOS; on Linux btrfs / XFS / bcachefs, shared extents (one FIEMAP ioctl per file), so `dedup_bytes` counts reflinked copies and snapshot-shared data once, like `btrfs filesystem du`'s "Set shared", and `freeable_min_bytes` never includes shared extents. Without it `freeable_min_bytes` is null on macOS and those filesystems. `accounting.clone_detection` says what was detected (`fiemap`, `fiemap-partial`, `apfs-full`, `apfs-partial`, `unsupported` or `off`).
 - `dutype --dump-config`: every category and its rules (TOML). Users extend them in `~/.config/dutype/config.toml`.
-- `dutype --mcp`: MCP server on stdio with read-only tools `disk_usage` and `find_by_category` (arguments `path`, `top`, `cross_fs`, `refresh`, `clones`, `size_mode`; same fields as `--json`).
+- `dutype --mcp`: MCP server on stdio with read-only tools `disk_usage(path, top?, cross_fs?, refresh?, clones?, size_mode?, private?)` and `find_by_category(path, category, top?, cross_fs?, refresh?, clones?, size_mode?, private?)` (`?` marks optional arguments; same fields as `--json`).
+- With `dutype --mcp --cache`, `refresh: true` replaces only the session's in-memory snapshot; MCP never writes or replaces the CLI's disk cache. A CLI run with `--refresh` updates the disk snapshot used by future sessions.
 
 ## Docs
 
