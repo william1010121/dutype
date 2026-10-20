@@ -22,6 +22,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 // Older snapshots preserve first-arriving attribution and must be rescanned.
 const MAGIC: &[u8; 8] = b"DUTYPE\0\x09";
 
+// Supported nesting budget for both codecs, counting open directories including
+// a directory root. A file consumes no frame, even beneath the last allowed dir.
+// This bounds traversal workspace, not the size of a valid decoded tree.
+const MAX_DIRECTORY_FRAMES: usize = 16_384;
+
 pub struct Snapshot {
     pub root: Node,
     /// When the scan ran; `None` for a scan that was not loaded from the cache.
@@ -305,7 +310,7 @@ fn read_from(file: &Path, root_path: &Path) -> Option<Snapshot> {
     if r.bytes()? != root_path.as_os_str().as_encoded_bytes() {
         return None;
     }
-    let mut root = r.node(0)?;
+    let mut root = r.node()?;
     let privates = r.private(&root, private_sizes && !private_missing)?;
     if r.pos != data.len() {
         return None;
@@ -357,51 +362,78 @@ impl<W: Write> Writer<W> {
     /// (with their shared extents). Per-dir
     /// category totals, file counts, error totals and freeable bytes are
     /// derived again on load.
-    fn node(&mut self, n: &Node) -> io::Result<()> {
-        stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
-            self.bytes(n.name.as_bytes())?;
-            self.varint(n.size)?;
-            self.varint(n.cat.index() as u64)?;
-            self.0.write_all(&[n.is_dir() as u8
-                | (n.special as u8) << 1
-                | (n.hardlink as u8) << 2
-                | (n.lossy as u8) << 3
-                | (n.clone as u8) << 4])?;
-            if let Some(d) = &n.dir {
-                self.varint(d.children.len() as u64)?;
-                for c in &d.children {
-                    self.node(c)?;
+    fn node(&mut self, root: &Node) -> io::Result<()> {
+        self.node_header(root)?;
+        let Some(dir) = root.dir.as_deref() else { return Ok(()) };
+        // A child cursor per open directory, never one task per sibling. Even a
+        // very wide directory therefore needs only O(depth) traversal space.
+        let mut frames = vec![(dir, 0usize)];
+        while let Some((dir, next)) = frames.last_mut() {
+            if let Some(child) = dir.children.get(*next) {
+                *next += 1;
+                if child.is_dir() && frames.len() >= MAX_DIRECTORY_FRAMES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "cache directory nesting limit exceeded",
+                    ));
                 }
-                let child_errors: u64 = d.children.iter().map(Node::errors).sum();
-                self.varint(d.errors.saturating_sub(child_errors))?;
-                let child_gaps: u64 = d.children.iter().map(Node::clone_gaps).sum();
-                self.varint(d.clone_gaps().saturating_sub(child_gaps))?;
-                self.varint(d.shared().len() as u64)?;
-                for s in d.shared() {
-                    for v in [
-                        s.idx as u64,
-                        s.key.0,
-                        s.key.1,
-                        s.is_clone as u64,
-                        s.ino,
-                        s.nlink as u64,
-                        s.refcnt as u64,
-                    ] {
-                        self.varint(v)?;
-                    }
-                    let extents = s.reflink.as_ref().map_or(&[][..], |r| &r.extents);
-                    self.varint(extents.len() as u64)?;
-                    for &(start, len) in extents {
-                        self.varint(start)?;
-                        self.varint(len)?;
-                    }
-                    if let Some(r) = &s.reflink {
-                        self.0.write_all(&[r.opaque as u8])?;
-                    }
+                self.node_header(child)?;
+                if let Some(dir) = child.dir.as_deref() {
+                    frames.try_reserve(1).map_err(io::Error::other)?;
+                    frames.push((dir, 0));
                 }
+            } else {
+                self.directory_footer(dir)?;
+                frames.pop();
             }
-            Ok(())
-        })
+        }
+        Ok(())
+    }
+
+    fn node_header(&mut self, n: &Node) -> io::Result<()> {
+        self.bytes(n.name.as_bytes())?;
+        self.varint(n.size)?;
+        self.varint(n.cat.index() as u64)?;
+        self.0.write_all(&[n.is_dir() as u8
+            | (n.special as u8) << 1
+            | (n.hardlink as u8) << 2
+            | (n.lossy as u8) << 3
+            | (n.clone as u8) << 4])?;
+        if let Some(d) = &n.dir {
+            self.varint(d.children.len() as u64)?;
+        }
+        Ok(())
+    }
+
+    fn directory_footer(&mut self, d: &DirInfo) -> io::Result<()> {
+        let child_errors: u64 = d.children.iter().map(Node::errors).sum();
+        self.varint(d.errors.saturating_sub(child_errors))?;
+        let child_gaps: u64 = d.children.iter().map(Node::clone_gaps).sum();
+        self.varint(d.clone_gaps().saturating_sub(child_gaps))?;
+        self.varint(d.shared().len() as u64)?;
+        for s in d.shared() {
+            for v in [
+                s.idx as u64,
+                s.key.0,
+                s.key.1,
+                s.is_clone as u64,
+                s.ino,
+                s.nlink as u64,
+                s.refcnt as u64,
+            ] {
+                self.varint(v)?;
+            }
+            let extents = s.reflink.as_ref().map_or(&[][..], |r| &r.extents);
+            self.varint(extents.len() as u64)?;
+            for &(start, len) in extents {
+                self.varint(start)?;
+                self.varint(len)?;
+            }
+            if let Some(r) = &s.reflink {
+                self.0.write_all(&[r.opaque as u8])?;
+            }
+        }
+        Ok(())
     }
 
     /// Count, then per file (sorted, so equal tables give equal files): its
@@ -534,13 +566,50 @@ impl Reader<'_> {
         Some(Some(out.into_boxed_slice()))
     }
 
-    fn node(&mut self, depth: usize) -> Option<Node> {
-        // Bound recursion when decoding untrusted snapshots, including on
-        // small (2 MiB) thread stacks in debug builds. Deeper real trees are
-        // supported by the scanner but their snapshots are a cache miss.
-        if depth > 256 {
-            return None;
+    fn node(&mut self) -> Option<Node> {
+        // Partial ancestors stay independent. Completed subtrees use DirInfo's
+        // iterative drop, so an error at any stage also needs no recursive drop.
+        struct Frame {
+            node: Node,
+            remaining: usize,
+            children: Vec<Node>,
         }
+        let mut frames: Vec<Frame> = Vec::new();
+        loop {
+            let (mut node, count) = self.node_header()?;
+            if let Some(remaining) = count {
+                if frames.len() >= MAX_DIRECTORY_FRAMES {
+                    return None;
+                }
+                if remaining > 0 {
+                    frames.try_reserve(1).ok()?;
+                    frames.push(Frame {
+                        node,
+                        remaining,
+                        children: Vec::new(),
+                    });
+                    continue;
+                }
+                node = self.finish_directory(node, Vec::new())?;
+            }
+            // Attach this completed node, then complete as many ancestors as
+            // possible before reading another header. Empty dirs need no push.
+            loop {
+                let Some(parent) = frames.last_mut() else {
+                    return Some(node);
+                };
+                parent.children.push(node);
+                parent.remaining -= 1;
+                if parent.remaining > 0 {
+                    break;
+                }
+                let frame = frames.pop()?;
+                node = self.finish_directory(frame.node, frame.children)?;
+            }
+        }
+    }
+
+    fn node_header(&mut self) -> Option<(Node, Option<usize>)> {
         let name: Box<str> = std::str::from_utf8(self.bytes()?).ok()?.into();
         let size = self.varint()?;
         let cat = Category::from_index(usize::try_from(self.varint()?).ok()?)?;
@@ -548,132 +617,136 @@ impl Reader<'_> {
         if flags > 31 {
             return None;
         }
-        let mut hardlink_flag = flags & 4 != 0;
-        let mut clone_flag = flags & 16 != 0;
-        let dir = if flags & 1 != 0 {
+        let count = if flags & 1 != 0 {
             let count = usize::try_from(self.varint()?).ok()?;
-            // `count` is untrusted. Every child takes several bytes, so a count
-            // beyond the remaining data is corrupt; and nothing is reserved from
-            // it (not even capped: nested dirs would add up), so memory only
-            // grows with children actually decoded.
+            // Never reserve children from this untrusted count, even capped:
+            // nested directories would multiply that reservation.
             if count > self.data.len() - self.pos {
                 return None;
             }
-            let mut children = Vec::new();
-            let mut cats = vec![0u64; reg().len()].into_boxed_slice();
-            // Checked arithmetic throughout: a damaged file is a miss, never
-            // a panic or a wrapped (wrong) total.
-            let (mut files, mut child_bytes, mut errors, mut free) = (0u64, 0u64, 0u64, 0u64);
-            let mut gaps = 0u64;
-            let (mut hardlink, mut clone) = (false, false);
-            for _ in 0..count {
-                let c = self.node(depth + 1)?;
-                child_bytes = child_bytes.checked_add(c.size)?;
-                files = files.checked_add(c.files())?;
-                errors = errors.checked_add(c.errors())?;
-                gaps = gaps.checked_add(c.clone_gaps())?;
-                hardlink |= c.hardlink;
-                clone |= c.clone;
-                match &c.dir {
-                    Some(d) => {
-                        for (a, b) in cats.iter_mut().zip(d.cats.iter()) {
-                            *a = a.checked_add(*b)?;
-                        }
-                        free = free.checked_add(d.free_base)?;
-                    }
-                    None => {
-                        cats[c.cat.index()] = cats[c.cat.index()].checked_add(c.size)?;
-                        if !c.hardlink && !c.clone {
-                            free = free.checked_add(c.size)?;
-                        }
-                    }
-                }
-                children.push(c);
-            }
-            // The directory's own blocks, as in `scan_dir`.
-            let own = size.checked_sub(child_bytes)?;
-            cats[cat.index()] = cats[cat.index()].checked_add(own)?;
-            let errors = errors.checked_add(self.varint()?)?;
-            let own_gaps = self.varint()?;
-            let clone_gaps = gaps.checked_add(own_gaps)?;
-            let shared_count = usize::try_from(self.varint()?).ok()?;
-            if shared_count > children.len() || (!self.clones && (own_gaps > 0 || shared_count > 0)) {
-                return None;
-            }
-            let mut shared = Vec::with_capacity(shared_count);
-            for _ in 0..shared_count {
-                let idx = u32::try_from(self.varint()?).ok()?;
-                let key = (self.varint()?, self.varint()?);
-                let is_clone = match self.varint()? {
-                    0 => false,
-                    1 => true,
-                    _ => return None,
-                };
-                let (ino, nlink) = (self.varint()?, u32::try_from(self.varint()?).ok()?);
-                let refcnt = u32::try_from(self.varint()?).ok()?;
-                // In order, each naming a distinct file child that shares
-                // blocks (so `account` visits its dir).
-                let prev = shared.last().map(|s: &Shared| s.idx as i64).unwrap_or(-1);
-                let shares = |c: &Node| !c.is_dir() && (c.hardlink || c.clone);
-                if idx as i64 <= prev || !children.get(idx as usize).is_some_and(shares) {
-                    return None;
-                }
-                let extents = self.extents()?;
-                // Files with shared extents are marked as possibly sharing.
-                if extents.is_some() && !children[idx as usize].clone {
-                    return None;
-                }
-                shared.push(Shared {
-                    idx,
-                    key,
-                    is_clone,
-                    ino,
-                    nlink,
-                    refcnt,
-                    dup: false,
-                    reflink: match extents {
-                        Some(extents) => Some(Box::new(Reflink {
-                            extents,
-                            dup: 0,
-                            opaque: match *self.take(1)?.first()? {
-                                0 => false,
-                                1 => true,
-                                _ => return None,
-                            },
-                        })),
-                        None => None,
-                    },
-                });
-            }
-            hardlink_flag = hardlink;
-            clone_flag = clone;
-            Some(Box::new(DirInfo {
-                cats,
-                files,
-                errors,
-                children,
-                free_base: free.checked_add(own)?,
-                clones: (!shared.is_empty() || clone_gaps > 0).then(|| {
-                    Box::new(CloneInfo {
-                        shared: shared.into_boxed_slice(),
-                        gaps: clone_gaps,
-                        ..CloneInfo::default()
-                    })
-                }),
-            }))
+            Some(count)
         } else {
             None
         };
-        Some(Node {
-            name,
-            size,
-            cat,
-            special: flags & 2 != 0,
-            hardlink: hardlink_flag,
-            lossy: flags & 8 != 0,
-            clone: clone_flag,
-            dir,
-        })
+        Some((
+            Node {
+                name,
+                size,
+                cat,
+                special: flags & 2 != 0,
+                hardlink: flags & 4 != 0,
+                lossy: flags & 8 != 0,
+                clone: flags & 16 != 0,
+                dir: None,
+            },
+            count,
+        ))
+    }
+
+    fn finish_directory(&mut self, mut node: Node, children: Vec<Node>) -> Option<Node> {
+        let (size, cat) = (node.size, node.cat);
+        // Allocate categories only once the children are complete, not once per
+        // unfinished ancestor while descending through untrusted input.
+        let mut cats = vec![0u64; reg().len()].into_boxed_slice();
+        // Checked arithmetic throughout: a damaged file is a miss, never
+        // a panic or a wrapped (wrong) total.
+        let (mut files, mut child_bytes, mut errors, mut free) = (0u64, 0u64, 0u64, 0u64);
+        let mut gaps = 0u64;
+        let (mut hardlink, mut clone) = (false, false);
+        for c in &children {
+            child_bytes = child_bytes.checked_add(c.size)?;
+            files = files.checked_add(c.files())?;
+            errors = errors.checked_add(c.errors())?;
+            gaps = gaps.checked_add(c.clone_gaps())?;
+            hardlink |= c.hardlink;
+            clone |= c.clone;
+            match &c.dir {
+                Some(d) => {
+                    for (a, b) in cats.iter_mut().zip(d.cats.iter()) {
+                        *a = a.checked_add(*b)?;
+                    }
+                    free = free.checked_add(d.free_base)?;
+                }
+                None => {
+                    cats[c.cat.index()] = cats[c.cat.index()].checked_add(c.size)?;
+                    if !c.hardlink && !c.clone {
+                        free = free.checked_add(c.size)?;
+                    }
+                }
+            }
+        }
+        // The directory's own blocks, as in `scan_dir`.
+        let own = size.checked_sub(child_bytes)?;
+        cats[cat.index()] = cats[cat.index()].checked_add(own)?;
+        let errors = errors.checked_add(self.varint()?)?;
+        let own_gaps = self.varint()?;
+        let clone_gaps = gaps.checked_add(own_gaps)?;
+        let shared_count = usize::try_from(self.varint()?).ok()?;
+        if shared_count > children.len() || (!self.clones && (own_gaps > 0 || shared_count > 0)) {
+            return None;
+        }
+        let mut shared = Vec::with_capacity(shared_count);
+        for _ in 0..shared_count {
+            let idx = u32::try_from(self.varint()?).ok()?;
+            let key = (self.varint()?, self.varint()?);
+            let is_clone = match self.varint()? {
+                0 => false,
+                1 => true,
+                _ => return None,
+            };
+            let (ino, nlink) = (self.varint()?, u32::try_from(self.varint()?).ok()?);
+            let refcnt = u32::try_from(self.varint()?).ok()?;
+            // In order, each naming a distinct file child that shares
+            // blocks (so `account` visits its dir).
+            let prev = shared.last().map(|s: &Shared| s.idx as i64).unwrap_or(-1);
+            let shares = |c: &Node| !c.is_dir() && (c.hardlink || c.clone);
+            if idx as i64 <= prev || !children.get(idx as usize).is_some_and(shares) {
+                return None;
+            }
+            let extents = self.extents()?;
+            // Files with shared extents are marked as possibly sharing.
+            if extents.is_some() && !children[idx as usize].clone {
+                return None;
+            }
+            shared.push(Shared {
+                idx,
+                key,
+                is_clone,
+                ino,
+                nlink,
+                refcnt,
+                dup: false,
+                reflink: match extents {
+                    Some(extents) => Some(Box::new(Reflink {
+                        extents,
+                        dup: 0,
+                        opaque: match *self.take(1)?.first()? {
+                            0 => false,
+                            1 => true,
+                            _ => return None,
+                        },
+                    })),
+                    None => None,
+                },
+            });
+        }
+        node.dir = Some(Box::new(DirInfo {
+            cats,
+            files,
+            errors,
+            children,
+            free_base: free.checked_add(own)?,
+            clones: (!shared.is_empty() || clone_gaps > 0).then(|| {
+                Box::new(CloneInfo {
+                    shared: shared.into_boxed_slice(),
+                    gaps: clone_gaps,
+                    ..CloneInfo::default()
+                })
+            }),
+        }));
+        node.hardlink = hardlink;
+        node.clone = clone;
+        Some(node)
     }
 }
 
@@ -682,23 +755,27 @@ mod tests {
     use super::*;
     use crate::scan::{Progress, scan};
 
-    fn same(a: &Node, b: &Node) {
-        assert_eq!((&a.name, a.size, a.cat, a.special), (&b.name, b.size, b.cat, b.special));
-        assert_eq!((a.files(), a.cats()), (b.files(), b.cats()), "{}", a.name);
-        assert_eq!(
-            (a.hardlink, a.clone, a.lossy, a.dedup(), a.freeable()),
-            (b.hardlink, b.clone, b.lossy, b.dedup(), b.freeable()),
-            "{}",
-            a.name
-        );
-        if let (Some(x), Some(y)) = (&a.dir, &b.dir) {
-            assert_eq!(x.shared(), y.shared(), "{}", a.name);
+    pub(super) fn same(a: &Node, b: &Node) {
+        let mut pending = vec![(a, b)];
+        while let Some((a, b)) = pending.pop() {
+            assert_eq!((&a.name, a.size, a.cat, a.special), (&b.name, b.size, b.cat, b.special));
+            assert_eq!((a.files(), a.cats()), (b.files(), b.cats()), "{}", a.name);
+            assert_eq!((a.errors(), a.clone_gaps()), (b.errors(), b.clone_gaps()));
+            assert_eq!(
+                (a.hardlink, a.clone, a.lossy, a.dedup(), a.freeable()),
+                (b.hardlink, b.clone, b.lossy, b.dedup(), b.freeable()),
+                "{}",
+                a.name
+            );
+            if let (Some(x), Some(y)) = (&a.dir, &b.dir) {
+                assert_eq!(x.shared(), y.shared(), "{}", a.name);
+            }
+            assert_eq!(a.children().len(), b.children().len());
+            pending.extend(a.children().iter().zip(b.children()));
         }
-        assert_eq!(a.children().len(), b.children().len());
-        a.children().iter().zip(b.children()).for_each(|(x, y)| same(x, y));
     }
 
-    fn temp(name: &str) -> PathBuf {
+    pub(super) fn temp(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("dutype-cache-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
@@ -1298,3 +1375,7 @@ mod tests {
         assert!(read_from(&file, &src).is_none());
     }
 }
+
+#[cfg(test)]
+#[path = "cache/depth_tests.rs"]
+mod depth_tests;

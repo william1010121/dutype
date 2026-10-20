@@ -1,0 +1,41 @@
+Load before: 0.62 0.90 0.86 1/600 5
+CPU affinity: [0, 1, 2, 3, 4, 5, 6, 7, 8]
+
+running 1 test
+test cache::depth_tests::baseline_probe::compare_shallow_wide_timing ... shallow-32 bytes=299 iterations=20000 write baseline=0.772us iterative=0.731us change=-5.3% before=[0.015104864, 0.015134278, 0.015164562, 0.015430618, 0.01599793, 0.016200622, 0.018462202] after=[0.014206307, 0.01444891, 0.014586734, 0.014615897, 0.014748525, 0.014820581, 0.015455034]
+shallow-32 bytes=299 iterations=20000 read+drop baseline=1.274us iterative=1.298us change=+1.8% before=[0.024648524, 0.024673271, 0.025289887, 0.025489233, 0.025508953, 0.026248071, 0.035833254] after=[0.025142609, 0.025215927, 0.02564824, 0.025958611, 0.025996698, 0.026211937, 0.026889203]
+wide-50000 bytes=450014 iterations=100 write baseline=1123.660us iterative=1084.215us change=-3.5% before=[0.108407989, 0.108944726, 0.112259091, 0.112366, 0.114920956, 0.118014993, 0.118869263] after=[0.104135841, 0.105291088, 0.107465869, 0.108421459, 0.108929655, 0.11005745, 0.124052685]
+wide-50000 bytes=450014 iterations=100 read+drop baseline=2582.887us iterative=2670.338us change=+3.4% before=[0.249173567, 0.24991595, 0.257482152, 0.25828875, 0.25952628, 0.267287621, 0.280189042] after=[0.261385271, 0.261685688, 0.262184229, 0.267033794, 0.268667844, 0.26952048, 0.296245359]
+branching-200x100 bytes=182213 iterations=100 write baseline=488.484us iterative=469.063us change=-4.0% before=[0.047472687, 0.047654127, 0.048528927, 0.048848443, 0.050063748, 0.051826227, 0.060307668] after=[0.045770297, 0.045772872, 0.046099126, 0.046906256, 0.047074165, 0.047838452, 0.049127346]
+branching-200x100 bytes=182213 iterations=100 read+drop baseline=1251.322us iterative=1274.908us change=+1.9% before=[0.123330152, 0.1239416, 0.124439069, 0.125132208, 0.126355177, 0.126951101, 0.142683918] after=[0.123396471, 0.123897605, 0.125133301, 0.127490843, 0.127881774, 0.134482202, 0.145480543]
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 88 filtered out; finished in 8.35s
+
+Elapsed: 8.35053531199992 seconds; status 0
+Combined process peak RSS KiB: 13920
+Load after: 0.68 0.90 0.86 1/600 7
+
+Separate wide-fixture process RSS probes:
+old: peak RSS=9984 KiB status=0
+
+running 1 test
+test cache::depth_tests::baseline_probe::peak_rss_wide_cache ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 88 filtered out; finished in 0.01s
+
+new: peak RSS=9708 KiB status=0
+
+running 1 test
+test cache::depth_tests::baseline_probe::peak_rss_wide_cache ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 88 filtered out; finished in 0.01s
+
+
+Independent baseline differential check:
+
+running 1 test
+test cache::depth_tests::baseline_probe::compare_full_baseline_codecs ... Full baseline differential corpus: 118362 cases passed
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 88 filtered out; finished in 1.58s

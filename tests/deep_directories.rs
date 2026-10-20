@@ -31,10 +31,9 @@ fn deep_directory_json_finishes_without_stack_overflow() {
     fs::write(&config, "").unwrap();
     let output = root.with_extension("json");
     let cache = root.with_extension("cache");
-    // Cold then repeated cache-enabled scans also exercise recursive snapshot
-    // writing. The existing reader deliberately rejects depth >256, so these
-    // very deep snapshots are rescanned rather than returned as cache hits.
-    for use_cache in [false, true, true] {
+    // Cold then repeated cache-enabled scans exercise full snapshot writing
+    // and loading. The final request must be a cache hit, not a silent rescan.
+    for (use_cache, expect_hit) in [(false, false), (true, false), (true, true)] {
         let mut command = Command::new(env!("CARGO_BIN_EXE_dutype"));
         if use_cache {
             command.arg("--cache");
@@ -66,6 +65,7 @@ fn deep_directory_json_finishes_without_stack_overflow() {
         fs::remove_file(&output).unwrap();
         assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["cached_at"].is_u64(), expect_hit);
         assert_eq!(json["files"], 0);
         assert_eq!(json["unreadable"], 0);
         assert_eq!(json["children"][0]["name"], "d");
