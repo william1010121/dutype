@@ -175,6 +175,23 @@ Options:
 
 </details>
 
+### Hard-link attribution
+
+On Unix, hard-linked files count once, just like `du -skx`. Their allocated
+bytes belong to the scanned link with the fewest path components, then the
+smallest path compared component by component (case-sensitive display names).
+If an escaped non-UTF-8 name looks like a valid UTF-8 name, the valid name wins
+the tie. Other links have zero allocated bytes. This rule is independent of
+scan order and thread count; the chosen link's category and ancestor folders
+receive its bytes: a root `app.rs` wins over `node_modules/app.js` and counts
+as Code, while `node_modules/a.js` wins over equally deep `z/a.rs` and counts
+as node_modules. It does not change the overall count-once total or how
+freeable bytes are calculated. Windows still cannot identify hard links.
+
+Stable attribution uses temporary bookkeeping proportional to hard-link entries
+and distinct inodes; ordinary-file scans skip it. See the [before/after
+benchmark](bench/hardlinks.md) for the measured time and peak-memory tradeoff.
+
 ### APFS clones
 
 On APFS (macOS), `cp -c`, Finder's Duplicate, uv, bun and pnpm make *clones*:

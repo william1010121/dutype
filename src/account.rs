@@ -69,6 +69,148 @@ struct Member {
 /// position)`.
 type Range = (u64, u64, u64, u32);
 
+/// Move each hard-linked inode's already-counted bytes to a deterministic
+/// link, before probing shared extents or accounting for clone families.
+/// Temporary `Shared` records also exist in default scans, but only for
+/// hard links: neither ordinary files nor `Node` gain extra storage.
+pub fn attribute_hardlinks(root: &mut Node, clones: bool) {
+    if !root.hardlink {
+        return;
+    }
+    let mut links = Hardlinks::default();
+    links.collect(root, root, 0, 0, 0);
+    let Hardlinks {
+        dirs,
+        groups,
+        mut path_a,
+        ..
+    } = links;
+    for (rep, counted) in groups.into_values() {
+        if rep.file == counted.file || counted.size == 0 {
+            continue;
+        }
+        // Remove before adding. Categories may differ because directory
+        // rules override extensions; free_base excludes every hard link
+        // already and must not change when its allocation moves.
+        for (m, size) in [(&counted, 0), (&rep, counted.size)] {
+            index_path(&dirs, m.file.dir, &mut path_a);
+            let mut dir: &Node = root;
+            for &i in &path_a {
+                dir = &dir.children()[i as usize];
+            }
+            let d = dir.dir.as_ref().expect("a dir");
+            let idx = d.shared()[m.file.slot as usize].idx as usize;
+            let cat = d.children[idx].cat.index();
+            let old = d.children[idx].size;
+            let mut dir: &mut Node = root;
+            for i in path_a.iter().copied().map(Some).chain(std::iter::once(None)) {
+                dir.size = dir.size - old + size;
+                let d = dir.dir.as_mut().expect("a dir");
+                d.cats[cat] = d.cats[cat] - old + size;
+                match i {
+                    Some(i) => dir = &mut d.children[i as usize],
+                    None => {
+                        d.children[idx].size = size;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    finish_attribution(root, clones);
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileRef {
+    dir: u32,
+    slot: u32,
+}
+
+#[derive(Clone, Copy)]
+struct Link {
+    file: FileRef,
+    size: u64,
+}
+
+/// Only two candidates per inode are needed, not a second record for every
+/// link. The tree's temporary Shared records retain all links for --clones.
+#[derive(Default)]
+struct Hardlinks {
+    dirs: Vec<Dir>,
+    groups: rustc_hash::FxHashMap<(u64, u64), (Link, Link)>,
+    path_a: Vec<u32>,
+    path_b: Vec<u32>,
+}
+
+impl Hardlinks {
+    fn collect(&mut self, root: &Node, node: &Node, parent: u32, child: u32, depth: u32) {
+        stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
+            let Some(d) = node.dir.as_ref() else { return };
+            let id = self.dirs.len() as u32;
+            self.dirs.push(Dir {
+                parent,
+                child,
+                depth,
+                first: 0,
+            });
+            for (slot, s) in d.shared().iter().enumerate().filter(|(_, s)| s.nlink > 1) {
+                let candidate = Link {
+                    file: FileRef {
+                        dir: id,
+                        slot: slot as u32,
+                    },
+                    size: d.children[s.idx as usize].size,
+                };
+                use std::collections::hash_map::Entry;
+                match self.groups.entry((s.key.0, s.ino)) {
+                    Entry::Vacant(e) => {
+                        e.insert((candidate, candidate));
+                    }
+                    Entry::Occupied(mut e) => {
+                        let (rep, counted) = e.get_mut();
+                        if compare_files(
+                            root,
+                            &self.dirs,
+                            candidate.file,
+                            rep.file,
+                            &mut self.path_a,
+                            &mut self.path_b,
+                        ) == Ordering::Less
+                        {
+                            *rep = candidate;
+                        }
+                        if candidate.size > 0 {
+                            *counted = candidate;
+                        }
+                    }
+                }
+            }
+            for (i, c) in d.children.iter().enumerate() {
+                if c.is_dir() && c.hardlink {
+                    self.collect(root, c, id, i as u32, depth + 1);
+                }
+            }
+        });
+    }
+}
+
+/// Restore size ordering only after all index paths have been used. Sorting
+/// remaps `Shared.idx`; a default scan releases its temporary records first.
+fn finish_attribution(node: &mut Node, clones: bool) {
+    stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
+        let Some(d) = node.dir.as_mut() else { return };
+        for c in &mut d.children {
+            if c.hardlink {
+                finish_attribution(c, clones);
+            }
+        }
+        if !clones {
+            d.clones = None;
+        }
+        d.sort_children(false);
+    });
+}
+
 /// Recompute `dup`, `group_free` and the `Shared` records' `dup` (and
 /// unknown `refcnt`) for the whole tree. `base` is the root's path on disk,
 /// to read family sizes; without it unknown ones stay unknown.
@@ -371,8 +513,12 @@ fn dir_chain<'a>(root: &'a Node, path: &[u32]) -> (Vec<&'a Node>, &'a Node) {
 }
 
 fn file_of<'a>(dir: &'a Node, m: &Member) -> &'a Node {
+    file_at(dir, m.slot)
+}
+
+fn file_at(dir: &Node, slot: u32) -> &Node {
     let d = dir.dir.as_ref().expect("a dir");
-    &d.children[d.shared()[m.slot as usize].idx as usize]
+    &d.children[d.shared()[slot as usize].idx as usize]
 }
 
 /// The on-disk path of a member.
@@ -383,11 +529,35 @@ fn member_path(root: &Node, dirs: &[Dir], base: &Path, m: &Member) -> Option<Pat
     resolve_chain(base, &chain, file_of(dir, m))
 }
 
+/// Escaped display names are injective among invalid UTF-8 names, but a
+/// valid name may spell the same escape. Prefer the valid name on that tie.
+fn name_order(a: &Node, b: &Node) -> Ordering {
+    a.name.cmp(&b.name).then(a.lossy.cmp(&b.lossy))
+}
+
 /// Order of members as family representatives: the shortest path, then the
 /// smallest one (name by name), then the smallest inode. Stable across
 /// scans, whatever order the parallel scan found them in.
 fn compare(root: &Node, dirs: &[Dir], a: &Member, b: &Member, pa: &mut Vec<u32>, pb: &mut Vec<u32>) -> Ordering {
-    let depth = |m: &Member| dirs[m.dir as usize].depth;
+    compare_files(
+        root,
+        dirs,
+        FileRef {
+            dir: a.dir,
+            slot: a.slot,
+        },
+        FileRef {
+            dir: b.dir,
+            slot: b.slot,
+        },
+        pa,
+        pb,
+    )
+    .then(a.ino.cmp(&b.ino))
+}
+
+fn compare_files(root: &Node, dirs: &[Dir], a: FileRef, b: FileRef, pa: &mut Vec<u32>, pb: &mut Vec<u32>) -> Ordering {
+    let depth = |m: FileRef| dirs[m.dir as usize].depth;
     depth(a).cmp(&depth(b)).then_with(|| {
         index_path(dirs, a.dir, pa);
         index_path(dirs, b.dir, pb);
@@ -395,12 +565,12 @@ fn compare(root: &Node, dirs: &[Dir], a: &Member, b: &Member, pa: &mut Vec<u32>,
         for (&i, &j) in pa.iter().zip(pb.iter()) {
             na = &na.children()[i as usize];
             nb = &nb.children()[j as usize];
-            match na.name.cmp(&nb.name) {
+            match name_order(na, nb) {
                 Ordering::Equal => {}
                 o => return o,
             }
         }
-        file_of(na, a).name.cmp(&file_of(nb, b).name).then(a.ino.cmp(&b.ino))
+        name_order(file_at(na, a.slot), file_at(nb, b.slot))
     })
 }
 
@@ -425,6 +595,120 @@ mod tests {
         scan_excluding(p, true, true, &Progress::default(), None).unwrap()
     }
 
+    /// Allocation belongs to the shallowest link, then the smallest path,
+    /// not whichever Rayon worker happens to encounter the inode first.
+    #[test]
+    fn hard_link_attribution_is_stable_across_thread_counts() {
+        use std::os::unix::fs::MetadataExt;
+        let d = temp("stable-links");
+        fs::create_dir_all(d.join("a/deep")).unwrap();
+        fs::create_dir_all(d.join("node_modules")).unwrap();
+        fs::create_dir_all(d.join("z")).unwrap();
+        fs::write(d.join("a/deep/first.bin"), vec![1; 8192]).unwrap();
+        for name in ["node_modules/second.js", "z/third.pdf", "root.rs"] {
+            fs::hard_link(d.join("a/deep/first.bin"), d.join(name)).unwrap();
+        }
+        fs::write(d.join("z/last.pdf"), vec![2; 16384]).unwrap();
+        fs::hard_link(d.join("z/last.pdf"), d.join("a/first.rs")).unwrap();
+        fs::hard_link(d.join("z/last.pdf"), d.join("node_modules/last.js")).unwrap();
+        fs::write(d.join("node_modules/alpha.pdf"), vec![3; 4096]).unwrap();
+        fs::hard_link(d.join("node_modules/alpha.pdf"), d.join("z/alpha.rs")).unwrap();
+        let special_bytes = fs::metadata(d.join("node_modules/alpha.pdf")).unwrap().blocks() * 512;
+        let root_bytes = fs::metadata(d.join("root.rs")).unwrap().blocks() * 512;
+        let sibling_bytes = fs::metadata(d.join("a/first.rs")).unwrap().blocks() * 512;
+        for threads in [1, 2, 4] {
+            let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+            for clones in [false, true] {
+                for _ in 0..8 {
+                    let root = pool.install(|| scan_excluding(&d, true, clones, &Progress::default(), None).unwrap());
+                    assert_eq!(child(&root, "root.rs").size, root_bytes);
+                    assert_eq!(child(child(&root, "a"), "first.rs").size, sibling_bytes);
+                    for (dir, file) in [
+                        ("node_modules", "second.js"),
+                        ("node_modules", "last.js"),
+                        ("z", "third.pdf"),
+                        ("z", "last.pdf"),
+                    ] {
+                        assert_eq!(child(child(&root, dir), file).size, 0);
+                    }
+                    assert_eq!(child(child(child(&root, "a"), "deep"), "first.bin").size, 0);
+                    fn check(n: &Node) {
+                        if let Some(dir) = &n.dir {
+                            assert_eq!(dir.cats.iter().sum::<u64>(), n.size);
+                            for c in &dir.children {
+                                check(c);
+                            }
+                        }
+                    }
+                    check(&root);
+                    let modules = child(&root, "node_modules");
+                    assert_eq!(child(modules, "alpha.pdf").size, special_bytes);
+                    assert_eq!(child(modules, "alpha.pdf").cat, modules.cat);
+                    assert_eq!(child(child(&root, "z"), "alpha.rs").size, 0);
+                    let code = child(&root, "root.rs").cat.index();
+                    let cats = root.cats();
+                    assert_eq!(cats[code], root_bytes + sibling_bytes);
+                    let own_modules = fs::metadata(d.join("node_modules")).unwrap().blocks() * 512;
+                    assert_eq!(cats[modules.cat.index()], own_modules + special_bytes);
+                    let own = ["", "a", "a/deep", "node_modules", "z"]
+                        .iter()
+                        .map(|p| fs::metadata(d.join(p)).unwrap().blocks() * 512)
+                        .sum::<u64>();
+                    assert_eq!(root.size, own + root_bytes + sibling_bytes + special_bytes);
+                    assert_eq!(root.dedup(), root.size);
+                    assert_eq!(
+                        root.freeable(),
+                        root.size
+                            - if clones {
+                                0
+                            } else {
+                                root_bytes + sibling_bytes + special_bytes
+                            }
+                    );
+                }
+            }
+        }
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn hard_link_names_with_identical_display_have_a_stable_order() {
+        use std::ffi::OsStr;
+        use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
+        let d = temp("lossy-links");
+        let raw = OsStr::from_bytes(b"\xff.rs");
+        // The invalid byte's escaped display is the valid file's literal name.
+        fs::write(d.join(raw), vec![1; 4096]).unwrap();
+        fs::hard_link(d.join(raw), d.join(Path::new("\\xff.rs"))).unwrap();
+        let bytes = fs::metadata(d.join(raw)).unwrap().blocks() * 512;
+        let raw_dir = OsStr::from_bytes(b"\xfe");
+        fs::create_dir(d.join(raw_dir)).unwrap();
+        fs::create_dir(d.join(Path::new("\\xfe"))).unwrap();
+        fs::write(d.join(raw_dir).join("nested.rs"), vec![2; 8192]).unwrap();
+        fs::hard_link(
+            d.join(raw_dir).join("nested.rs"),
+            d.join(Path::new("\\xfe")).join("nested.rs"),
+        )
+        .unwrap();
+        let nested = fs::metadata(d.join(raw_dir).join("nested.rs")).unwrap().blocks() * 512;
+        for threads in [1, 2, 4] {
+            let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+            for clones in [false, true] {
+                for _ in 0..4 {
+                    let root = pool.install(|| scan_excluding(&d, true, clones, &Progress::default(), None).unwrap());
+                    for c in root.children() {
+                        if c.is_dir() {
+                            assert_eq!(child(c, "nested.rs").size, if c.lossy { 0 } else { nested });
+                        } else {
+                            assert_eq!(c.size, if c.lossy { 0 } else { bytes });
+                        }
+                    }
+                }
+            }
+        }
+        fs::remove_dir_all(d).unwrap();
+    }
+
     /// A hard link frees its blocks only where every link is inside.
     #[test]
     fn hard_links_free_where_all_links_are_inside() {
@@ -441,10 +725,10 @@ mod tests {
         let x = child(&root, "x");
         assert_eq!(x.freeable(), x.size);
         let y = child(x, "y");
-        assert_eq!(y.freeable(), y.size - MIB);
+        assert_eq!(y.freeable(), y.size);
         // z/plain has a link outside z.
         let z = child(&root, "z");
-        assert_eq!(z.freeable(), z.size - MIB);
+        assert_eq!(z.freeable(), z.size);
         assert_eq!(root.freeable(), root.size);
         // Hard links are never "dedup" savings: they are counted once already.
         assert_eq!(root.dedup(), root.size);
@@ -473,7 +757,7 @@ mod tests {
 /// Hand-built trees, so the clone rules are tested on every platform.
 #[cfg(test)]
 mod synthetic {
-    use super::account;
+    use super::{account, attribute_hardlinks};
     use crate::category::reg;
     use crate::scan::{CloneInfo, DirInfo, Node, Shared};
     use std::path::Path;
@@ -520,11 +804,15 @@ mod synthetic {
             size,
             cat: reg().other(),
             special: false,
-            hardlink: false,
+            hardlink: children.iter().any(|c| c.hardlink),
             lossy: false,
             clone: children.iter().any(|c| c.clone),
             dir: Some(Box::new(DirInfo {
-                cats: vec![0; reg().len()].into_boxed_slice(),
+                cats: {
+                    let mut cats = vec![0; reg().len()].into_boxed_slice();
+                    cats[reg().other().index()] = size;
+                    cats
+                },
                 files: children.iter().map(Node::files).sum(),
                 errors: 0,
                 children,
@@ -563,6 +851,77 @@ mod synthetic {
         }
         out.sort();
         out
+    }
+
+    #[test]
+    fn hard_link_transfer_precedes_clone_accounting_without_filesystem_access() {
+        for flip in [false, true] {
+            let mut shallow = file("c_a", true);
+            shallow.hardlink = true;
+            shallow.size = 0;
+            let mut deep = file("c_z", true);
+            deep.hardlink = true;
+            let mut children = vec![dir("nested", vec![deep]), shallow, file("c_b", true)];
+            if flip {
+                children.reverse();
+            }
+            let mut root = dir("nonexistent-root", children);
+            fn identities(n: &mut Node) {
+                if let Some(d) = n.dir.as_mut() {
+                    for s in &mut d.clones.as_mut().unwrap().shared {
+                        let c = &d.children[s.idx as usize];
+                        s.ino = if c.hardlink { 10 } else { 20 };
+                        s.nlink = if c.hardlink { 2 } else { 1 };
+                        s.refcnt = 2;
+                    }
+                    for c in &mut d.children {
+                        identities(c);
+                    }
+                }
+            }
+            identities(&mut root);
+            for _ in 0..2 {
+                attribute_hardlinks(&mut root, true);
+                account(&mut root, None);
+                assert_eq!(root.size, 2 * S);
+                assert_eq!(root.cats()[reg().other().index()], 2 * S);
+                assert_eq!(root.dedup(), S);
+                assert_eq!(root.freeable(), S);
+                let d = root.dir.as_ref().unwrap();
+                for (i, c) in d.children.iter().enumerate() {
+                    match &*c.name {
+                        "c_a" => assert_eq!((c.size, d.child_dedup(i)), (S, S)),
+                        "c_b" => assert_eq!((c.size, d.child_dedup(i)), (S, 0)),
+                        "nested" => assert_eq!((c.size, c.freeable(), c.cats()[reg().other().index()]), (0, 0, 0)),
+                        _ => unreachable!(),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn clone_display_name_ties_prefer_valid_names() {
+        for flip in [false, true] {
+            let mut invalid = file("c\\xff", true);
+            invalid.lossy = true;
+            let valid = file("c\\xff", true);
+            let mut children = vec![invalid, valid];
+            if flip {
+                children.reverse();
+            }
+            let mut root = dir("root", children);
+            let d = root.dir.as_mut().unwrap();
+            for (i, s) in d.clones.as_mut().unwrap().shared.iter_mut().enumerate() {
+                s.ino = i as u64;
+                s.refcnt = 2;
+            }
+            account(&mut root, None);
+            let d = root.dir.as_ref().unwrap();
+            for (i, c) in d.children.iter().enumerate() {
+                assert_eq!(d.child_dedup(i), if c.lossy { 0 } else { S });
+            }
+        }
     }
 
     #[test]

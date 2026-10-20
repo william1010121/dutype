@@ -42,12 +42,13 @@ pub struct DirInfo {
     /// "Freeable" bytes that need no shared-block bookkeeping: the dirs' own
     /// blocks and files without hard links or clones, in this subtree.
     pub free_base: u64,
-    /// Shared-block state, only with --clones (and only where it is not
-    /// all empty), so a default scan costs one pointer per dir for it.
+    /// Shared-block state, retained only with --clones (and only where it is not
+    /// all empty), so a default tree costs one pointer per dir for it.
+    /// During scanning, hard-link records also support stable attribution.
     pub clones: Option<Box<CloneInfo>>,
 }
 
-/// The part of a [`DirInfo`] that only clone detection (`--clones`) uses.
+/// Shared-block accounting (`--clones`) and temporary hard-link attribution.
 #[derive(Default)]
 pub struct CloneInfo {
     /// Bytes of complete groups (every link and clone of them inside) whose
@@ -1082,6 +1083,7 @@ fn scan_root(
     let parent = root.parent().map(file_name_of).unwrap_or_default();
     let own_size = platform::allocated(&meta);
     let mut node = scan_dir(root, file_name_of(root).into(), &parent, inherited, own_size, &ctx);
+    crate::account::attribute_hardlinks(&mut node, clones);
     // Only a probed tree reports its extents as read (a file root is not:
     // it may share blocks, so nothing about it is freeable for sure).
     #[cfg(target_os = "linux")]
@@ -1358,9 +1360,9 @@ fn scan_dir_inner(
         let link = e.link();
         let size = ctx.alloc_size(e.alloc, link);
         file_bytes += size;
-        // Groups are only accounted with --clones; without it a hard link
-        // simply never counts as freeable.
-        if ctx.clones && (link.is_some() || e.clone.is_some()) {
+        // Hard-link records also support stable allocation in default scans;
+        // they are discarded after attribution when --clones is off.
+        if link.is_some() || (ctx.clones && e.clone.is_some()) {
             let (key, is_clone, refcnt) = match e.clone {
                 Some(id) => ((e.dev, id), true, 0),
                 // A hard link that may share blocks (a partial clone, or
@@ -1437,7 +1439,10 @@ fn scan_dir_inner(
             })
         }),
     };
-    dir.sort_children(false);
+    // Hard-link branches are sorted after stable allocation is assigned.
+    if !hardlink {
+        dir.sort_children(false);
+    }
 
     Node {
         name,
@@ -2147,11 +2152,12 @@ pub(crate) mod reflink_tests {
         let sub_dir = node.children()[sub].dir.as_ref().unwrap();
         let c3 = sub_dir.children.iter().position(|c| &*c.name == "c3").unwrap();
         assert_eq!(sub_dir.child_freeable(c3), M);
-        // Subdirs are read first, so sub/hl carries the hard link's bytes;
-        // c1 (the shortest, smallest path holding them) keeps the extent.
+        // The shallowest hard link, a, carries the inode's bytes and
+        // is also the smallest path holding the shared extent.
         let dir = node.dir.as_ref().unwrap();
         let at = |name: &str| dir.children.iter().position(|c| &*c.name == name).unwrap();
-        assert_eq!(dir.child_dedup(at("c1")), 8 * M);
+        assert_eq!(dir.child_dedup(at("a")), 8 * M);
+        assert_eq!(dir.child_dedup(at("c1")), 0);
         assert_eq!(dir.child_dedup(at("c2")), 0);
         assert_eq!(sub_dir.child_dedup(c3), M);
 
