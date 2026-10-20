@@ -528,6 +528,15 @@ pub fn to_text(r: &Report, root: &Node) -> String {
     out
 }
 
+/// Matches in the scanned snapshot, including items omitted by the list limit.
+/// Matching directories count once and prune their descendants. Unreadable
+/// entries cannot be inferred from this count; see [`Meta::unreadable`].
+pub struct CategoryMatches {
+    pub matched_items: u64,
+    pub items_truncated: bool,
+    pub items: Vec<Entry>,
+}
+
 /// Largest items of one category below `root`: the matching special dirs for
 /// directory categories (e.g. every node_modules), files otherwise.
 /// `known`: freeable bytes can be given (see [`freeable_known`]);
@@ -540,8 +549,9 @@ pub fn find(
     mode: SizeMode,
     known: bool,
     private: Option<&PrivateSizes>,
-) -> Vec<Entry> {
+) -> CategoryMatches {
     let mut list = TopN::new(top);
+    let mut matched_items = 0u64;
     let want_dirs = cat.is_dir_kind();
     walk(root, &mut PathBuf::new(), false, &mut |n, sizes, p, lossy| {
         let hit = if want_dirs {
@@ -550,18 +560,27 @@ pub fn find(
             !n.is_dir() && n.cat == cat
         };
         let rank = mode.pick(n.size, sizes.dedup);
-        if hit && list.accepts(|min: &Item| rank > min.rank || (rank == min.rank && p > min.rel.as_path())) {
-            list.push(Item::of(n, sizes, private_of(private, n, p, lossy), p, mode, known));
+        if hit {
+            matched_items = matched_items.saturating_add(1);
+            if list.accepts(|min: &Item| rank > min.rank || (rank == min.rank && p > min.rel.as_path())) {
+                list.push(Item::of(n, sizes, private_of(private, n, p, lossy), p, mode, known));
+            }
         }
         !(hit && want_dirs)
     });
-    list.into_sorted().into_iter().map(|i| i.entry(root_path)).collect()
+    let items: Vec<_> = list.into_sorted().into_iter().map(|i| i.entry(root_path)).collect();
+    CategoryMatches {
+        matched_items,
+        items_truncated: u64::try_from(items.len()).is_ok_and(|shown| matched_items > shown),
+        items,
+    }
 }
 
 /// Text for [`find`]'s items, showing the sizes they were ranked by and any
 /// cached-snapshot/scan-wide unreadable notices.
-pub fn find_to_text(cat: Category, items: &[Entry], meta: &Meta) -> String {
+pub fn find_to_text(cat: Category, found: &CategoryMatches, meta: &Meta) -> String {
     use std::fmt::Write as _;
+    let items = &found.items;
     let mode = meta.size_mode;
     let size = |e: &Entry| mode.pick(e.size_bytes, e.dedup_bytes);
     let total: u64 = items.iter().map(size).sum();
@@ -569,9 +588,10 @@ pub fn find_to_text(cat: Category, items: &[Entry], meta: &Meta) -> String {
     scan_notices(&mut out, unix_secs(meta.cached_at), meta.unreadable);
     let _ = writeln!(
         out,
-        "Largest {} ({} shown, {} total{}):",
+        "Largest {} ({} of {} shown, {} displayed total{}):",
         cat.label(),
         items.len(),
+        found.matched_items,
         human(total),
         if mode == SizeMode::Dedup {
             ", clones counted once"
@@ -605,6 +625,108 @@ mod tests {
             size_mode: SizeMode::Du,
             private: None,
             reflink_fs: None,
+        }
+    }
+
+    fn file(name: &str, size: u64, cat: Category) -> Node {
+        Node {
+            name: name.into(),
+            size,
+            cat,
+            special: false,
+            hardlink: false,
+            lossy: false,
+            clone: false,
+            dir: None,
+        }
+    }
+
+    fn directory(name: &str, cat: Category, special: bool, children: Vec<Node>) -> Node {
+        let mut root = file(name, children.iter().map(|n| n.size).sum(), cat);
+        root.special = special;
+        root.dir = Some(Box::new(crate::scan::DirInfo {
+            cats: vec![0; reg().len()].into_boxed_slice(),
+            files: children.iter().map(Node::files).sum(),
+            errors: 0,
+            children,
+            free_base: root.size,
+            clones: None,
+        }));
+        root.dir.as_mut().unwrap().sort_children(false);
+        root
+    }
+
+    #[test]
+    fn category_matches_count_zero_size_files_independently_of_limit_and_size_mode() {
+        use crate::scan::Shared;
+
+        let cat = reg().find_by_name("PDF").unwrap();
+        let mut root = directory(
+            "root",
+            reg().other(),
+            false,
+            vec![file("a.pdf", 100, cat), file("b.pdf", 50, cat), file("c.pdf", 0, cat)],
+        );
+        // Simulate a clone whose bytes are attributed elsewhere: dedup ranking
+        // changes, while the matching zero-byte and duplicate files still count.
+        root.dir.as_mut().unwrap().clones_mut().shared = vec![Shared {
+            idx: 0,
+            key: (1, 1),
+            is_clone: true,
+            ino: 1,
+            nlink: 1,
+            refcnt: 2,
+            dup: true,
+            reflink: None,
+        }]
+        .into_boxed_slice();
+        for mode in [SizeMode::Du, SizeMode::Dedup] {
+            let expected = if mode == SizeMode::Du {
+                ["a.pdf", "b.pdf", "c.pdf"]
+            } else {
+                ["b.pdf", "c.pdf", "a.pdf"]
+            };
+            for top in [0, 1, 2, 3, 4, usize::MAX] {
+                let found = find(&root, Path::new("root"), cat, top, mode, true, None);
+                assert_eq!(found.matched_items, 3);
+                assert_eq!(found.items_truncated, top < 3);
+                let paths: Vec<_> = found.items.iter().map(|e| PathBuf::from(&e.path)).collect();
+                let expected: Vec<_> = expected
+                    .iter()
+                    .take(top)
+                    .map(|name| Path::new("root").join(name))
+                    .collect();
+                assert_eq!(paths, expected, "{mode:?}, top {top}");
+            }
+        }
+    }
+
+    #[test]
+    fn category_matches_prune_matching_directories_even_when_not_retained() {
+        let cat = reg().find_by_name("node_modules").unwrap();
+        let root = directory(
+            "root",
+            cat,
+            true,
+            vec![
+                directory("a", cat, true, vec![directory("nested", cat, true, vec![])]),
+                directory(
+                    "ordinary",
+                    reg().other(),
+                    false,
+                    vec![directory("b", cat, true, vec![])],
+                ),
+                file("inherited", 0, cat),
+            ],
+        );
+        for top in [0, 1, 2, usize::MAX] {
+            let found = find(&root, Path::new("root"), cat, top, SizeMode::Du, true, None);
+            // Root is excluded, matching descendants prune regardless of top,
+            // and a file inheriting a directory category is not a match.
+            assert_eq!(found.matched_items, 2);
+            assert_eq!(found.items.len(), top.min(2));
+            assert_eq!(found.items_truncated, top < 2);
+            assert!(found.items.iter().all(|e| !e.path.contains("nested")));
         }
     }
 
@@ -647,10 +769,12 @@ mod tests {
             };
             let cat = reg().find_by_name("PDF").unwrap();
             let items = find(&root, Path::new("root"), cat, 20, SizeMode::Du, true, None);
-            assert!(items.is_empty());
+            assert!(items.items.is_empty());
+            assert_eq!(items.matched_items, 0);
+            assert!(!items.items_truncated);
             assert_eq!(
                 find_to_text(cat, &items, &meta),
-                format!("{notices}Largest PDF (0 shown, 0 B total):\n")
+                format!("{notices}Largest PDF (0 of 0 shown, 0 B displayed total):\n")
             );
             let report = build(&root, Path::new("root"), &meta, 20);
             assert!(to_text(&report, &root).starts_with(&format!(
@@ -694,7 +818,9 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(names(&report.largest_files), ["c.rs", "b.rs"]);
-        assert_eq!(names(&found), ["c.rs", "b.rs"]);
+        assert_eq!(names(&found.items), ["c.rs", "b.rs"]);
+        assert_eq!(found.matched_items, 3);
+        assert!(found.items_truncated);
     }
 
     /// A private size kept for a valid name never shows on a non-UTF-8
@@ -833,9 +959,16 @@ mod tests {
             clone: dedup < size,
             private_bytes: None,
         };
-        let items = [item("/a", 3 << 20, 3 << 20), item("/b", 2 << 20, 0)];
+        let items = CategoryMatches {
+            matched_items: 4,
+            items_truncated: true,
+            items: vec![item("/a", 3 << 20, 3 << 20), item("/b", 2 << 20, 0)],
+        };
         let du = find_to_text(reg().other(), &items, &plain_meta());
-        assert!(du.contains("5.0 MiB total)") && du.contains("2.0 MiB  /b"), "{du}");
+        assert!(
+            du.contains("2 of 4 shown, 5.0 MiB displayed total)") && du.contains("2.0 MiB  /b"),
+            "{du}"
+        );
         let dedup = find_to_text(
             reg().other(),
             &items,
@@ -844,7 +977,10 @@ mod tests {
                 ..plain_meta()
             },
         );
-        assert!(dedup.contains("3.0 MiB total, clones counted once)"), "{dedup}");
+        assert!(
+            dedup.contains("2 of 4 shown, 3.0 MiB displayed total, clones counted once)"),
+            "{dedup}"
+        );
         assert!(dedup.contains("0 B  /b"), "{dedup}");
         let warned = find_to_text(
             reg().other(),

@@ -50,7 +50,14 @@ If `dutype` is not installed, run it through npx with the same arguments:
   until the snapshot is deleted (`snapshots-counted-as-shared`). Without
   `--clones`, `freeable_min_bytes` is null there.
 
-`--category` returns `{path, category, accounting, items: [{path, size_bytes, size, ...}]}`.
+`--category` returns `{path, category, cached_at, unreadable, accounting,
+matched_items, items_truncated, items: [{path, size_bytes, size, ...}]}`.
+`matched_items` counts matches below the root in the scanned/cached snapshot
+before the top-N limit; a matching directory counts once and prunes descendants.
+`items_truncated` means `matched_items > items.length`, not that the scan is
+complete: `unreadable` is scan-wide and unclassifiable entries are not inferred.
+Text totals cover only displayed items. CLI `--top 0` still counts matches;
+MCP `top` remains 1–500.
 
 ## Shared blocks (APFS clones, hard links)
 
