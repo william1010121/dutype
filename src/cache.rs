@@ -18,7 +18,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 // shared extents were read (`--clones`); shared-block records end with
 // those extents (and, if any, a byte: some shared extents had an unknown
 // size).
-const MAGIC: &[u8; 8] = b"DUTYPE\0\x08";
+// v9: same layout, but allocation belongs to a stable hard-link path.
+// Older snapshots preserve first-arriving attribution and must be rescanned.
+const MAGIC: &[u8; 8] = b"DUTYPE\0\x09";
 
 pub struct Snapshot {
     pub root: Node,
@@ -840,6 +842,30 @@ mod tests {
         let again = read_from(&file, &src).unwrap();
         assert!(!again.clones && !answers(&again, true) && answers(&again, false));
         same(&plain.root, &again.root);
+        // v8 used the same layout but credited whichever link arrived first.
+        // Reject it even when package version and category rules still match.
+        let mut legacy = fs::read(&file).unwrap();
+        legacy[7] = 8;
+        fs::write(&file, legacy).unwrap();
+        assert!(read_from(&file, &src).is_none());
+        let rebuilt = Snapshot {
+            root: scan(&src, true, false, &Progress::default()).unwrap(),
+            ..plain
+        };
+        write_to(&file, &src, &rebuilt).unwrap();
+        let normalized = read_from(&file, &src).unwrap();
+        same(&rebuilt.root, &normalized.root);
+        assert_eq!(
+            normalized
+                .root
+                .children()
+                .iter()
+                .find(|c| &*c.name == "link")
+                .unwrap()
+                .size,
+            2 << 20
+        );
+        let plain = rebuilt;
         // The hard-linked file is counted (once) but never freeable.
         assert_eq!(again.root.freeable(), again.root.size - (2 << 20));
         let mislabeled = Snapshot {
