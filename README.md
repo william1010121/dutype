@@ -367,6 +367,16 @@ is `null` on macOS and on btrfs / XFS / bcachefs); children, special dirs, files
 a file that may share blocks). `--size-mode dedup` ranks the lists by
 `dedup_bytes`.
 
+Full and category JSON reports (including MCP `disk_usage` and
+`find_by_category`) include `unreadable`: the scan-wide count of entries that
+could not be read, not a per-category count, since unreadable entries may be
+unclassifiable. An empty category list with a nonzero count may be incomplete.
+`cached_at` is `null` for a fresh scan; otherwise it is the saved or
+session-retained snapshot's Unix timestamp, not a guarantee of current
+filesystem state. Both text report forms show cached-snapshot and unreadable
+notices when applicable. A cached partial scan keeps its unreadable count
+even after permissions change; use `--refresh` (MCP: `refresh: true`) to rescan.
+
 **Private sizes (`--private`, macOS/APFS)** — a file that was cloned and then
 changed (a *partial clone*) shares only some blocks with other files, so neither
 `size_bytes` nor the clone-family numbers say what deleting it frees. With

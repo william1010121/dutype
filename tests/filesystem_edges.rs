@@ -1,9 +1,9 @@
 //! Black-box filesystem regressions. Every scan runs in a subprocess with a
 //! deadline, so a traversal loop cannot hang the test runner.
 
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::Arc;
@@ -37,9 +37,13 @@ impl Fixture {
     }
 
     fn command(&self) -> Command {
+        self.command_for("--json")
+    }
+
+    fn command_for(&self, format: &str) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_dutype"));
         command
-            .arg("--json")
+            .arg(format)
             .arg("--config")
             .arg(&self.config)
             .arg("--top")
@@ -51,6 +55,30 @@ impl Fixture {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         command
+    }
+
+    fn output(&self, format: &str, args: &[&str]) -> String {
+        let output = bounded_output(self.command_for(format).args(args).spawn().unwrap());
+        assert!(
+            output.status.success() && output.stderr.is_empty(),
+            "report failed: status={}, stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    fn category_report(&self, args: &[&str]) -> Value {
+        let mut args = args.to_vec();
+        args.extend(["--category", "PDF"]);
+        let report: Value = serde_json::from_str(&self.output("--json", &args)).unwrap();
+        assert_absolute_path(&report);
+        assert_eq!(report["category"], "PDF");
+        assert_u64(&report, "unreadable");
+        assert_optional_u64(&report, "cached_at");
+        assert!(report["accounting"].is_object());
+        assert!(report["items"].is_array());
+        report
     }
 
     fn report(&self) -> Value {
@@ -252,6 +280,89 @@ fn empty_directory_has_complete_stable_json() {
 }
 
 #[test]
+fn missing_category_keeps_zero_errors_explicit_in_fresh_and_cached_reports() {
+    let fixture = Fixture::new("missing-category");
+    fs::write(fixture.root.join("visible.txt"), b"not a PDF").unwrap();
+    let full = fixture.report();
+    let fresh = fixture.category_report(&[]);
+    assert_eq!(fresh["unreadable"], full["unreadable"]);
+    assert_eq!(fresh["unreadable"], 0);
+    assert!(fresh["cached_at"].is_null());
+    assert!(fresh["items"].as_array().unwrap().is_empty());
+    let text = fixture.output("--report", &["--category", "PDF"]);
+    assert_eq!(text, "Largest PDF (0 shown, 0 B total):\n");
+
+    let before = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    assert_eq!(fixture.category_report(&["--cache"]), fresh);
+    let cached = fixture.category_report(&["--cache"]);
+    let at = assert_u64(&cached, "cached_at");
+    let after = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    assert!((before..=after).contains(&at));
+    let mut expected = fresh.clone();
+    expected["cached_at"] = at.into();
+    assert_eq!(cached, expected, "caching must change only cached_at");
+    let full_cached: Value = serde_json::from_str(&fixture.output("--json", &["--cache"])).unwrap();
+    assert_eq!(cached["cached_at"], full_cached["cached_at"]);
+    assert_eq!(cached["unreadable"], full_cached["unreadable"]);
+
+    let cached_text = fixture.output("--report", &["--category", "PDF", "--cache"]);
+    let (notice, body) = cached_text.split_once('\n').unwrap();
+    assert!(notice.starts_with("(from cache, scanned "), "{cached_text}");
+    assert!(notice.ends_with("; --refresh to rescan)"), "{cached_text}");
+    assert_eq!(body, text, "a complete cached scan must not gain an unreadable warning");
+    assert_eq!(fixture.category_report(&["--cache"]), cached);
+}
+
+#[test]
+fn cli_and_mcp_category_reports_keep_the_same_schema_and_ranked_items() {
+    let fixture = Fixture::new("category-schema-parity");
+    for (name, size) in [("small.pdf", 1), ("large.pdf", 16384), ("medium.pdf", 8192)] {
+        fs::write(fixture.root.join(name), vec![b'x'; size]).unwrap();
+    }
+    let cli = fixture.category_report(&[]);
+    let full = fixture.report();
+    assert_eq!(cli["path"], full["path"]);
+    assert_eq!(cli["accounting"], full["accounting"]);
+    assert_eq!(cli["unreadable"], full["unreadable"]);
+    assert_eq!(cli["items"], full["largest_files"]);
+    assert_eq!(cli["items"].as_array().unwrap().len(), 3);
+
+    let mut child = fixture.command_for("--mcp").stdin(Stdio::piped()).spawn().unwrap();
+    let input = [
+        json!({"jsonrpc":"2.0", "id":1, "method":"tools/call", "params":{
+            "name":"find_by_category", "arguments":{"path":fixture.root, "category":"PDF", "top":100}}}),
+        json!({"jsonrpc":"2.0", "id":2, "method":"tools/call", "params":{
+            "name":"find_by_category", "arguments":{"path":fixture.root, "category":"PDF", "top":2}}}),
+    ]
+    .iter()
+    .map(Value::to_string)
+    .collect::<Vec<_>>()
+    .join("\n");
+    child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+    let output = bounded_output(child);
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty(), "{}", String::from_utf8_lossy(&output.stderr));
+    let responses: Vec<Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(responses.len(), 2);
+    for response in &responses {
+        let result = &response["result"];
+        assert_eq!(result["isError"], false);
+        let text: Value = serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(text, result["structuredContent"]);
+        assert_u64(&text, "unreadable");
+    }
+    assert_eq!(responses[0]["result"]["structuredContent"], cli);
+    let mut limited = cli;
+    limited["items"].as_array_mut().unwrap().truncate(2);
+    assert_eq!(responses[1]["result"]["structuredContent"], limited);
+    assert!(!fixture.base.join("unused-cache").exists(), "MCP must remain read-only");
+}
+
+#[test]
 fn equal_sized_entries_keep_stable_json_order() {
     let fixture = Fixture::new("ties");
     for name in ["zeta", "alpha", "middle", "beta"] {
@@ -380,6 +491,14 @@ fn unreadable_root_is_explicitly_reported_as_partial() {
     assert_eq!(report["unreadable"], 1);
     assert_eq!(report["files"], 0);
     assert!(report["children"].as_array().unwrap().is_empty());
+    let category = fixture.category_report(&[]);
+    assert_eq!(category["unreadable"], report["unreadable"]);
+    assert!(category["cached_at"].is_null());
+    assert!(category["items"].as_array().unwrap().is_empty());
+    assert_eq!(
+        fixture.output("--report", &["--category", "PDF"]),
+        "(1 entries unreadable)\nLargest PDF (0 shown, 0 B total):\n"
+    );
 }
 
 #[cfg(unix)]
@@ -401,6 +520,60 @@ fn unreadable_descendant_does_not_hide_readable_siblings() {
     let denied = children.iter().find(|child| child["name"] == "denied").unwrap();
     assert_eq!(denied["type"], "dir");
     assert_eq!(denied["files"], 0);
+    let category = fixture.category_report(&[]);
+    assert_eq!(category["unreadable"], report["unreadable"]);
+    assert!(category["items"].as_array().unwrap().is_empty());
+    assert_eq!(
+        fixture.output("--report", &["--category", "PDF"]),
+        "(1 entries unreadable)\nLargest PDF (0 shown, 0 B total):\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cached_partial_category_stays_partial_after_permissions_recover_until_refresh() {
+    let fixture = Fixture::new("cached-partial-category");
+    let denied = fixture.root.join("denied");
+    fs::create_dir(&denied).unwrap();
+    fs::write(denied.join("hidden.pdf"), b"hidden").unwrap();
+    fs::write(fixture.root.join("visible.pdf"), b"visible").unwrap();
+    let Some(permissions) = UnreadableDirectory::new(&denied) else {
+        return;
+    };
+    let fresh = fixture.category_report(&["--cache"]);
+    assert_eq!(fresh["unreadable"], 1);
+    assert!(fresh["cached_at"].is_null());
+    assert_eq!(fresh["items"].as_array().unwrap().len(), 1);
+    assert!(fresh["items"][0]["path"].as_str().unwrap().ends_with("visible.pdf"));
+    let cached = fixture.category_report(&["--cache"]);
+    assert_u64(&cached, "cached_at");
+    assert_eq!(cached["items"], fresh["items"]);
+
+    drop(permissions);
+    assert_eq!(fixture.category_report(&["--cache"]), cached);
+    let full: Value = serde_json::from_str(&fixture.output("--json", &["--cache"])).unwrap();
+    assert_eq!(full["unreadable"], cached["unreadable"]);
+    assert_eq!(full["cached_at"], cached["cached_at"]);
+    assert_eq!(full["largest_files"], cached["items"]);
+    let text = fixture.output("--report", &["--category", "PDF", "--cache"]);
+    let mut lines = text.lines();
+    let notice = lines.next().unwrap();
+    assert!(notice.starts_with("(from cache, scanned "), "{text}");
+    assert!(notice.ends_with("; --refresh to rescan)"), "{text}");
+    assert_eq!(lines.next(), Some("(1 entries unreadable)"));
+    assert!(lines.next().unwrap().starts_with("Largest PDF (1 shown, "));
+
+    let refreshed = fixture.category_report(&["--refresh"]);
+    assert_eq!(refreshed["unreadable"], 0);
+    assert!(refreshed["cached_at"].is_null());
+    assert_eq!(refreshed["items"].as_array().unwrap().len(), 2);
+    let cached_refreshed = fixture.category_report(&["--cache"]);
+    assert_u64(&cached_refreshed, "cached_at");
+    assert_eq!(cached_refreshed["unreadable"], 0);
+    assert_eq!(cached_refreshed["items"], refreshed["items"]);
+    let text = fixture.output("--report", &["--category", "PDF", "--refresh"]);
+    assert!(text.starts_with("Largest PDF (2 shown, "));
+    assert!(!text.contains("entries unreadable") && !text.contains("from cache"));
 }
 
 struct FileChurn {
