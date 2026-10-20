@@ -677,8 +677,16 @@ mod tests {
         use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
         let d = temp("lossy-links");
         let raw = OsStr::from_bytes(b"\xff.rs");
+        // APFS rejects non-UTF-8 filenames. Skip only that explicit filesystem
+        // limitation; synthetic name-tie coverage still runs on every platform.
+        match fs::write(d.join(raw), vec![1; 4096]) {
+            Err(e) if e.raw_os_error() == Some(libc::EILSEQ) => {
+                fs::remove_dir_all(d).unwrap();
+                return;
+            }
+            result => result.unwrap(),
+        }
         // The invalid byte's escaped display is the valid file's literal name.
-        fs::write(d.join(raw), vec![1; 4096]).unwrap();
         fs::hard_link(d.join(raw), d.join(Path::new("\\xff.rs"))).unwrap();
         let bytes = fs::metadata(d.join(raw)).unwrap().blocks() * 512;
         let raw_dir = OsStr::from_bytes(b"\xfe");
