@@ -356,48 +356,50 @@ impl<W: Write> Writer<W> {
     /// category totals, file counts, error totals and freeable bytes are
     /// derived again on load.
     fn node(&mut self, n: &Node) -> io::Result<()> {
-        self.bytes(n.name.as_bytes())?;
-        self.varint(n.size)?;
-        self.varint(n.cat.index() as u64)?;
-        self.0.write_all(&[n.is_dir() as u8
-            | (n.special as u8) << 1
-            | (n.hardlink as u8) << 2
-            | (n.lossy as u8) << 3
-            | (n.clone as u8) << 4])?;
-        if let Some(d) = &n.dir {
-            self.varint(d.children.len() as u64)?;
-            for c in &d.children {
-                self.node(c)?;
+        stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
+            self.bytes(n.name.as_bytes())?;
+            self.varint(n.size)?;
+            self.varint(n.cat.index() as u64)?;
+            self.0.write_all(&[n.is_dir() as u8
+                | (n.special as u8) << 1
+                | (n.hardlink as u8) << 2
+                | (n.lossy as u8) << 3
+                | (n.clone as u8) << 4])?;
+            if let Some(d) = &n.dir {
+                self.varint(d.children.len() as u64)?;
+                for c in &d.children {
+                    self.node(c)?;
+                }
+                let child_errors: u64 = d.children.iter().map(Node::errors).sum();
+                self.varint(d.errors.saturating_sub(child_errors))?;
+                let child_gaps: u64 = d.children.iter().map(Node::clone_gaps).sum();
+                self.varint(d.clone_gaps().saturating_sub(child_gaps))?;
+                self.varint(d.shared().len() as u64)?;
+                for s in d.shared() {
+                    for v in [
+                        s.idx as u64,
+                        s.key.0,
+                        s.key.1,
+                        s.is_clone as u64,
+                        s.ino,
+                        s.nlink as u64,
+                        s.refcnt as u64,
+                    ] {
+                        self.varint(v)?;
+                    }
+                    let extents = s.reflink.as_ref().map_or(&[][..], |r| &r.extents);
+                    self.varint(extents.len() as u64)?;
+                    for &(start, len) in extents {
+                        self.varint(start)?;
+                        self.varint(len)?;
+                    }
+                    if let Some(r) = &s.reflink {
+                        self.0.write_all(&[r.opaque as u8])?;
+                    }
+                }
             }
-            let child_errors: u64 = d.children.iter().map(Node::errors).sum();
-            self.varint(d.errors.saturating_sub(child_errors))?;
-            let child_gaps: u64 = d.children.iter().map(Node::clone_gaps).sum();
-            self.varint(d.clone_gaps().saturating_sub(child_gaps))?;
-            self.varint(d.shared().len() as u64)?;
-            for s in d.shared() {
-                for v in [
-                    s.idx as u64,
-                    s.key.0,
-                    s.key.1,
-                    s.is_clone as u64,
-                    s.ino,
-                    s.nlink as u64,
-                    s.refcnt as u64,
-                ] {
-                    self.varint(v)?;
-                }
-                let extents = s.reflink.as_ref().map_or(&[][..], |r| &r.extents);
-                self.varint(extents.len() as u64)?;
-                for &(start, len) in extents {
-                    self.varint(start)?;
-                    self.varint(len)?;
-                }
-                if let Some(r) = &s.reflink {
-                    self.0.write_all(&[r.opaque as u8])?;
-                }
-            }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Count, then per file (sorted, so equal tables give equal files): its
@@ -531,9 +533,9 @@ impl Reader<'_> {
     }
 
     fn node(&mut self, depth: usize) -> Option<Node> {
-        // Deeper than any sane tree, and keeps the recursion well within
-        // small (2 MiB) thread stacks even in debug builds. Deeper snapshots
-        // are just a cache miss.
+        // Bound recursion when decoding untrusted snapshots, including on
+        // small (2 MiB) thread stacks in debug builds. Deeper real trees are
+        // supported by the scanner but their snapshots are a cache miss.
         if depth > 256 {
             return None;
         }

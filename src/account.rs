@@ -261,42 +261,44 @@ fn collect(
     members: &mut Vec<Member>,
     ranges: &mut Vec<Range>,
 ) {
-    let Some(d) = node.dir.as_deref_mut() else { return };
-    let id = dirs.len() as u32;
-    dirs.push(Dir {
-        parent,
-        child,
-        depth,
-        first: members.len() as u32,
-    });
-    if let Some(c) = d.clones.as_deref_mut() {
-        c.dup = 0;
-        c.group_free = 0;
-    }
-    for (slot, s) in d.shared().iter().enumerate() {
-        for &(start, len) in s.reflink.as_ref().map_or(&[][..], |r| &r.extents) {
-            ranges.push((s.key.0, start, len, members.len() as u32));
-        }
-        members.push(Member {
-            dir: id,
-            slot: slot as u32,
-            key: s.key,
-            is_clone: s.is_clone,
-            ino: s.ino,
-            nlink: s.nlink,
-            refcnt: s.refcnt,
-            size: d.children[s.idx as usize].size,
-            pos: members.len() as u32,
-            reflinked: s.reflink.is_some(),
-            opaque: s.reflink.as_ref().is_some_and(|r| r.opaque),
+    stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
+        let Some(d) = node.dir.as_deref_mut() else { return };
+        let id = dirs.len() as u32;
+        dirs.push(Dir {
+            parent,
+            child,
+            depth,
+            first: members.len() as u32,
         });
-    }
-    for (i, c) in d.children.iter_mut().enumerate() {
-        let stale = c.dir.as_ref().is_some_and(|d| d.dup() != 0 || d.group_free() != 0);
-        if c.is_dir() && (c.hardlink || c.clone || stale) {
-            collect(c, id, i as u32, depth + 1, dirs, members, ranges);
+        if let Some(c) = d.clones.as_deref_mut() {
+            c.dup = 0;
+            c.group_free = 0;
         }
-    }
+        for (slot, s) in d.shared().iter().enumerate() {
+            for &(start, len) in s.reflink.as_ref().map_or(&[][..], |r| &r.extents) {
+                ranges.push((s.key.0, start, len, members.len() as u32));
+            }
+            members.push(Member {
+                dir: id,
+                slot: slot as u32,
+                key: s.key,
+                is_clone: s.is_clone,
+                ino: s.ino,
+                nlink: s.nlink,
+                refcnt: s.refcnt,
+                size: d.children[s.idx as usize].size,
+                pos: members.len() as u32,
+                reflinked: s.reflink.is_some(),
+                opaque: s.reflink.as_ref().is_some_and(|r| r.opaque),
+            });
+        }
+        for (i, c) in d.children.iter_mut().enumerate() {
+            let stale = c.dir.as_ref().is_some_and(|d| d.dup() != 0 || d.group_free() != 0);
+            if c.is_dir() && (c.hardlink || c.clone || stale) {
+                collect(c, id, i as u32, depth + 1, dirs, members, ranges);
+            }
+        }
+    });
 }
 
 /// Write the results back, visiting the same dirs as [`collect`].
@@ -309,27 +311,29 @@ fn apply(
     out: &[(bool, u32)],
     extent_dup: &[u64],
 ) {
-    let id = *next;
-    *next += 1;
-    let d = node.dir.as_deref_mut().expect("a collected dir");
-    if dup[id] != 0 || free[id] != 0 || d.clones.is_some() {
-        let c = d.clones_mut();
-        c.dup = dup[id];
-        c.group_free = free[id];
-        let first = dirs[id].first as usize;
-        for (k, (s, &(is_dup, refcnt))) in c.shared.iter_mut().zip(&out[first..]).enumerate() {
-            s.dup = is_dup;
-            s.refcnt = refcnt;
-            if let Some(r) = &mut s.reflink {
-                r.dup = extent_dup.get(first + k).copied().unwrap_or(0);
+    stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
+        let id = *next;
+        *next += 1;
+        let d = node.dir.as_deref_mut().expect("a collected dir");
+        if dup[id] != 0 || free[id] != 0 || d.clones.is_some() {
+            let c = d.clones_mut();
+            c.dup = dup[id];
+            c.group_free = free[id];
+            let first = dirs[id].first as usize;
+            for (k, (s, &(is_dup, refcnt))) in c.shared.iter_mut().zip(&out[first..]).enumerate() {
+                s.dup = is_dup;
+                s.refcnt = refcnt;
+                if let Some(r) = &mut s.reflink {
+                    r.dup = extent_dup.get(first + k).copied().unwrap_or(0);
+                }
             }
+            d.trim_clones();
         }
-        d.trim_clones();
-    }
-    while *next < dirs.len() && dirs[*next].parent as usize == id {
-        let c = dirs[*next].child as usize;
-        apply(&mut d.children[c], dirs, next, dup, free, out, extent_dup);
-    }
+        while *next < dirs.len() && dirs[*next].parent as usize == id {
+            let c = dirs[*next].child as usize;
+            apply(&mut d.children[c], dirs, next, dup, free, out, extent_dup);
+        }
+    });
 }
 
 /// Child indices from the root down to dir `id`.

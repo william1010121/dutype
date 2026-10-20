@@ -96,6 +96,16 @@ pub struct CacheOpts {
     pub always_refresh: bool,
 }
 
+// JSON Schema integers include representations such as 20.0 and 2e1.
+fn integral_number(value: &Value) -> bool {
+    value.is_i64() || value.is_u64() || value.as_f64().is_some_and(|n| n.is_finite() && n.fract() == 0.0)
+}
+
+fn top_value(value: &Value) -> Option<usize> {
+    let number = value.as_f64()?;
+    (integral_number(value) && (1.0..=500.0).contains(&number)).then_some(number as usize)
+}
+
 fn call_tool(name: &str, args: &Value, opts: CacheOpts) -> Result<Value, String> {
     let use_cache = opts.use_cache;
     let path = args
@@ -104,8 +114,8 @@ fn call_tool(name: &str, args: &Value, opts: CacheOpts) -> Result<Value, String>
         .ok_or("missing required argument: path")?;
     let top = args
         .get("top")
-        .and_then(Value::as_u64)
-        .map(|t| t.clamp(1, 500) as usize);
+        .map(|value| top_value(value).ok_or("top must be an integer from 1 to 500"))
+        .transpose()?;
     let cross_fs = args.get("cross_fs").and_then(Value::as_bool).unwrap_or(false);
     let refresh = opts.always_refresh || args.get("refresh").and_then(Value::as_bool).unwrap_or(false);
     let private = args.get("private").and_then(Value::as_bool).unwrap_or(false);
@@ -226,9 +236,85 @@ thread_local! {
     static MEMORY: RefCell<HashMap<(PathBuf, bool), Snapshot>> = RefCell::new(HashMap::new());
 }
 
+fn rpc_error(code: i32, message: impl Into<String>) -> Value {
+    json!({"code": code, "message": message.into()})
+}
+
+/// Reject malformed calls before touching the filesystem. Protocol errors are
+/// distinct from a valid tool call that fails to scan its requested path.
+fn validate_tool_args(name: &str, args: &Value) -> Result<(), String> {
+    if !matches!(name, "disk_usage" | "find_by_category") {
+        return Err(format!("unknown tool {name:?}"));
+    }
+    if !args.is_object() {
+        return Err("arguments must be an object".into());
+    }
+    if args.get("path").and_then(Value::as_str).is_none() {
+        return Err("missing or invalid required argument: path".into());
+    }
+    if name == "find_by_category" {
+        let category = args
+            .get("category")
+            .and_then(Value::as_str)
+            .ok_or("missing or invalid required argument: category")?;
+        if reg().find_by_name(category).is_none() {
+            return Err(format!("unknown category {category:?}"));
+        }
+    }
+    if let Some(top) = args.get("top")
+        && top_value(top).is_none()
+    {
+        return Err("top must be an integer from 1 to 500".into());
+    }
+    for name in ["cross_fs", "refresh", "clones", "private"] {
+        if args.get(name).is_some_and(|value| !value.is_boolean()) {
+            return Err(format!("{name} must be a boolean"));
+        }
+    }
+    if let Some(mode) = args.get("size_mode")
+        && !matches!(mode.as_str(), Some("du" | "dedup"))
+    {
+        return Err("size_mode must be du or dedup".into());
+    }
+    Ok(())
+}
+
+fn handle_tool_call(params: &Value, opts: CacheOpts) -> Result<Value, Value> {
+    let name = params
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| rpc_error(-32602, "missing or invalid tool name"))?;
+    let empty = json!({});
+    let args = params.get("arguments").unwrap_or(&empty);
+    validate_tool_args(name, args).map_err(|e| rpc_error(-32602, e))?;
+    // Only execution failures are results with isError, not protocol errors.
+    Ok(match call_tool(name, args, opts) {
+        Ok(value) => json!({
+            "content": [{"type": "text", "text": value.to_string()}],
+            "structuredContent": value,
+            "isError": false
+        }),
+        Err(error) => json!({"content": [{"type": "text", "text": error}], "isError": true}),
+    })
+}
+
 fn handle(msg: &Value, opts: CacheOpts) -> Option<Value> {
-    let id = msg.get("id")?.clone(); // notifications get no response
-    let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
+    let id = msg.get("id");
+    // MCP requires string or integer request IDs (unlike JSON-RPC, not null).
+    // Validate before deciding that a missing ID denotes a notification: e.g.
+    // `null`, `{}` and a numeric method must receive Invalid Request errors.
+    if !msg.is_object()
+        || msg.get("jsonrpc") != Some(&json!("2.0"))
+        || msg.get("method").and_then(Value::as_str).is_none()
+        || id.is_some_and(|id| !(id.is_string() || integral_number(id)))
+    {
+        return Some(json!({"jsonrpc": "2.0", "id": null, "error": rpc_error(-32600, "invalid request")}));
+    }
+    let id = id?.clone(); // valid notifications get no response
+    if msg.get("params").is_some_and(|params| !params.is_object()) {
+        return Some(json!({"jsonrpc": "2.0", "id": id, "error": rpc_error(-32602, "params must be an object")}));
+    }
+    let method = msg["method"].as_str().unwrap();
     let result = match method {
         "initialize" => Ok(json!({
             "protocolVersion": PROTOCOL_VERSION,
@@ -240,21 +326,8 @@ fn handle(msg: &Value, opts: CacheOpts) -> Option<Value> {
         })),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({"tools": tools()})),
-        "tools/call" => {
-            let params = msg.get("params").cloned().unwrap_or(Value::Null);
-            let name = params.get("name").and_then(Value::as_str).unwrap_or("");
-            let args = params.get("arguments").cloned().unwrap_or(json!({}));
-            // Tool failures are results with isError, not protocol errors.
-            Ok(match call_tool(name, &args, opts) {
-                Ok(v) => json!({
-                    "content": [{"type": "text", "text": serde_json::to_string(&v).unwrap_or_default()}],
-                    "structuredContent": v,
-                    "isError": false
-                }),
-                Err(e) => json!({"content": [{"type": "text", "text": e}], "isError": true}),
-            })
-        }
-        _ => Err(json!({"code": -32601, "message": format!("method not found: {method}")})),
+        "tools/call" => handle_tool_call(&msg["params"], opts),
+        _ => Err(rpc_error(-32601, format!("method not found: {method}"))),
     };
     Some(match result {
         Ok(r) => json!({"jsonrpc": "2.0", "id": id, "result": r}),
@@ -291,6 +364,140 @@ mod tests {
         CacheOpts {
             use_cache: false,
             always_refresh: false,
+        }
+    }
+
+    #[test]
+    fn invalid_requests_get_protocol_errors_instead_of_disappearing_or_succeeding() {
+        for message in [
+            Value::Null,
+            json!(42),
+            json!([]),
+            json!({}),
+            json!({"jsonrpc": "2.0", "method": 7}),
+            json!({"id": 1, "method": "ping"}),
+            json!({"jsonrpc": "1.0", "id": 1, "method": "ping"}),
+            json!({"jsonrpc": "2.0", "id": true, "method": "ping"}),
+            json!({"jsonrpc": "2.0", "id": [], "method": "ping"}),
+            json!({"jsonrpc": "2.0", "id": null, "method": "ping"}),
+            json!({"jsonrpc": "2.0", "id": 1.5, "method": "ping"}),
+        ] {
+            let response = handle(&message, opts()).expect("invalid requests must not be lost as notifications");
+            assert_eq!(response["error"]["code"], -32600, "{message}: {response}");
+            assert_eq!(response["id"], Value::Null, "{message}: {response}");
+            assert!(response.get("result").is_none(), "{response}");
+        }
+    }
+
+    #[test]
+    fn notifications_are_silent_and_request_ids_are_preserved() {
+        for method in ["notifications/initialized", "ping", "unknown"] {
+            assert!(handle(&json!({"jsonrpc": "2.0", "method": method}), opts()).is_none());
+        }
+        for id in [
+            json!(0),
+            json!(-1),
+            json!(1.0),
+            json!(-2.0),
+            json!("request\n\"id"),
+            json!(u64::MAX),
+        ] {
+            let response = handle(&json!({"jsonrpc": "2.0", "id": id, "method": "ping"}), opts()).unwrap();
+            assert_eq!(response, json!({"jsonrpc": "2.0", "id": id, "result": {}}));
+        }
+    }
+
+    #[test]
+    fn invalid_tool_call_params_get_protocol_errors() {
+        for params in [
+            Value::Null,
+            json!([]),
+            json!({}),
+            json!({"name": 42}),
+            json!({"name": "not_a_tool"}),
+            json!({"name": "disk_usage", "arguments": []}),
+            json!({"name": "disk_usage", "arguments": {}}),
+            json!({"name": "disk_usage", "arguments": {"path": false}}),
+            json!({"name": "find_by_category", "arguments": {"path": "."}}),
+            json!({"name": "find_by_category", "arguments": {"path": ".", "category": "not_a_category"}}),
+        ] {
+            let response = handle(
+                &json!({"jsonrpc": "2.0", "id": "bad-call", "method": "tools/call", "params": params}),
+                opts(),
+            )
+            .unwrap();
+            assert_eq!(response["error"]["code"], -32602, "{params}: {response}");
+            assert_eq!(response["id"], "bad-call");
+            assert!(response.get("result").is_none(), "{response}");
+        }
+    }
+
+    #[test]
+    fn tool_options_must_match_the_advertised_schema() {
+        let path = std::env::temp_dir().join(format!("dutype-mcp-invalid-options-{}", std::process::id()));
+        for (name, values) in [
+            (
+                "top",
+                vec![json!(0), json!(501), json!(-1), json!(1.5), json!("5"), Value::Null],
+            ),
+            ("cross_fs", vec![json!("true"), json!(1), Value::Null]),
+            ("refresh", vec![json!("true"), json!(1), Value::Null]),
+            ("clones", vec![json!("true"), json!(1), Value::Null]),
+            ("private", vec![json!("true"), json!(1), Value::Null]),
+            ("size_mode", vec![json!("DEDUP"), json!(1), Value::Null]),
+        ] {
+            for value in values {
+                let mut args = json!({"path": path});
+                args[name] = value;
+                let response = handle(
+                    &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                        "params": {"name": "disk_usage", "arguments": args}}),
+                    opts(),
+                )
+                .unwrap();
+                assert_eq!(response["error"]["code"], -32602, "{args}: {response}");
+            }
+        }
+    }
+
+    #[test]
+    fn integral_numeric_top_values_are_valid_and_honored() {
+        let dir = std::env::temp_dir().join(format!("dutype-mcp-integral-top-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        for i in 0..25 {
+            std::fs::write(dir.join(format!("file-{i}.pdf")), b"pdf").unwrap();
+        }
+        let mut results = Vec::new();
+        for (value, expected) in [
+            (json!(1.0), 1),
+            (json!(20.0), 20),
+            (json!(500.0), 25),
+            (serde_json::from_str("1e0").unwrap(), 1),
+        ] {
+            for tool in ["disk_usage", "find_by_category"] {
+                let response = handle(
+                    &json!({"jsonrpc":"2.0", "id":"integral", "method":"tools/call",
+                    "params":{"name":tool, "arguments":{"path":dir, "category":"PDF", "top":value}}}),
+                    opts(),
+                )
+                .unwrap();
+                results.push((tool, expected, response));
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+        for (tool, expected, response) in results {
+            assert_eq!(response["result"]["isError"], false, "{response}");
+            let key = if tool == "disk_usage" { "largest_files" } else { "items" };
+            assert_eq!(
+                response["result"]["structuredContent"][key].as_array().unwrap().len(),
+                expected
+            );
+        }
+        for value in [json!(0.0), json!(501.0), json!(-1.0), json!(1.5), json!(1e100)] {
+            assert!(
+                validate_tool_args("disk_usage", &json!({"path":".", "top":value})).is_err(),
+                "{value}"
+            );
         }
     }
 
