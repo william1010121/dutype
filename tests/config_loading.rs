@@ -40,7 +40,7 @@ impl Fixture {
         fs::write(root.join("sample.fixtureconfig"), vec![b'x'; 8192]).unwrap();
         Self {
             root,
-            config: base.join("config-home/dutype/config.toml"),
+            config: base.join("config-home").join("dutype").join("config.toml"),
             cache: base.join("cache"),
             base,
         }
