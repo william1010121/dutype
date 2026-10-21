@@ -768,7 +768,7 @@ impl App {
                 let matches = match &item.key {
                     Key::Cat(c) if c.is_dir_kind() => n.special && n.cat == *c,
                     Key::Cat(c) => !n.is_dir() && n.cat == *c,
-                    Key::Ext(e) => !n.is_dir() && ext_key(&n.name) == *e,
+                    Key::Ext(e) => !n.is_dir() && matches_ext_key(&n.name, e),
                 };
                 if matches {
                     let size = if by_dedup { dedup } else { n.size };
@@ -856,6 +856,16 @@ fn step(state: &mut TableState, len: usize, delta: isize) {
 
 pub fn ext_key(name: &str) -> String {
     category::ext_of(name).map_or_else(|| "(none)".to_string(), |e| e.to_ascii_lowercase())
+}
+
+/// Compare to the ASCII-lowercased breakdown key without allocating per file.
+/// Fold only the name, not the key: noncanonical keys must stay unmatched.
+fn matches_ext_key(name: &str, key: &str) -> bool {
+    category::ext_of(name)
+        .unwrap_or("(none)")
+        .bytes()
+        .map(|b| b.to_ascii_lowercase())
+        .eq(key.bytes())
 }
 
 fn ext_breakdown(cur: &Node) -> Vec<BreakdownItem> {
@@ -1074,6 +1084,202 @@ mod tests {
         // Exercise collection directly: repeated test opens must never dispatch
         // Enter to an existing popup's external reveal action.
         app.open_popup();
+    }
+
+    #[test]
+    fn borrowed_extension_match_is_exactly_normalized_key_equality() {
+        let mut names: Vec<String> = [
+            "",
+            ".",
+            "..",
+            "README",
+            ".bashrc",
+            "name.",
+            "name..",
+            ".config.JSON",
+            "archive.tar.GZ",
+            "a..PDF",
+            "file.PdF",
+            "file.(none)",
+            "file.(NONE)",
+            "file.É",
+            "file.é",
+            "file.İ",
+            "file.ı",
+            "file.Σ",
+            "file.σ",
+            "file.ς",
+            "file.ẞ",
+            "file.ß",
+            "file.K",
+            "file.k",
+            "file.ÉPDF",
+            "file.éPDF",
+            "file.e\u{301}PDF",
+            "file.日本語",
+            "file.🦀",
+            r"raw\xff.PDF",
+            r"raw.P\xffDF",
+            r"raw.PD\x46",
+            r"literal\\.PDF",
+            "lossy.�PDF",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        // Exercise every ASCII byte, including controls, both before and after
+        // the final dot. These are strings only, never filesystem fixtures.
+        for byte in 0..=127 {
+            let c = char::from(byte);
+            names.extend([format!("stem.{c}"), format!("stem.X{c}Z"), format!("{c}.PDF")]);
+        }
+        let mut keys = vec![
+            "".into(),
+            "pdf".into(),
+            "PDF".into(),
+            "PdF".into(),
+            "(none)".into(),
+            "(NONE)".into(),
+            "absent".into(),
+        ];
+        for name in &names {
+            let key = ext_key(name);
+            keys.extend([
+                key.clone(),
+                key.to_ascii_uppercase(),
+                key.to_uppercase(),
+                key.to_lowercase(),
+            ]);
+        }
+        keys.sort_unstable();
+        keys.dedup();
+        for name in &names {
+            for key in &keys {
+                assert_eq!(
+                    matches_ext_key(name, key),
+                    ext_key(name) == *key,
+                    "name={name:?}, key={key:?}"
+                );
+            }
+        }
+        assert!(matches_ext_key("file.(NONE)", "(none)"));
+        assert!(matches_ext_key("README", "(none)"));
+        assert!(!matches_ext_key("file.PDF", "PDF"));
+        assert!(!matches_ext_key("README", "(NONE)"));
+        assert!(!matches_ext_key("file.É", "é"));
+        assert!(!matches_ext_key("file.K", "k"));
+    }
+
+    #[test]
+    fn borrowed_extension_popup_preserves_oracle_output_and_jump_targets() {
+        let mut raw = jump_file(r"raw\xff.PdF", 4);
+        // Unix resolution decodes this in memory; avoid filesystem lookup on
+        // platforms whose lossy-name representation needs directory reads.
+        raw.lossy = cfg!(unix);
+        let tree = jump_dir(
+            "root",
+            vec![
+                jump_file("README", 1),
+                jump_file(".hidden", 2),
+                jump_file("trailing.", 3),
+                jump_file("file.(NONE)", 4),
+                jump_file("a.PDF", 5),
+                jump_file("a.pDf", 5),
+                jump_file("archive.tar.GZ", 6),
+                jump_file("file.ÉPDF", 7),
+                jump_file("file.éPDF", 8),
+                jump_file("file.İ", 9),
+                jump_file("file.ı", 10),
+                jump_file("file.K", 11),
+                jump_file("file.k", 12),
+                jump_file("file.日本語", 13),
+                jump_file("file.�PDF", 14),
+                raw,
+                jump_file(r"raw\xff.PdF", 4),
+                jump_file(r"raw.P\xffDF", 4),
+                jump_dir(
+                    "directory.PDF",
+                    vec![jump_file("child.pdf", 15), jump_file("child", 16)],
+                ),
+                jump_dir("empty.(none)", vec![]),
+            ],
+        );
+        let mut app = jump_app(tree);
+        for mode in [SizeMode::Du, SizeMode::Dedup] {
+            app.set_size_mode(mode);
+            for key in [
+                "pdf",
+                "PDF",
+                "PdF",
+                "(none)",
+                "(NONE)",
+                "gz",
+                "GZ",
+                "Épdf",
+                "épdf",
+                "İ",
+                "i",
+                "ı",
+                "K",
+                "k",
+                "日本語",
+                "�pdf",
+                r"p\xffdf",
+                "",
+                "absent",
+            ] {
+                let mut expected = Vec::new();
+                walk_popup(
+                    &app.root,
+                    &mut PathBuf::new(),
+                    &mut Vec::new(),
+                    &mut |n, dedup, path, indices| {
+                        // The allocating expression is the pre-optimization oracle.
+                        if !n.is_dir() && ext_key(&n.name) == key {
+                            expected.push(PopupItem {
+                                path: path.to_path_buf(),
+                                size: if mode == SizeMode::Dedup { dedup } else { n.size },
+                                fs_path: popup_fs_path(&app.root, &app.root_path, indices),
+                                target: indices.to_vec(),
+                            });
+                        }
+                        true
+                    },
+                );
+                expected.sort_by(|a, b| b.cmp(a));
+                rank_popup(&mut app, Key::Ext(key.into()));
+                let popup = app.popup.as_ref().unwrap();
+                let suffix = if mode == SizeMode::Dedup {
+                    " · clones counted once"
+                } else {
+                    ""
+                };
+                assert_eq!(popup.title, format!("*.{key} files{suffix}"));
+                assert_eq!(popup.items.len(), expected.len(), "key={key:?}");
+                for (got, want) in popup.items.iter().zip(&expected) {
+                    assert_eq!(
+                        (&got.path, got.size, &got.fs_path, &got.target),
+                        (&want.path, want.size, &want.fs_path, &want.target),
+                        "key={key:?}"
+                    );
+                    assert!(!node_at(&app.root, &got.target).is_dir());
+                }
+                for (index, want) in expected.iter().enumerate() {
+                    rank_popup(&mut app, Key::Ext(key.into()));
+                    app.popup.as_mut().unwrap().state.select(Some(index));
+                    // Exercise only the in-app jump, never reveal/open/copy.
+                    app.handle_popup_key(KeyEvent::from(KeyCode::Char('s')));
+                    assert!(app.popup.is_none());
+                    let mut target = app.stack.clone();
+                    target.push(app.selected_entry().unwrap());
+                    assert_eq!(target, want.target);
+                    consistent_history(&app);
+                    while !app.stack.is_empty() {
+                        app.leave();
+                    }
+                }
+            }
+        }
     }
 
     #[test]
