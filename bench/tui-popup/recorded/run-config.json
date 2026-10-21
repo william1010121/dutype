@@ -1,0 +1,18 @@
+{
+  "public_command": [
+    "/workspace/shared/dutype-popup-benchmark-recovered-stage/tui-popup/compare.py",
+    "measure",
+    "--output",
+    "/workspace/shared/dutype-popup-benchmark-recovered-stage/final-build",
+    "--authorized",
+    "--timeout",
+    "30"
+  ],
+  "timeout_seconds": 30,
+  "results_name": "results",
+  "exit_code": 0,
+  "timed_out": false,
+  "completed_harness_invocations": 64,
+  "elapsed_seconds": 2.4918203829984122,
+  "hashes_unchanged": true
+}

@@ -1,0 +1,105 @@
+{
+  "started_utc": "2026-10-21T03:18:49.006692+00:00",
+  "platform": "Linux-6.18.55-x86_64-with-glibc2.41",
+  "machine": "x86_64",
+  "cpu_count": 9,
+  "affinity": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8
+  ],
+  "toolchain": "rustc 1.99.1 (58cf8f9c3 2026-10-13)\nbinary: rustc\ncommit-hash: 58cf8f9c35b355199727627d07ae34a4e2846d67\ncommit-date: 2026-10-13\nhost: x86_64-unknown-linux-gnu\nrelease: 1.99.1\nLLVM version: 23.1.1\ncargo 1.99.1 (5f94df478 2026-08-27)\n",
+  "source_manifest": {
+    "prepared_utc": "2026-10-21T03:16:37.985527+00:00",
+    "harness_sha256": "ee1c6540f8610f982d09f45ff4dacaab23177be59bd656d02b6eecac467799d1",
+    "comparison_script_sha256": "0d8cf6c425d10923e476022abfb5e60d77c167f938533f089d8d94bcbf33b8d2",
+    "variants": {
+      "before": {
+        "source": "/workspace/shared/dutype-recovered",
+        "expectation": "buggy",
+        "head": "348ac88a26936c6bd2e98dabf9b0ff68184bc983",
+        "git_status": "",
+        "app_rs_sha256": "bdd5935d87fa594e89e53d175e757b48283f4fb198c8dd25a6c41351c5eec0a6",
+        "cargo_lock_sha256": "89b9b735e9e518b97d1db53673c7e49dcb10d623194cb731fce3c040a6a1e925",
+        "copied_module_hashes": {
+          "src/account.rs": "af06297708d68e0b09629f73e983eaf0bf0c8496ec125abbd50a1d9137b9f269",
+          "src/app.rs": "bdd5935d87fa594e89e53d175e757b48283f4fb198c8dd25a6c41351c5eec0a6",
+          "src/cache/depth_tests.rs": "e2d945089c173bd187d7284b9e543d992a206bd29b9ad8d9c8281987868fd328",
+          "src/cache.rs": "3a57393ba1d7a66ac00ff6abcd241ecaa97e56239b3348452ba4bc469f09b5b0",
+          "src/category.rs": "0dcf5b751d505f2b951ac7127d0e49a9501337e871c2b8d54d431a21fefa4c69",
+          "src/default_config.toml": "32edc274d7897a75bb9745d4d23bac98e07e80d1eaf2b62089e5b94f26826723",
+          "src/mcp.rs": "1e3216374d81e62a792251dc226ed1d931f6bf1468a0c9841fdd67dd348829d5",
+          "src/report.rs": "2ca4955f1e581ac299b3a0ba24fb341e46aed425f88f43ea4ed780790823336e",
+          "src/scan/platform/bulk.rs": "1ff551829049e38ea8e86a04f35ee13a61551c60c9e6635b1d7f1c9d7b2fe292",
+          "src/scan/platform/fiemap.rs": "76bc3a0ff17fbabaa386b39a5b1e20cc15c6a5a3389f3579e24b87b165905ea0",
+          "src/scan.rs": "816e7547561403902365f82c9b191121b7944880a1ee88e3a78207db1fc81e19",
+          "src/ui.rs": "7e17b021f8b45d4bdda4c424649a0835541a0c8b4345c517a74a028a092900fc"
+        }
+      },
+      "after": {
+        "source": "/workspace/shared/dutype-tui-tie-recovered",
+        "expectation": "correct",
+        "head": "348ac88a26936c6bd2e98dabf9b0ff68184bc983",
+        "git_status": "M src/app.rs\n?? tests/tui_tie_parity.py",
+        "app_rs_sha256": "6693c2416462def27690f539c79c21673440c0aeec0d3eebddf3e5eaa078d48d",
+        "cargo_lock_sha256": "89b9b735e9e518b97d1db53673c7e49dcb10d623194cb731fce3c040a6a1e925",
+        "copied_module_hashes": {
+          "src/account.rs": "af06297708d68e0b09629f73e983eaf0bf0c8496ec125abbd50a1d9137b9f269",
+          "src/app.rs": "6693c2416462def27690f539c79c21673440c0aeec0d3eebddf3e5eaa078d48d",
+          "src/cache/depth_tests.rs": "e2d945089c173bd187d7284b9e543d992a206bd29b9ad8d9c8281987868fd328",
+          "src/cache.rs": "3a57393ba1d7a66ac00ff6abcd241ecaa97e56239b3348452ba4bc469f09b5b0",
+          "src/category.rs": "0dcf5b751d505f2b951ac7127d0e49a9501337e871c2b8d54d431a21fefa4c69",
+          "src/default_config.toml": "32edc274d7897a75bb9745d4d23bac98e07e80d1eaf2b62089e5b94f26826723",
+          "src/mcp.rs": "1e3216374d81e62a792251dc226ed1d931f6bf1468a0c9841fdd67dd348829d5",
+          "src/report.rs": "2ca4955f1e581ac299b3a0ba24fb341e46aed425f88f43ea4ed780790823336e",
+          "src/scan/platform/bulk.rs": "1ff551829049e38ea8e86a04f35ee13a61551c60c9e6635b1d7f1c9d7b2fe292",
+          "src/scan/platform/fiemap.rs": "76bc3a0ff17fbabaa386b39a5b1e20cc15c6a5a3389f3579e24b87b165905ea0",
+          "src/scan.rs": "816e7547561403902365f82c9b191121b7944880a1ee88e3a78207db1fc81e19",
+          "src/ui.rs": "7e17b021f8b45d4bdda4c424649a0835541a0c8b4345c517a74a028a092900fc"
+        }
+      }
+    }
+  },
+  "binary_identities": {
+    "before-time": {
+      "app_rs_sha256": "bdd5935d87fa594e89e53d175e757b48283f4fb198c8dd25a6c41351c5eec0a6",
+      "expectation": "buggy",
+      "instrumented": false,
+      "variant": "before",
+      "binary_sha256": "3129d4da2c53917958a9bb98ffd801780eee2f1d9f8dc38b8a2cba09ef23c3e7"
+    },
+    "before-metrics": {
+      "app_rs_sha256": "bdd5935d87fa594e89e53d175e757b48283f4fb198c8dd25a6c41351c5eec0a6",
+      "expectation": "buggy",
+      "instrumented": true,
+      "variant": "before",
+      "binary_sha256": "df47c606f0174ebbfb1fbb1c6cbf4c6304553b67c5f7df125ffc62e792844eb0"
+    },
+    "after-time": {
+      "app_rs_sha256": "6693c2416462def27690f539c79c21673440c0aeec0d3eebddf3e5eaa078d48d",
+      "expectation": "correct",
+      "instrumented": false,
+      "variant": "after",
+      "binary_sha256": "8e5d4d9f1c7e614e31f3dbcec23641f18aa1d0cbac5067c583d1d668fc9a93e5"
+    },
+    "after-metrics": {
+      "app_rs_sha256": "6693c2416462def27690f539c79c21673440c0aeec0d3eebddf3e5eaa078d48d",
+      "expectation": "correct",
+      "instrumented": true,
+      "variant": "after",
+      "binary_sha256": "15236ae3cfefb9bde7d462bd837cd46ded4e0bf88d588e1f45dddb202290148f"
+    }
+  },
+  "warmups": 2,
+  "repetitions": 7,
+  "timeout_seconds": 30,
+  "timing_scope": "Uninstrumented release App::handle_key(Enter); excludes construction, verification, output and popup destruction.",
+  "metric_scope": "Rust global-allocator requests during one popup open; excludes tree/registry/App construction and popup destruction.",
+  "rss_scope": "Fresh ordinary-allocator process, including construction, one popup, output and teardown."
+}

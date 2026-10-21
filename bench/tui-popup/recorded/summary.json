@@ -1,0 +1,626 @@
+[
+  {
+    "count": 10000,
+    "pattern": "ties",
+    "pane": "category",
+    "before": {
+      "median_ms": 0.349769,
+      "min_ms": 0.348748,
+      "max_ms": 0.487545,
+      "samples_ns": [
+        363570,
+        348888,
+        348919,
+        365052,
+        349769,
+        348748,
+        487545
+      ],
+      "allocator": {
+        "alloc_calls": 2006,
+        "allocated_bytes": 134591,
+        "dealloc_calls": 504,
+        "deallocated_bytes": 62075,
+        "peak_live_bytes": 112538,
+        "realloc_calls": 501,
+        "retained_bytes": 72516,
+        "zeroed_alloc_calls": 0
+      },
+      "rss": {
+        "rss_provider": "wait4-rusage",
+        "max_rss_kib": 2112
+      },
+      "verification": {
+        "checksum": 11137360828976510475,
+        "expected_parity": false,
+        "filesystem_paths_verified": true,
+        "first_path": "f00000499.pdf",
+        "last_path": "f00000000.pdf",
+        "report_parity": false
+      }
+    },
+    "after": {
+      "median_ms": 5.880448,
+      "min_ms": 5.62639,
+      "max_ms": 6.024542,
+      "samples_ns": [
+        6024542,
+        5626390,
+        5921548,
+        5758105,
+        5880448,
+        5881389,
+        5636465
+      ],
+      "allocator": {
+        "alloc_calls": 21006,
+        "allocated_bytes": 334091,
+        "dealloc_calls": 19504,
+        "deallocated_bytes": 261575,
+        "peak_live_bytes": 90538,
+        "realloc_calls": 501,
+        "retained_bytes": 72516,
+        "zeroed_alloc_calls": 0
+      },
+      "rss": {
+        "rss_provider": "wait4-rusage",
+        "max_rss_kib": 2368
+      },
+      "verification": {
+        "checksum": 17620137893924026871,
+        "expected_parity": true,
+        "filesystem_paths_verified": true,
+        "first_path": "f00009999.pdf",
+        "last_path": "f00009500.pdf",
+        "report_parity": true
+      }
+    },
+    "after_over_before_median": 16.81237616827106
+  },
+  {
+    "count": 10000,
+    "pattern": "ties",
+    "pane": "extension",
+    "before": {
+      "median_ms": 0.525341,
+      "min_ms": 0.483819,
+      "max_ms": 0.741492,
+      "samples_ns": [
+        485792,
+        525341,
+        483819,
+        558680,
+        485121,
+        619921,
+        741492
+      ],
+      "allocator": {
+        "alloc_calls": 12006,
+        "allocated_bytes": 164583,
+        "dealloc_calls": 10504,
+        "deallocated_bytes": 92067,
+        "peak_live_bytes": 112538,
+        "realloc_calls": 500,
+        "retained_bytes": 72516,
+        "zeroed_alloc_calls": 0
+      },
+      "rss": {
+        "rss_provider": "wait4-rusage",
+        "max_rss_kib": 2240
+      },
+      "verification": {
+        "checksum": 11137360828976510475,
+        "expected_parity": false,
+        "filesystem_paths_verified": true,
+        "first_path": "f00000499.pdf",
+        "last_path": "f00000000.pdf",
+        "report_parity": false
+      }
+    },
+    "after": {
+      "median_ms": 6.072523,
+      "min_ms": 5.807449,
+      "max_ms": 6.357426,
+      "samples_ns": [
+        6150579,
+        6108717,
+        6003090,
+        5872826,
+        5807449,
+        6072523,
+        6357426
+      ],
+      "allocator": {
+        "alloc_calls": 31006,
+        "allocated_bytes": 364083,
+        "dealloc_calls": 29504,
+        "deallocated_bytes": 291567,
+        "peak_live_bytes": 90538,
+        "realloc_calls": 500,
+        "retained_bytes": 72516,
+        "zeroed_alloc_calls": 0
+      },
+      "rss": {
+        "rss_provider": "wait4-rusage",
+        "max_rss_kib": 2368
+      },
+      "verification": {
+        "checksum": 17620137893924026871,
+        "expected_parity": true,
+        "filesystem_paths_verified": true,
+        "first_path": "f00009999.pdf",
+        "last_path": "f00009500.pdf",
+        "report_parity": true
+      }
+    },
+    "after_over_before_median": 11.559202498948304
+  },
+  {
+    "count": 10000,
+    "pattern": "descending",
+    "pane": "category",
+    "before": {
+      "median_ms": 0.33655,
+      "min_ms": 0.320676,
+      "max_ms": 1.228225,
+      "samples_ns": [
+        321678,
+        336550,
+        335288,
+        344943,
+        320676,
+        456298,
+        1228225
+      ],
+      "allocator": {
+        "alloc_calls": 2006,
+        "allocated_bytes": 134591,
+        "dealloc_calls": 504,
+        "deallocated_bytes": 62075,
+        "peak_live_bytes": 112538,
+        "realloc_calls": 501,
+        "retained_bytes": 72516,
+        "zeroed_alloc_calls": 0
+      },
+      "rss": {
+        "rss_provider": "wait4-rusage",
+        "max_rss_kib": 2368
+      },
+      "verification": {
+        "checksum": 5476151114218492039,
+        "expected_parity": true,
+        "filesystem_paths_verified": true,
+        "first_path": "f00000000.pdf",
+        "last_path": "f00000499.pdf",
+        "report_parity": true
+      }
+    },
+    "after": {
+      "median_ms": 0.312445,
+      "min_ms": 0.310081,
+      "max_ms": 0.51858,
+      "samples_ns": [
+        312274,
+        354647,
+        310081,
+        311874,
+        518580,
+        312445,
+        359284
+      ],
+      "allocator": {
+        "alloc_calls": 2006,
+        "allocated_bytes": 134591,
+        "dealloc_calls": 504,
+        "deallocated_bytes": 62075,
+        "peak_live_bytes": 90538,
+        "realloc_calls": 501,
+        "retained_bytes": 72516,
+        "zeroed_alloc_calls": 0
+      },
+      "rss": {
+        "rss_provider": "wait4-rusage",
+        "max_rss_kib": 2176
+      },
+      "verification": {
+        "checksum": 5476151114218492039,
+        "expected_parity": true,
+        "filesystem_paths_verified": true,
+        "first_path": "f00000000.pdf",
+        "last_path": "f00000499.pdf",
+        "report_parity": true
+      }
+    },
+    "after_over_before_median": 0.9283761699598869
+  },
+  {
+    "count": 10000,
+    "pattern": "descending",
+    "pane": "extension",
+    "before": {
+      "median_ms": 0.596797,
+      "min_ms": 0.473423,
+      "max_ms": 0.677487,
+      "samples_ns": [
+        600352,
+        677487,
+        564980,
+        596797,
+        473884,
+        649895,
+        473423
+      ],
+      "allocator": {
+        "alloc_calls": 12006,
+        "allocated_bytes": 164583,
+        "dealloc_calls": 10504,
+        "deallocated_bytes": 92067,
+        "peak_live_bytes": 112538,
+        "realloc_calls": 500,
+        "retained_bytes": 72516,
+        "zeroed_alloc_calls": 0
+      },
+      "rss": {
+        "rss_provider": "wait4-rusage",
+        "max_rss_kib": 2368
+      },
+      "verification": {
+        "checksum": 5476151114218492039,
+        "expected_parity": true,
+        "filesystem_paths_verified": true,
+        "first_path": "f00000000.pdf",
+        "last_path": "f00000499.pdf",
+        "report_parity": true
+      }
+    },
+    "after": {
+      "median_ms": 0.456929,
+      "min_ms": 0.45028,
+      "max_ms": 0.467344,
+      "samples_ns": [
+        456929,
+        467344,
+        450280,
+        466273,
+        452252,
+        466733,
+        451451
+      ],
+      "allocator": {
+        "alloc_calls": 12006,
+        "allocated_bytes": 164583,
+        "dealloc_calls": 10504,
+        "deallocated_bytes": 92067,
+        "peak_live_bytes": 90538,
+        "realloc_calls": 500,
+        "retained_bytes": 72516,
+        "zeroed_alloc_calls": 0
+      },
+      "rss": {
+        "rss_provider": "wait4-rusage",
+        "max_rss_kib": 2368
+      },
+      "verification": {
+        "checksum": 5476151114218492039,
+        "expected_parity": true,
+        "filesystem_paths_verified": true,
+        "first_path": "f00000000.pdf",
+        "last_path": "f00000499.pdf",
+        "report_parity": true
+      }
+    },
+    "after_over_before_median": 0.7656355511170464
+  },
+  {
+    "count": 100000,
+    "pattern": "ties",
+    "pane": "category",
+    "before": {
+      "median_ms": 2.904917,
+      "min_ms": 2.780932,
+      "max_ms": 3.280635,
+      "samples_ns": [
+        2841763,
+        3040487,
+        2780932,
+        2809535,
+        3187836,
+        3280635,
+        2904917
+      ],
+      "allocator": {
+        "alloc_calls": 2006,
+        "allocated_bytes": 134591,
+        "dealloc_calls": 504,
+        "deallocated_bytes": 62075,
+        "peak_live_bytes": 112538,
+        "realloc_calls": 501,
+        "retained_bytes": 72516,
+        "zeroed_alloc_calls": 0
+      },
+      "rss": {
+        "rss_provider": "wait4-rusage",
+        "max_rss_kib": 8640
+      },
+      "verification": {
+        "checksum": 11137360828976510475,
+        "expected_parity": false,
+        "filesystem_paths_verified": true,
+        "first_path": "f00000499.pdf",
+        "last_path": "f00000000.pdf",
+        "report_parity": false
+      }
+    },
+    "after": {
+      "median_ms": 64.424136,
+      "min_ms": 58.983652,
+      "max_ms": 81.525426,
+      "samples_ns": [
+        76091851,
+        81525426,
+        78792705,
+        64424136,
+        59056590,
+        59466960,
+        58983652
+      ],
+      "allocator": {
+        "alloc_calls": 201006,
+        "allocated_bytes": 2224091,
+        "dealloc_calls": 199504,
+        "deallocated_bytes": 2151575,
+        "peak_live_bytes": 90538,
+        "realloc_calls": 501,
+        "retained_bytes": 72516,
+        "zeroed_alloc_calls": 0
+      },
+      "rss": {
+        "rss_provider": "wait4-rusage",
+        "max_rss_kib": 8576
+      },
+      "verification": {
+        "checksum": 6062084143361889263,
+        "expected_parity": true,
+        "filesystem_paths_verified": true,
+        "first_path": "f00099999.pdf",
+        "last_path": "f00099500.pdf",
+        "report_parity": true
+      }
+    },
+    "after_over_before_median": 22.1776167787238
+  },
+  {
+    "count": 100000,
+    "pattern": "ties",
+    "pane": "extension",
+    "before": {
+      "median_ms": 4.272999,
+      "min_ms": 4.069677,
+      "max_ms": 4.533386,
+      "samples_ns": [
+        4069677,
+        4295422,
+        4250125,
+        4272999,
+        4225889,
+        4533386,
+        4343084
+      ],
+      "allocator": {
+        "alloc_calls": 102006,
+        "allocated_bytes": 434583,
+        "dealloc_calls": 100504,
+        "deallocated_bytes": 362067,
+        "peak_live_bytes": 112538,
+        "realloc_calls": 500,
+        "retained_bytes": 72516,
+        "zeroed_alloc_calls": 0
+      },
+      "rss": {
+        "rss_provider": "wait4-rusage",
+        "max_rss_kib": 8640
+      },
+      "verification": {
+        "checksum": 11137360828976510475,
+        "expected_parity": false,
+        "filesystem_paths_verified": true,
+        "first_path": "f00000499.pdf",
+        "last_path": "f00000000.pdf",
+        "report_parity": false
+      }
+    },
+    "after": {
+      "median_ms": 60.393136,
+      "min_ms": 59.518416,
+      "max_ms": 62.162554,
+      "samples_ns": [
+        60393136,
+        61360573,
+        62162554,
+        60487085,
+        59518416,
+        60185467,
+        60000452
+      ],
+      "allocator": {
+        "alloc_calls": 301006,
+        "allocated_bytes": 2524083,
+        "dealloc_calls": 299504,
+        "deallocated_bytes": 2451567,
+        "peak_live_bytes": 90538,
+        "realloc_calls": 500,
+        "retained_bytes": 72516,
+        "zeroed_alloc_calls": 0
+      },
+      "rss": {
+        "rss_provider": "wait4-rusage",
+        "max_rss_kib": 8640
+      },
+      "verification": {
+        "checksum": 6062084143361889263,
+        "expected_parity": true,
+        "filesystem_paths_verified": true,
+        "first_path": "f00099999.pdf",
+        "last_path": "f00099500.pdf",
+        "report_parity": true
+      }
+    },
+    "after_over_before_median": 14.133664903736227
+  },
+  {
+    "count": 100000,
+    "pattern": "descending",
+    "pane": "category",
+    "before": {
+      "median_ms": 2.71261,
+      "min_ms": 2.673182,
+      "max_ms": 2.895503,
+      "samples_ns": [
+        2712610,
+        2709295,
+        2895503,
+        2712831,
+        2690228,
+        2673182,
+        2803385
+      ],
+      "allocator": {
+        "alloc_calls": 2006,
+        "allocated_bytes": 134591,
+        "dealloc_calls": 504,
+        "deallocated_bytes": 62075,
+        "peak_live_bytes": 112538,
+        "realloc_calls": 501,
+        "retained_bytes": 72516,
+        "zeroed_alloc_calls": 0
+      },
+      "rss": {
+        "rss_provider": "wait4-rusage",
+        "max_rss_kib": 8576
+      },
+      "verification": {
+        "checksum": 6824218256772423255,
+        "expected_parity": true,
+        "filesystem_paths_verified": true,
+        "first_path": "f00000000.pdf",
+        "last_path": "f00000499.pdf",
+        "report_parity": true
+      }
+    },
+    "after": {
+      "median_ms": 2.662707,
+      "min_ms": 2.628125,
+      "max_ms": 2.839029,
+      "samples_ns": [
+        2634334,
+        2789825,
+        2839029,
+        2653112,
+        2662707,
+        2628125,
+        2694123
+      ],
+      "allocator": {
+        "alloc_calls": 2006,
+        "allocated_bytes": 134591,
+        "dealloc_calls": 504,
+        "deallocated_bytes": 62075,
+        "peak_live_bytes": 90538,
+        "realloc_calls": 501,
+        "retained_bytes": 72516,
+        "zeroed_alloc_calls": 0
+      },
+      "rss": {
+        "rss_provider": "wait4-rusage",
+        "max_rss_kib": 8608
+      },
+      "verification": {
+        "checksum": 6824218256772423255,
+        "expected_parity": true,
+        "filesystem_paths_verified": true,
+        "first_path": "f00000000.pdf",
+        "last_path": "f00000499.pdf",
+        "report_parity": true
+      }
+    },
+    "after_over_before_median": 0.9816033266853694
+  },
+  {
+    "count": 100000,
+    "pattern": "descending",
+    "pane": "extension",
+    "before": {
+      "median_ms": 4.307551,
+      "min_ms": 4.182203,
+      "max_ms": 4.460428,
+      "samples_ns": [
+        4267841,
+        4460428,
+        4353889,
+        4182203,
+        4217016,
+        4340710,
+        4307551
+      ],
+      "allocator": {
+        "alloc_calls": 102006,
+        "allocated_bytes": 434583,
+        "dealloc_calls": 100504,
+        "deallocated_bytes": 362067,
+        "peak_live_bytes": 112538,
+        "realloc_calls": 500,
+        "retained_bytes": 72516,
+        "zeroed_alloc_calls": 0
+      },
+      "rss": {
+        "rss_provider": "wait4-rusage",
+        "max_rss_kib": 8640
+      },
+      "verification": {
+        "checksum": 6824218256772423255,
+        "expected_parity": true,
+        "filesystem_paths_verified": true,
+        "first_path": "f00000000.pdf",
+        "last_path": "f00000499.pdf",
+        "report_parity": true
+      }
+    },
+    "after": {
+      "median_ms": 4.735927,
+      "min_ms": 4.362332,
+      "max_ms": 5.116372,
+      "samples_ns": [
+        5116372,
+        4936485,
+        4362332,
+        4735927,
+        4791369,
+        4507918,
+        4392317
+      ],
+      "allocator": {
+        "alloc_calls": 102006,
+        "allocated_bytes": 434583,
+        "dealloc_calls": 100504,
+        "deallocated_bytes": 362067,
+        "peak_live_bytes": 90538,
+        "realloc_calls": 500,
+        "retained_bytes": 72516,
+        "zeroed_alloc_calls": 0
+      },
+      "rss": {
+        "rss_provider": "wait4-rusage",
+        "max_rss_kib": 8620
+      },
+      "verification": {
+        "checksum": 6824218256772423255,
+        "expected_parity": true,
+        "filesystem_paths_verified": true,
+        "first_path": "f00000000.pdf",
+        "last_path": "f00000499.pdf",
+        "report_parity": true
+      }
+    },
+    "after_over_before_median": 1.0994476908108575
+  }
+]
