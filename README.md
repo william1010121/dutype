@@ -28,23 +28,33 @@ Point dutype at a folder and it tells you, in one screen, how much of it is
 row gets a bar colored by what is inside it, so you can see *why* a folder is
 big before you even open it.
 
-## What it does that other tools don't
+## How it compares
 
-Great tools like gdu, ncdu, dua and dust answer "which folder is big?".
-dutype answers "big *with what*?":
+Tools like gdu, ncdu, dua and dust help locate large folders.
+dutype focuses on "big *with what*?" through category composition:
 
 | | **dutype** | gdu | ncdu | dua | dust | diskonaut |
 |:---|:---:|:---:|:---:|:---:|:---:|:---:|
 | Breakdown by file type (video, PDF, model, …) | ✅ | filter only (`-T`) | — | — | raw extensions (`-t`), non-interactive | — |
-| Knows `node_modules`, venvs, `.git`, `target/`, caches as categories | ✅ | — | — | — | — | — |
+| Category composition for `node_modules`, venvs, `.git`, `target/`, caches | ✅ | — | — | — | — | — |
 | Per-row bar showing what each folder is made of | ✅ | — | — | — | — | — |
-| "Show me every `node_modules` / venv / cache, with sizes" | ✅ | — | — | — | — | — |
+| Discover `node_modules`, venvs and caches with sizes | ✅ | — | — | `dua clean` (selected candidates)¹ | — | — |
 | Your own categories and rules (TOML) | ✅ | — | — | — | — | — |
 | JSON output | ✅ | ✅ | ✅ | — | ✅ | — |
 | Built-in MCP server for LLM agents | ✅ | — | — | — | — | — |
 | Interactive TUI | ✅ | ✅ | ✅ | ✅ | — | ✅ |
 | Parallel scan | ✅ | ✅ | opt-in (`-t`) | ✅ | ✅ | ✅ |
 | Delete from the UI | not yet | ✅ | ✅ | ✅ | — | ✅ |
+
+¹ [dua v2.46.0](https://github.com/Byron/dua-cli/releases/tag/v2.46.0) documents
+[`dua clean`](https://github.com/Byron/dua-cli/blob/v2.46.0/README.md#L258-L275)
+for largest-first discovery of cleanup candidates, including `node_modules`,
+Python caches and virtual environments, Cargo `target` and Zig output/cache
+directories. Discovery respects traversal exclusions; in Git repositories,
+candidates must be ignored and contain no tracked files. Directories containing
+a `.git` entry are skipped. Nothing is deleted automatically. This is cleanup
+discovery, distinct from dutype's category-composition totals and per-row bars. This comparison credits documented
+behavior, not a side-by-side runtime test.
 
 And it is the fastest of the bunch in 3 of our 4 benchmarks (see [Performance](#performance)).
 
