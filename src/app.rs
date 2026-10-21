@@ -1086,11 +1086,17 @@ mod tests {
         app.open_popup();
     }
 
-    #[test]
-    fn deep_popup_jump_and_size_modes_preserve_snapshot_on_small_stack() {
+    // Temporary phase diagnostics are fixed to the three bounded cases below.
+    // Use --nocapture so a process-aborting stack overflow preserves the last
+    // entered/completed phase. No fixture path is ever created on disk.
+    fn deep_tui_phase(depth: usize, stack_bytes: Option<usize>, phase: &str) {
+        eprintln!("[deep-tui-phase] depth={depth} requested_stack_bytes={stack_bytes:?} phase={phase}");
+    }
+
+    fn check_deep_tui_snapshot(depth: usize, stack_bytes: Option<usize>) {
         use crate::scan::{CloneInfo, Shared};
 
-        const DEPTH: usize = 1000;
+        deep_tui_phase(depth, stack_bytes, "fixture-construction:begin");
         let mut shared = jump_file("deep.pdf", 8192);
         shared.clone = true;
         let special_cat = reg().find_by_name("node_modules").unwrap();
@@ -1119,7 +1125,7 @@ mod tests {
             .into_boxed_slice(),
             ..CloneInfo::default()
         }));
-        for _ in 1..DEPTH {
+        for _ in 1..depth {
             branch = jump_dir("d", vec![branch]);
             branch.dir.as_mut().unwrap().clones_mut().dup = 8192;
         }
@@ -1144,29 +1150,44 @@ mod tests {
             .into_boxed_slice(),
             ..CloneInfo::default()
         }));
-        std::thread::Builder::new()
-            .stack_size(128 * 1024)
+        deep_tui_phase(depth, stack_bytes, "fixture-construction:complete");
+        let builder = std::thread::Builder::new();
+        let builder = match stack_bytes {
+            Some(bytes) => builder.stack_size(bytes),
+            None => builder,
+        };
+        deep_tui_phase(depth, stack_bytes, "worker-spawn:begin");
+        builder
             .spawn(move || {
+                deep_tui_phase(depth, stack_bytes, "app-construction:begin");
                 let mut app = jump_app(root);
+                deep_tui_phase(depth, stack_bytes, "app-construction:complete");
                 app.mode = Mode::Extension;
+                deep_tui_phase(depth, stack_bytes, "extension-walk:begin");
                 app.refresh_breakdown();
+                deep_tui_phase(depth, stack_bytes, "extension-walk:complete");
                 assert_eq!(app.breakdown.len(), 1);
                 assert_eq!(app.breakdown[0].count, Some(3));
                 assert_eq!(app.breakdown[0].size, 20480);
                 // Location restoration need not repeatedly aggregate the
                 // extension of every ancestor while testing sort identity.
                 app.mode = Mode::Category;
+                deep_tui_phase(depth, stack_bytes, "initial-dedup-sort-and-restore:begin");
                 app.set_size_mode(SizeMode::Dedup);
+                deep_tui_phase(depth, stack_bytes, "initial-dedup-sort-and-restore:complete");
                 assert_eq!(app.root.children()[0].name.as_ref(), "sibling.pdf");
                 assert_eq!((app.root.size, app.root.dedup(), app.root.files()), (20480, 12288, 3));
 
                 assert_eq!(app.root.dir.as_ref().unwrap().shared()[0].idx, 0);
+                deep_tui_phase(depth, stack_bytes, "special-popup-walk:begin");
                 rank_popup(&mut app, Key::Cat(special_cat));
+                deep_tui_phase(depth, stack_bytes, "special-popup-walk:complete");
                 let popup = app.popup.as_ref().unwrap();
                 assert_eq!(popup.items.len(), 1, "the nested matching directory is pruned");
-                assert_eq!(popup.items[0].target.len(), DEPTH + 1);
-                assert_eq!(popup.items[0].target[DEPTH], 2);
+                assert_eq!(popup.items[0].target.len(), depth + 1);
+                assert_eq!(popup.items[0].target[depth], 2);
 
+                deep_tui_phase(depth, stack_bytes, "file-popup-walks:begin");
                 for key in [Key::Cat(reg().classify_file("deep.pdf")), Key::Ext("pdf".into())] {
                     rank_popup(&mut app, key);
                     let popup = app.popup.as_mut().unwrap();
@@ -1175,15 +1196,18 @@ mod tests {
                         [8192, 4096, 0]
                     );
                     let target = &popup.items[2].target;
-                    assert_eq!(target.len(), DEPTH + 1);
-                    assert_eq!((target[0], target[DEPTH]), (1, 1));
-                    assert!(target[1..DEPTH].iter().all(|&i| i == 0));
+                    assert_eq!(target.len(), depth + 1);
+                    assert_eq!((target[0], target[depth]), (1, 1));
+                    assert!(target[1..depth].iter().all(|&i| i == 0));
                     assert!(popup.items[2].path.ends_with("deep.pdf"));
                 }
+                deep_tui_phase(depth, stack_bytes, "file-popup-walks:complete");
                 app.popup.as_mut().unwrap().state.select(Some(2));
+                deep_tui_phase(depth, stack_bytes, "snapshot-jump:begin");
                 app.jump_to_result();
-                assert_eq!(app.stack.len(), DEPTH);
-                assert_eq!(app.states.len(), DEPTH + 1);
+                deep_tui_phase(depth, stack_bytes, "snapshot-jump:complete");
+                assert_eq!(app.stack.len(), depth);
+                assert_eq!(app.states.len(), depth + 1);
                 assert_eq!(
                     app.current().children()[app.selected_entry().unwrap()].name.as_ref(),
                     "deep.pdf"
@@ -1192,26 +1216,53 @@ mod tests {
 
                 // Sorting preserves the location and selected identity while
                 // remapping the shared record back to its original file.
+                deep_tui_phase(depth, stack_bytes, "du-sort-and-restore:begin");
                 app.set_size_mode(SizeMode::Du);
+                deep_tui_phase(depth, stack_bytes, "du-sort-and-restore:complete");
                 assert_eq!(app.stack[0], 0);
                 assert_eq!(app.root.dir.as_ref().unwrap().shared()[0].idx, 1);
                 assert_eq!(app.selected_entry(), Some(0));
                 assert_eq!(app.current().children()[0].name.as_ref(), "deep.pdf");
                 assert_eq!(app.current().dir.as_ref().unwrap().shared()[0].idx, 0);
+                deep_tui_phase(depth, stack_bytes, "dedup-sort-and-restore:begin");
                 app.set_size_mode(SizeMode::Dedup);
+                deep_tui_phase(depth, stack_bytes, "dedup-sort-and-restore:complete");
                 assert_eq!(app.stack[0], 1);
                 assert_eq!(app.selected_entry(), Some(1));
+                deep_tui_phase(depth, stack_bytes, "in-du-order-sorts-and-restore:begin");
                 app.in_du_order(|root| assert_eq!(root.children()[0].name.as_ref(), "d"));
-                assert_eq!(app.stack.len(), DEPTH);
+                deep_tui_phase(depth, stack_bytes, "in-du-order-sorts-and-restore:complete");
+                assert_eq!(app.stack.len(), depth);
                 assert_eq!(app.stack[0], 1);
                 assert_eq!(app.selected_entry(), Some(1));
                 assert_eq!(app.current().dir.as_ref().unwrap().shared()[0].idx, 1);
                 assert_eq!((app.root.size, app.root.dedup(), app.root.files()), (20480, 12288, 3));
-                // Drop on the same bounded stack as all traversal operations.
+                // Drop on the same selected stack as all traversal operations.
+                deep_tui_phase(depth, stack_bytes, "drop:begin");
+                drop(app);
+                deep_tui_phase(depth, stack_bytes, "drop:complete");
             })
             .unwrap()
             .join()
             .unwrap();
+        deep_tui_phase(depth, stack_bytes, "worker-join:complete");
+    }
+
+    #[test]
+    fn deep_popup_jump_and_size_modes_preserve_snapshot_on_small_stack() {
+        check_deep_tui_snapshot(1000, Some(128 * 1024));
+    }
+
+    #[test]
+    fn shallow_popup_jump_and_size_modes_preserve_snapshot_on_small_stack() {
+        check_deep_tui_snapshot(32, Some(128 * 1024));
+    }
+
+    #[test]
+    fn deep_popup_jump_and_size_modes_preserve_snapshot_on_default_stack() {
+        // Leave Builder::stack_size unset; this is a default Rust worker,
+        // not a claim about the process main thread or the production TUI.
+        check_deep_tui_snapshot(1000, None);
     }
 
     #[test]

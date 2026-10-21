@@ -1,0 +1,51 @@
+# Temporary, bounded PR #29 diagnostics.
+# Do not replace the existing CI or relax any checks. Remove after diagnosis.
+name: Deep TUI phase diagnostics
+
+on:
+  pull_request:
+    paths:
+      - src/app.rs
+      - .github/workflows/deep-tui-diagnostics.yml
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows-phases:
+    if: github.event.pull_request.number == 29
+    name: Windows phases (${{ matrix.rust }}, ${{ matrix.case.label }})
+    runs-on: windows-latest
+    timeout-minutes: 20
+    strategy:
+      # An abort in the original 128 KiB case must not cancel either control.
+      fail-fast: false
+      matrix:
+        rust: ["1.99.1", "1.88.0"]
+        case:
+          - label: shallow-128k
+            test: shallow_popup_jump_and_size_modes_preserve_snapshot_on_small_stack
+          - label: deep-default
+            test: deep_popup_jump_and_size_modes_preserve_snapshot_on_default_stack
+          - label: deep-128k
+            test: deep_popup_jump_and_size_modes_preserve_snapshot_on_small_stack
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Record and test the exact PR head, not an opaque synthetic merge.
+          ref: ${{ github.event.pull_request.head.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.rust }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Record the tested revision and toolchain
+        run: |
+          git rev-parse HEAD
+          rustc +${{ matrix.rust }} --version --verbose
+          cargo +${{ matrix.rust }} --version
+          if (Test-Path Env:RUST_MIN_STACK) { Write-Output "RUST_MIN_STACK=$env:RUST_MIN_STACK" } else { Write-Output "RUST_MIN_STACK is unset" }
+      - name: Run one bounded case with visible phase breadcrumbs
+        run: cargo +${{ matrix.rust }} test --locked --bin dutype app::tests::${{ matrix.case.test }} -- --exact --nocapture --test-threads=1
