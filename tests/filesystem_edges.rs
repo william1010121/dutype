@@ -825,3 +825,195 @@ fn relative_root_reports_absolute_paths() {
     assert_report_schema(&report, &fixture.root);
     assert_eq!(report["largest_files"].as_array().unwrap().len(), 1);
 }
+
+const UNITY_CONFIG: &str = r#"
+[[category]]
+name = "Unity"
+dirs = ["Library", "Temp"]
+markers = ["ProjectSettings"]
+extensions = ["unitypackage"]
+"#;
+
+fn relative_items(report: &Value) -> Vec<PathBuf> {
+    let root = Path::new(report["path"].as_str().unwrap());
+    report["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| {
+            Path::new(item["path"].as_str().unwrap())
+                .strip_prefix(root)
+                .unwrap()
+                .to_path_buf()
+        })
+        .collect()
+}
+
+#[test]
+fn mixed_inventory_readme_unity_fixture_is_opt_in_and_prunes_at_every_limit() {
+    let fixture = Fixture::new("unity-inventory");
+    fs::write(&fixture.config, UNITY_CONFIG).unwrap();
+    fs::create_dir_all(fixture.root.join("Library/Temp")).unwrap();
+    fs::write(fixture.root.join("Library/imported.asset"), vec![b'x'; 4096]).unwrap();
+    fs::write(fixture.root.join("Library/Temp/nested.unitypackage"), b"").unwrap();
+    fs::write(fixture.root.join("export.unitypackage"), vec![b'x'; 65536]).unwrap();
+    fs::write(fixture.root.join("zero.unitypackage"), b"").unwrap();
+    fs::write(fixture.root.join("a.unitypackage"), b"").unwrap();
+    for mode in ["du", "dedup"] {
+        let legacy = fixture.category_report_with_top("Unity", 100, &["--size-mode", mode]);
+        assert_eq!(legacy["matched_items"], 1);
+        assert_eq!(relative_items(&legacy), [PathBuf::from("Library")]);
+        assert!(legacy.get("include_files").is_none());
+        let all = fixture.category_report_with_top("Unity", 100, &["--include-files", "--size-mode", mode]);
+        assert_eq!(all["include_files"], true);
+        assert_eq!(all["matched_items"], 4);
+        assert_eq!(
+            relative_items(&all),
+            ["export.unitypackage", "Library", "zero.unitypackage", "a.unitypackage"].map(PathBuf::from)
+        );
+        assert_eq!(all["accounting"], legacy["accounting"]);
+        // The small Library match must prune even when the larger file fills top=1.
+        for top in [0, 1, 2, 4, usize::MAX] {
+            let limited = fixture.category_report_with_top("Unity", top, &["--include-files", "--size-mode", mode]);
+            let mut expected = all.clone();
+            expected["items"].as_array_mut().unwrap().truncate(top);
+            expected["items_truncated"] = json!(top < 4);
+            assert_eq!(limited, expected);
+        }
+        let text = fixture.output_with_top(
+            "--report",
+            1,
+            &["--category", "Unity", "--include-files", "--size-mode", mode],
+        );
+        assert!(text.starts_with("Largest Unity (1 of 4 shown,"));
+        assert!(text.lines().nth(1).unwrap().ends_with("export.unitypackage"));
+    }
+}
+
+#[test]
+fn mixed_inventory_excluded_root_effective_overrides_and_other_fallback() {
+    let fixture = Fixture::new("mixed-root");
+    let root_config = format!("{UNITY_CONFIG}\n[[category]]\nname = \"Unity\"\ndirs = [\"tree\"]\n");
+    fs::write(&fixture.config, &root_config).unwrap();
+    fs::create_dir_all(fixture.root.join("ordinary")).unwrap();
+    for name in [
+        "explicit.unitypackage",
+        "inherited.asset",
+        "ordinary/nested.unitypackage",
+    ] {
+        fs::write(fixture.root.join(name), b"").unwrap();
+    }
+    let legacy = fixture.category_report_with_top("Unity", 100, &[]);
+    assert_eq!(legacy["matched_items"], 0);
+    let mixed = fixture.category_report_with_top("Unity", 100, &["--include-files"]);
+    assert_eq!(
+        relative_items(&mixed),
+        ["ordinary/nested.unitypackage", "explicit.unitypackage"].map(PathBuf::from)
+    );
+    // Last active extension owner wins, including beneath an excluded root.
+    fs::write(
+        &fixture.config,
+        format!("{root_config}\n[[category]]\nname = \"Exports\"\nextensions = [\"unitypackage\"]\n"),
+    )
+    .unwrap();
+    let overridden = fixture.category_report_with_top("Unity", 100, &["--include-files"]);
+    assert_eq!(overridden["matched_items"], 0);
+    assert!(overridden["items"].as_array().unwrap().is_empty());
+    fs::write(&fixture.config, "[[category]]\nname = \"Other\"\ndirs = [\"tree\"]\n").unwrap();
+    fs::write(fixture.root.join("known.pdf"), b"").unwrap();
+    let other = fixture.category_report_with_top("Other", 100, &["--include-files"]);
+    assert_eq!(other["matched_items"], 3);
+    assert!(!relative_items(&other).contains(&PathBuf::from("known.pdf")));
+    assert_eq!(fixture.category_report_with_top("Other", 100, &[])["matched_items"], 0);
+}
+
+#[test]
+fn mixed_inventory_requires_both_scanned_and_filename_category() {
+    let fixture = Fixture::new("mixed-inheritance");
+    fs::write(
+        &fixture.config,
+        format!("{UNITY_CONFIG}\n[[category]]\nname = \"Cache\"\nextensions = [\"cachefile\"]\n"),
+    )
+    .unwrap();
+    fs::create_dir_all(fixture.root.join("node_modules")).unwrap();
+    fs::create_dir_all(fixture.root.join(".cache")).unwrap();
+    fs::write(fixture.root.join("node_modules/not-unity.unitypackage"), b"").unwrap();
+    fs::write(fixture.root.join(".cache/explicit.unitypackage"), b"").unwrap();
+    fs::write(fixture.root.join("visible.unitypackage"), b"").unwrap();
+    fs::write(fixture.root.join(".cache/inherited.asset"), b"").unwrap();
+    fs::write(fixture.root.join("direct.cachefile"), b"").unwrap();
+    fs::write(fixture.root.join("visible.pdf"), b"pdf").unwrap();
+    fs::write(fixture.root.join("node_modules/inherited.pdf"), b"pdf").unwrap();
+    let mixed = fixture.category_report_with_top("Unity", 100, &["--include-files"]);
+    assert_eq!(relative_items(&mixed), [PathBuf::from("visible.unitypackage")]);
+    // Even a weak matching directory is returned and prunes its descendants.
+    let cache = fixture.category_report_with_top("Cache", 100, &["--include-files"]);
+    let mut names = relative_items(&cache);
+    names.sort();
+    assert_eq!(names, [PathBuf::from(".cache"), PathBuf::from("direct.cachefile")]);
+    // Pure file/directory categories are unchanged apart from the true-only echo.
+    for category in ["PDF", "node_modules"] {
+        let legacy = fixture.category_report_with_top(category, 100, &[]);
+        let mut opted = fixture.category_report_with_top(category, 100, &["--include-files"]);
+        assert_eq!(
+            opted.as_object_mut().unwrap().remove("include_files"),
+            Some(json!(true))
+        );
+        assert_eq!(opted, legacy);
+        assert_eq!(
+            fixture.output("--report", &["--category", category]),
+            fixture.output("--report", &["--category", category, "--include-files"])
+        );
+    }
+}
+
+#[test]
+fn mixed_inventory_preserves_hardlink_accounting() {
+    let fixture = Fixture::new("mixed-hardlinks");
+    fs::write(&fixture.config, UNITY_CONFIG).unwrap();
+    fs::write(fixture.root.join("a.unitypackage"), vec![b'x'; 8192]).unwrap();
+    fs::hard_link(fixture.root.join("a.unitypackage"), fixture.root.join("z.unitypackage")).unwrap();
+    for mode in ["du", "dedup"] {
+        let mixed = fixture.category_report_with_top("Unity", 100, &["--include-files", "--size-mode", mode]);
+        let items = mixed["items"].as_array().unwrap();
+        assert_eq!(mixed["matched_items"], 2);
+        assert_eq!(items.iter().filter(|i| i["size_bytes"] == 0).count(), 1);
+        let full: Value = serde_json::from_str(&fixture.output("--json", &["--size-mode", mode])).unwrap();
+        assert_eq!(mixed["items"], full["largest_files"]);
+        assert_eq!(mixed["accounting"], full["accounting"]);
+    }
+}
+
+#[test]
+fn include_files_rejects_ignored_cli_combinations_before_any_scan_or_server() {
+    let fixture = Fixture::new("include-files-invalid");
+    for args in [
+        vec!["--include-files"],
+        vec!["--include-files", "--json"],
+        vec!["--include-files", "--report"],
+        vec!["--include-files", "--category", "PDF"],
+        vec!["--include-files", "--category", "PDF", "--mcp"],
+        vec!["--include-files", "--category", "PDF", "--json", "--mcp"],
+        vec!["--include-files", "--category", "PDF", "--dump-config"],
+        vec!["--include-files", "--category", "PDF", "--report", "--dump-config"],
+    ] {
+        let output = bounded_output(
+            Command::new(env!("CARGO_BIN_EXE_dutype"))
+                .args(&args)
+                .arg("--config")
+                .arg(&fixture.config)
+                .arg(fixture.root.join("missing"))
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        assert!(!output.status.success(), "{args:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("--include-files"),
+            "{args:?}"
+        );
+    }
+}

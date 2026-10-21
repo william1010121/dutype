@@ -282,6 +282,12 @@ impl Registry {
         self.other
     }
 
+    /// Whether the final rules can classify a filename as this category.
+    /// Query setup only: do not add this map walk to per-file classification.
+    pub fn has_file_rules(&self, cat: Category) -> bool {
+        cat == self.other || self.ext.values().any(|&owner| owner == cat)
+    }
+
     pub fn classify_file(&self, name: &str) -> Category {
         let Some(ext) = ext_of(name) else { return self.other };
         // Lowercase into a stack buffer: this runs once per file.
@@ -415,6 +421,36 @@ mod tests {
 
     fn label(r: &Registry, c: Option<Category>) -> Option<&str> {
         c.map(|c| r.defs[c.index()].name.as_str())
+    }
+
+    #[test]
+    fn file_rule_eligibility_uses_final_owners_and_other_fallback() {
+        let base = r#"
+            [[category]]
+            name = "Mixed"
+            dirs = ["special"]
+            extensions = ["one", "two"]
+            [[category]]
+            name = "Other"
+            dirs = ["fallback"]
+        "#;
+        let override_one = r#"[[category]]
+            name = "New owner"
+            extensions = ["one"]
+        "#;
+        let override_two = r#"[[category]]
+            name = "New owner"
+            extensions = ["TWO"]
+        "#;
+        let partial = Registry::from_sources(&[base, override_one]).unwrap();
+        assert!(partial.has_file_rules(partial.find("Mixed").unwrap()));
+        let final_rules = Registry::from_sources(&[base, override_one, override_two]).unwrap();
+        let mixed = final_rules.find("Mixed").unwrap();
+        assert!(final_rules.defs[mixed.index()].dir_kind);
+        assert!(!final_rules.has_file_rules(mixed));
+        assert!(final_rules.has_file_rules(final_rules.find("New owner").unwrap()));
+        assert!(final_rules.has_file_rules(final_rules.other()));
+        assert_eq!(final_rules.other().index(), final_rules.len() - 1);
     }
 
     #[test]

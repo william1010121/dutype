@@ -37,6 +37,10 @@ struct Args {
     /// (e.g. "node_modules", "PDF", "Python env")
     #[arg(long, value_name = "NAME")]
     category: Option<String>,
+    /// With --category and --report / --json: include directly matching files
+    /// alongside directories for categories with both kinds of rules
+    #[arg(long, requires = "category", conflicts_with_all = ["mcp", "dump_config"])]
+    include_files: bool,
     /// Number of entries in each list of --report / --json
     #[arg(long, default_value_t = 20, value_name = "N")]
     top: usize,
@@ -110,6 +114,9 @@ fn print(s: &str) {
 }
 
 fn run(args: Args) -> Result<(), String> {
+    if args.include_files && !(args.report || args.json) {
+        return Err("--include-files needs --category and --report or --json".into());
+    }
     if args.dump_config {
         print(category::DEFAULT_CONFIG);
         return Ok(());
@@ -199,9 +206,17 @@ fn run(args: Args) -> Result<(), String> {
         if let Some(cat) = only {
             let detected = report::detected(snap.clones, snap.clone_ids, snap.reflink_fs);
             let known = report::freeable_known(detected, meta.shares);
-            let found = report::find(root, &path, cat, args.top, args.size_mode, known, meta.private);
+            let found = report::find(
+                root,
+                &path,
+                report::CategoryQuery::new(cat, args.include_files),
+                args.top,
+                args.size_mode,
+                known,
+                meta.private,
+            );
             if args.json {
-                let doc = serde_json::json!({
+                let mut doc = serde_json::json!({
                     "path": path.display().to_string(),
                     "category": cat.label(),
                     "cached_at": report::unix_secs(snap.cached_at),
@@ -211,6 +226,9 @@ fn run(args: Args) -> Result<(), String> {
                     "items_truncated": found.items_truncated,
                     "items": found.items,
                 });
+                if args.include_files {
+                    doc["include_files"] = true.into();
+                }
                 print(&serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?);
                 print("\n");
             } else {
