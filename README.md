@@ -569,10 +569,20 @@ codex mcp add dutype -- npx -y dutype --mcp       # Codex CLI
 **Agent skill** — [`skills/dutype/SKILL.md`](skills/dutype/SKILL.md) teaches an
 agent the "my disk is full" workflow. For Claude Code:
 
+The install below pins the skill to the current published release, **v0.1.4**,
+for use with the matching packaged binary. The skill on `main` documents source
+features such as `--include-files` and MCP pagination that v0.1.4 does not expose;
+use it only with a matching source build. Check CLI help and the MCP tool schema
+before relying on options from a different revision.
+
 ```bash
 mkdir -p ~/.claude/skills/dutype && curl -fsSL -o ~/.claude/skills/dutype/SKILL.md \
-  https://raw.githubusercontent.com/william1010121/dutype/main/skills/dutype/SKILL.md
+  https://raw.githubusercontent.com/william1010121/dutype/v0.1.4/skills/dutype/SKILL.md
 ```
+
+When a new version is released, update this pin and the packaged skill guidance
+together. Changing these source docs does not update an already-published npm
+package README.
 
 There is also an [`llms.txt`](llms.txt).
 
