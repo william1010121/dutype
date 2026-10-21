@@ -890,3 +890,135 @@ fn scan_wide_unreadable_warning_survives_each_page_and_permission_recovery() {
     stale_cursor(server.call("find_by_category", continuation(&first, 1)));
     fixture.no_disk_cache();
 }
+
+#[test]
+fn mixed_inventory_pages_partition_606_matches_and_bind_include_files() {
+    let fixture = Fixture::new();
+    fs::write(
+        &fixture.config,
+        r#"
+        [[category]]
+        name = "Unity"
+        dirs = ["Library", "Temp"]
+        markers = ["ProjectSettings"]
+        extensions = ["unitypackage"]
+    "#,
+    )
+    .unwrap();
+    for i in 0..303 {
+        let directory = fixture.root.join(format!("p{i:03}/Library/Temp"));
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("pruned.unitypackage"), b"").unwrap();
+        // Ties, zero-byte matches, and pages that interleave directory/file ranks.
+        fs::write(
+            fixture.root.join(format!("{i:03}.unitypackage")),
+            vec![b'x'; if i % 2 == 0 { 16384 } else { 0 }],
+        )
+        .unwrap();
+    }
+    for mode in ["du", "dedup"] {
+        let expected = fixture.cli(
+            &fixture.root,
+            Some("Unity"),
+            1000,
+            &["--include-files", "--size-mode", mode],
+            "1",
+        );
+        assert_eq!(expected["matched_items"], 606);
+        assert_eq!(expected["items_truncated"], false);
+        assert_eq!(
+            expected,
+            fixture.cli(
+                &fixture.root,
+                Some("Unity"),
+                1000,
+                &["--include-files", "--size-mode", mode],
+                "4"
+            )
+        );
+        for threads in ["1", "4"] {
+            let mut server = fixture.server(&["--cache"], threads);
+            let base = json!({"path":fixture.root, "category":"Unity", "size_mode":mode});
+            // Prime the retained snapshot before exact default/explicit-false comparison.
+            server.find(base.clone());
+            let legacy = server.find(base.clone());
+            let mut explicit_false = base.clone();
+            explicit_false["include_files"] = json!(false);
+            assert_eq!(legacy, server.find(explicit_false));
+            assert_eq!(legacy["matched_items"], 303);
+            assert!(legacy.get("include_files").is_none());
+            for top in [500, 137] {
+                let mut first = base.clone();
+                first["top"] = json!(top);
+                first["paginate"] = json!(true);
+                first["include_files"] = json!(true);
+                let mut page = server.find(first);
+                let snapshot_id = page["pagination"]["snapshot_id"].clone();
+                let mut all = Vec::new();
+                loop {
+                    let count = (606 - all.len()).min(top);
+                    let more = all.len() + count < 606;
+                    assert_page(&page, all.len() as u64, count, 606, more);
+                    assert_eq!(page["include_files"], true);
+                    assert_eq!(page["accounting"], expected["accounting"]);
+                    assert_eq!(page["pagination"]["snapshot_id"], snapshot_id);
+                    all.extend_from_slice(page["items"].as_array().unwrap());
+                    if !more {
+                        break;
+                    }
+                    let mut next = continuation(&page, top);
+                    next["size_mode"] = json!(mode);
+                    invalid_arguments(server.call("find_by_category", next.clone()));
+                    next["include_files"] = json!(false);
+                    invalid_arguments(server.call("find_by_category", next.clone()));
+                    next["include_files"] = json!(true);
+                    let following = server.find(next.clone());
+                    assert_eq!(following, server.find(next));
+                    page = following;
+                }
+                assert_eq!(json!(all), expected["items"]);
+            }
+        }
+    }
+    fixture.no_disk_cache();
+}
+
+#[test]
+fn include_files_schema_type_validation_and_pure_category_cursor_binding() {
+    let fixture = Fixture::new();
+    fixture.pdfs(3);
+    let mut server = fixture.server(&["--cache"], "1");
+    let schema = server.request("tools/list", json!({}));
+    let tools = schema["result"]["tools"].as_array().unwrap();
+    for tool in tools {
+        let property = &tool["inputSchema"]["properties"]["include_files"];
+        if tool["name"] == "find_by_category" {
+            assert_eq!(property["type"], "boolean");
+            assert_eq!(property["default"], false);
+        } else {
+            assert!(property.is_null());
+        }
+    }
+    for invalid in [json!(null), json!(1), json!("true"), json!([]), json!({})] {
+        invalid_arguments(server.call(
+            "find_by_category",
+            json!({"path":fixture.root, "category":"PDF", "include_files":invalid}),
+        ));
+    }
+    for value in [true, false] {
+        invalid_arguments(server.call("disk_usage", json!({"path":fixture.root, "include_files":value})));
+    }
+    let first = server.find(start(&fixture.root, "PDF", 1));
+    let mut changed = continuation(&first, 1);
+    changed["include_files"] = json!(true);
+    invalid_arguments(server.call("find_by_category", changed));
+    let mut opted = start(&fixture.root, "PDF", 1);
+    opted["include_files"] = json!(true);
+    let opted = server.find(opted);
+    assert_eq!(first["items"], opted["items"]);
+    assert_eq!(first["matched_items"], opted["matched_items"]);
+    invalid_arguments(server.call("find_by_category", continuation(&opted, 1)));
+    let mut next = continuation(&opted, 1);
+    next["include_files"] = json!(true);
+    assert_page(&server.find(next), 1, 1, 3, true);
+}

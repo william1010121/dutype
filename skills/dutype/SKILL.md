@@ -17,6 +17,7 @@ dutype --json --top 50 PATH               # longer lists
 dutype --json --category node_modules PATH   # largest node_modules with sizes (default: 20)
 dutype --json --category "Python env" ~      # largest venvs / conda envs (default: 20)
 dutype --json --category Video ~/Movies      # biggest video files
+dutype --json --category Unity --include-files PATH # custom mixed directory/file category
 dutype --json --clones PATH               # macOS: also detect APFS clones (slower)
 dutype --json --size-mode dedup PATH      # rank by size with APFS clones counted once (implies --clones)
 dutype --report PATH                      # same data as plain text
@@ -58,6 +59,19 @@ before the top-N limit; a matching directory counts once and prunes descendants.
 complete: `unreadable` is scan-wide and unclassifiable entries are not inferred.
 Text totals cover only displayed items. CLI `--top 0` still counts matches;
 MCP `top` remains 1–500.
+
+Directory categories list matching directories by default. For a custom mixed
+category (for example Unity with `Library` directories and `unitypackage`
+files), add `--include-files` or MCP `include_files: true`. A file must match
+both the scanned category and direct filename classification under final rules.
+Matching directories still prune descendants regardless of the top-N cutoff.
+The root is excluded; explicitly matching files below an excluded special root
+can appear, but arbitrary inherited files cannot. Other's filename fallback is
+included when Other has directory rules. Pure-category matches stay unchanged.
+True is echoed in category JSON; false/omitted preserves the default payload.
+CLI requires `--category` and `--report` or `--json`, rejects `--mcp` and
+`--dump-config`, and never changes the TUI. MCP accepts the option only on
+`find_by_category`. Inventory totals need not equal category summary totals.
 
 For a category inventory, increase CLI `--top` to at least `matched_items`
 and check that `items_truncated` is false in the result. This lists all matches
@@ -120,7 +134,7 @@ per folder.
 
 `dutype --mcp` is an MCP server on stdio with two read-only tools,
 `disk_usage(path, top?, cross_fs?, refresh?, clones?, size_mode?, private?)` and
-`find_by_category(path, category, top?, cross_fs?, refresh?, clones?, size_mode?, private?, paginate?, cursor?)`,
+`find_by_category(path, category, top?, cross_fs?, refresh?, clones?, size_mode?, private?, include_files?, paginate?, cursor?)`,
 with the same fields as `--json`. `size_mode` is `"du"` (default) or `"dedup"`
 (implies `clones: true`); `private: true` adds `private_bytes` (implies
 `clones: true`).
@@ -133,7 +147,8 @@ Claude Code: `claude mcp add dutype -- npx -y dutype --mcp`.
 For category inventories beyond 500 matches, use `dutype --mcp --cache` without
 server-wide `--refresh`. Start with `paginate: true`; follow
 `pagination.next_cursor`, repeating the returned absolute `path`, category and
-effective options. `top` remains 1–500 (default 50) and may change between pages.
+effective options, including `include_files` (changing it rejects the cursor,
+even for pure categories). `top` remains 1–500 (default 50) and may change between pages.
 Cursor presence implies pagination; never combine it with `refresh: true` or
 `paginate: false`. Stop on `pagination.has_more: false` / `next_cursor: null`,
 not `items_truncated`, which still compares all matches to this page's length.
