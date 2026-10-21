@@ -27,8 +27,9 @@ fn tools() -> Value {
                 file types (video, PDF, archives, ML models, ...) and special directories \
                 (node_modules, Python envs, .git, build output, caches, ...). Returns totals, \
                 every category's share, the biggest children, the biggest special \
-                directories (cleanup candidates) and the biggest files. Sizes are bytes \
-                allocated on disk (size_bytes, like du). With clones: true (slower), \
+                directories (cleanup candidates) and the biggest files. size_bytes follows \
+                accounting.measurement_basis: allocated on Unix (like du), logical \
+                file lengths on non-Unix including Windows. With clones: true (slower), \
                 dedup_bytes counts each APFS clone family (macOS) or each shared extent \
                 (Linux btrfs/XFS/bcachefs reflinks and snapshots) once and \
                 freeable_min_bytes is a lower bound of what deleting an item frees; without \

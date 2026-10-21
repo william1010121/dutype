@@ -77,8 +77,12 @@ pub fn freeable_known(detected: bool, shares: bool) -> bool {
 /// How sizes were counted, so agents know what the numbers mean.
 #[derive(Serialize)]
 pub struct Accounting {
-    /// `size_bytes`: allocated bytes, hard links counted once (`du -skx`).
+    /// Legacy compatibility label; `measurement_basis` is authoritative.
     pub size: &'static str,
+    /// Native scan basis: `allocated` on Unix, `logical` elsewhere.
+    pub measurement_basis: &'static str,
+    /// Native hardlink policy/capability, not observed duplicate detection.
+    pub hardlink_deduplication: &'static str,
     /// What the lists are ranked by.
     pub size_mode: SizeMode,
     /// `apfs-full`: identical APFS clones are detected (`dedup_bytes`,
@@ -102,7 +106,8 @@ pub struct Accounting {
     pub caveats: Vec<&'static str>,
 }
 
-/// The `accounting` object for a tree scanned with these facts.
+/// The `accounting` object for a native scan or same-platform cache.
+/// Caches have no producer-platform tag and are not portable snapshots.
 pub fn accounting(meta: &Meta) -> Accounting {
     let mut caveats = match (meta.clones, meta.reflink_fs, meta.clone_ids, meta.clone_gaps) {
         (false, ..) => vec![
@@ -133,6 +138,8 @@ pub fn accounting(meta: &Meta) -> Accounting {
     }
     Accounting {
         size: "du-allocated",
+        measurement_basis: crate::scan::MEASUREMENT_BASIS,
+        hardlink_deduplication: crate::scan::HARDLINK_DEDUPLICATION,
         size_mode: meta.size_mode,
         clone_detection: match (meta.clones, meta.reflink_fs, meta.clone_ids, meta.clone_gaps) {
             (false, ..) => "off",
@@ -1743,6 +1750,26 @@ mod tests {
         let kids: Vec<_> = r.children.iter().map(|c| (c.size_bytes, c.private_bytes)).collect();
         assert!(kids.contains(&(small, Some(4096))) && kids.contains(&(big, None)));
         std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn native_accounting_serialization_preserves_legacy_fields() {
+        let mut meta = plain_meta();
+        for clones in [false, true] {
+            meta.clones = clones;
+            let value = serde_json::to_value(accounting(&meta)).unwrap();
+            assert_eq!(value["size"], "du-allocated");
+            #[cfg(unix)]
+            let expected = ("allocated", "count-once");
+            #[cfg(not(unix))]
+            let expected = ("logical", "unsupported");
+            assert_eq!(value["measurement_basis"], expected.0);
+            assert_eq!(value["hardlink_deduplication"], expected.1);
+            assert_eq!(value.as_object().unwrap().len(), 7);
+            assert_eq!(value["size_mode"], "du");
+            assert_eq!(value["private"], false);
+            assert_eq!(value["clone_detection"], if clones { "unsupported" } else { "off" });
+        }
     }
 
     /// Detection is "apfs-full" only when every file's clone flags were read.

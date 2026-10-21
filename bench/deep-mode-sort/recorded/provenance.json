@@ -1,0 +1,5 @@
+{
+  "before_revision": "4baa74f2f15c51507e128056fd4447ed5d7d4523",
+  "after_revision": "1476a87f75fad5ed4a7b46ddbd6836b3eee5ad4f",
+  "note": "Raw samples and manifest are copied unchanged from the corrected production-Category(u8) run. Commands retain historical build paths, not portable paths. The earlier zero-sized-Category prototype is excluded. Public build/measure scripts are portable adaptations; the measured hot-path source is extracted verbatim from the above revisions. Final cleanup and main integration do not change sort_tree or DirInfo::sort_children."
+}

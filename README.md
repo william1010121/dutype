@@ -28,23 +28,33 @@ Point dutype at a folder and it tells you, in one screen, how much of it is
 row gets a bar colored by what is inside it, so you can see *why* a folder is
 big before you even open it.
 
-## What it does that other tools don't
+## How it compares
 
-Great tools like gdu, ncdu, dua and dust answer "which folder is big?".
-dutype answers "big *with what*?":
+Tools like gdu, ncdu, dua and dust help locate large folders.
+dutype focuses on "big *with what*?" through category composition:
 
 | | **dutype** | gdu | ncdu | dua | dust | diskonaut |
 |:---|:---:|:---:|:---:|:---:|:---:|:---:|
 | Breakdown by file type (video, PDF, model, …) | ✅ | filter only (`-T`) | — | — | raw extensions (`-t`), non-interactive | — |
-| Knows `node_modules`, venvs, `.git`, `target/`, caches as categories | ✅ | — | — | — | — | — |
+| Category composition for `node_modules`, venvs, `.git`, `target/`, caches | ✅ | — | — | — | — | — |
 | Per-row bar showing what each folder is made of | ✅ | — | — | — | — | — |
-| "Show me every `node_modules` / venv / cache, with sizes" | ✅ | — | — | — | — | — |
+| Discover `node_modules`, venvs and caches with sizes | ✅ | — | — | `dua clean` (selected candidates)¹ | — | — |
 | Your own categories and rules (TOML) | ✅ | — | — | — | — | — |
 | JSON output | ✅ | ✅ | ✅ | — | ✅ | — |
 | Built-in MCP server for LLM agents | ✅ | — | — | — | — | — |
 | Interactive TUI | ✅ | ✅ | ✅ | ✅ | — | ✅ |
 | Parallel scan | ✅ | ✅ | opt-in (`-t`) | ✅ | ✅ | ✅ |
 | Delete from the UI | not yet | ✅ | ✅ | ✅ | — | ✅ |
+
+¹ [dua v2.46.0](https://github.com/Byron/dua-cli/releases/tag/v2.46.0) documents
+[`dua clean`](https://github.com/Byron/dua-cli/blob/v2.46.0/README.md#L258-L275)
+for largest-first discovery of cleanup candidates, including `node_modules`,
+Python caches and virtual environments, Cargo `target` and Zig output/cache
+directories. Discovery respects traversal exclusions; in Git repositories,
+candidates must be ignored and contain no tracked files. Directories containing
+a `.git` entry are skipped. Nothing is deleted automatically. This is cleanup
+discovery, distinct from dutype's category-composition totals and per-row bars. This comparison credits documented
+behavior, not a side-by-side runtime test.
 
 And it is the fastest of the bunch in 3 of our 4 benchmarks (see [Performance](#performance)).
 
@@ -403,7 +413,8 @@ candidates) and the biggest files, with absolute paths and byte sizes (here
   "dedup_bytes": 186126925824,
   "clone_shared_bytes": 4855193600,
   "freeable_min_bytes": 171798691840,
-  "accounting": { "size": "du-allocated", "size_mode": "du", "clone_detection": "apfs-full",
+  "accounting": { "size": "du-allocated", "measurement_basis": "allocated",
+                  "hardlink_deduplication": "count-once", "size_mode": "du", "clone_detection": "apfs-full",
                   "caveats": ["partial-clones-not-deduplicated", "snapshots-not-considered"] },
   "files": 666884,
   "categories": [{ "name": "Data", "size_bytes": 87828418560, "size": "81.8 GiB", "percent": 46.0 }, …],
@@ -414,7 +425,18 @@ candidates) and the biggest files, with absolute paths and byte sizes (here
 }
 ```
 
-`size_bytes` is always the `du` size. With `--clones`, `dedup_bytes` counts
+`accounting.measurement_basis` is authoritative for `size_bytes`: `"allocated"`
+on Unix (allocated blocks, like `du`) and `"logical"` on non-Unix platforms
+(including Windows, using file lengths). `accounting.hardlink_deduplication`
+is `"count-once"` on Unix and `"unsupported"` on non-Unix platforms, where
+hardlinked paths are counted separately. These fields describe the native scan
+policy/capability, not whether duplicates were observed. The existing
+`accounting.size: "du-allocated"` is a legacy compatibility label, not an
+authoritative measurement description. Native disk caches are assumed to be
+reused on the same platform: they have no producer-platform tag and are not
+portable snapshots.
+
+With `--clones`, `dedup_bytes` counts
 each APFS clone family (or, on Linux, each shared extent) once and
 `freeable_min_bytes` is a lower bound of what deleting the item frees (see
 [APFS clones](#apfs-clones) and
@@ -566,10 +588,20 @@ codex mcp add dutype -- npx -y dutype --mcp       # Codex CLI
 **Agent skill** — [`skills/dutype/SKILL.md`](skills/dutype/SKILL.md) teaches an
 agent the "my disk is full" workflow. For Claude Code:
 
+The install below pins the skill to the current published release, **v0.1.4**,
+for use with the matching packaged binary. The skill on `main` documents source
+features such as `--include-files` and MCP pagination that v0.1.4 does not expose;
+use it only with a matching source build. Check CLI help and the MCP tool schema
+before relying on options from a different revision.
+
 ```bash
 mkdir -p ~/.claude/skills/dutype && curl -fsSL -o ~/.claude/skills/dutype/SKILL.md \
-  https://raw.githubusercontent.com/william1010121/dutype/main/skills/dutype/SKILL.md
+  https://raw.githubusercontent.com/william1010121/dutype/v0.1.4/skills/dutype/SKILL.md
 ```
+
+When a new version is released, update this pin and the packaged skill guidance
+together. Changing these source docs does not update an already-published npm
+package README.
 
 There is also an [`llms.txt`](llms.txt).
 

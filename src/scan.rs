@@ -10,6 +10,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
+/// Native scan capabilities, owned by the selected platform backend.
+pub(crate) use platform::{HARDLINK_DEDUPLICATION, MEASUREMENT_BASIS};
+
 pub struct Node {
     pub name: Box<str>,
     /// Allocated bytes on disk (like `du`).
@@ -483,6 +486,9 @@ impl PrivateSizes {
 
 #[cfg(unix)]
 mod platform {
+    pub const MEASUREMENT_BASIS: &str = "allocated";
+    pub const HARDLINK_DEDUPLICATION: &str = "count-once";
+
     use super::{Entry, FsKind, Progress, ReadStats};
     use std::ffi::OsStr;
     use std::fs::Metadata;
@@ -674,6 +680,9 @@ mod platform {
 
 #[cfg(not(unix))]
 mod platform {
+    pub const MEASUREMENT_BASIS: &str = "logical";
+    pub const HARDLINK_DEDUPLICATION: &str = "unsupported";
+
     use super::{Entry, FsKind, Progress, ReadStats};
     use std::ffi::OsStr;
     use std::fs::{self, Metadata};
