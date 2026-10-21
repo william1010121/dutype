@@ -6,7 +6,7 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, BorderType, Cell, Clear, Padding, Paragraph, Row, Table};
+use ratatui::widgets::{Block, BorderType, Cell, Clear, Padding, Paragraph, Row, Table, TableState};
 use std::path::Path;
 use std::time::Duration;
 
@@ -421,6 +421,25 @@ fn entry_name(c: &Node) -> Line<'static> {
     }
 }
 
+/// Rows are one line high with no margins or table header/footer. Mirror
+/// ratatui 0.29's fixed-height row bounds only to skip offscreen formatting;
+/// the complete row list and real TableState still handle scrolling/rendering.
+fn visible_entry_range(state: &TableState, len: usize, area: Rect) -> std::ops::Range<usize> {
+    if len == 0 || area.is_empty() {
+        return 0..0;
+    }
+    let height = usize::from(area.height);
+    let mut start = state.offset().min(len - 1);
+    if let Some(selected) = state.selected().map(|s| s.min(len - 1)) {
+        if selected < start {
+            start = selected;
+        } else if selected >= start.saturating_add(height) {
+            start = selected + 1 - height;
+        }
+    }
+    start..start.saturating_add(height).min(len)
+}
+
 fn draw_entries(f: &mut Frame, app: &mut App, area: Rect) {
     // Shown size, and whether clone copies in it are counted elsewhere.
     let sizes: Vec<(u64, bool)> = {
@@ -461,20 +480,29 @@ fn draw_entries(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
+    let visible = visible_entry_range(states.last().unwrap(), cur.children().len(), block.inner(area));
     let max = sizes.first().map_or(1, |s| s.0);
-    let rows = cur.children().iter().zip(&sizes).map(|(c, &(size, copies))| {
-        let mut name = entry_name(c);
-        // Holds (or is) a clone whose family is counted at another member.
-        if copies {
-            name.push_span(Span::styled("  ⧉", Style::new().fg(Color::Indexed(117))));
-        }
-        Row::new(vec![
-            Cell::from(Line::from(Span::styled(human(size), size_style(size))).right_aligned()),
-            Cell::from(Span::styled(pct(size, total), Style::new().fg(MUTED))),
-            Cell::from(stacked_bar(&c.cats(), size, max, ENTRY_BAR, "█")),
-            Cell::from(name),
-        ])
-    });
+    let rows = cur
+        .children()
+        .iter()
+        .zip(&sizes)
+        .enumerate()
+        .map(|(i, (c, &(size, copies)))| {
+            if !visible.contains(&i) {
+                return Row::default().height(1);
+            }
+            let mut name = entry_name(c);
+            // Holds (or is) a clone whose family is counted at another member.
+            if copies {
+                name.push_span(Span::styled("  ⧉", Style::new().fg(Color::Indexed(117))));
+            }
+            Row::new(vec![
+                Cell::from(Line::from(Span::styled(human(size), size_style(size))).right_aligned()),
+                Cell::from(Span::styled(pct(size, total), Style::new().fg(MUTED))),
+                Cell::from(stacked_bar(&c.cats(), size, max, ENTRY_BAR, "█")),
+                Cell::from(name),
+            ])
+        });
     let table = Table::new(
         rows,
         [
@@ -777,4 +805,100 @@ pub fn draw_scanning(f: &mut Frame, path: &Path, files: u64, bytes: u64, elapsed
         stat("elapsed", format!("{secs:.1}s")),
     ];
     f.render_widget(Paragraph::new(lines), inner);
+}
+
+#[cfg(test)]
+mod entry_viewport_tests {
+    use super::*;
+    use ratatui::buffer::Buffer;
+    use ratatui::widgets::StatefulWidget;
+
+    #[test]
+    fn visible_range_keeps_global_offsets_and_empty_area_state() {
+        let state = TableState::default().with_offset(99);
+        assert_eq!(visible_entry_range(&state, 100, Rect::new(0, 0, 20, 8)), 99..100);
+        assert_eq!(state.offset(), 99);
+        let state = state.with_selected(Some(usize::MAX));
+        assert_eq!(visible_entry_range(&state, 100, Rect::new(0, 0, 20, 8)), 99..100);
+        assert_eq!(visible_entry_range(&state, 100, Rect::new(0, 0, 0, 8)), 0..0);
+        assert_eq!(visible_entry_range(&state, 100, Rect::new(0, 0, 20, 0)), 0..0);
+        assert_eq!(state.selected(), Some(usize::MAX));
+        let state = TableState::default().with_selected(Some(99));
+        assert_eq!(visible_entry_range(&state, 100, Rect::new(0, 0, 20, 8)), 92..100);
+    }
+
+    fn row(index: usize) -> Row<'static> {
+        Row::new([
+            Cell::from(format!("{index}")),
+            Cell::from(format!("日本語-🦀-{index}")),
+            Cell::from(Line::styled("multi\nline", Style::new().fg(ACCENT))),
+            Cell::from("long invisible label".repeat(3)),
+        ])
+    }
+
+    #[test]
+    fn placeholders_match_pinned_table_buffers_and_global_state() {
+        for len in [0usize, 1, 2, 24, 33, 100] {
+            for (width, height) in [(0, 0), (2, 40), (4, 8), (6, 3), (12, 4), (40, 8), (80, 40)] {
+                let area = Rect::new(0, 0, width, height);
+                let positions = [
+                    (None, 0),
+                    (None, len.saturating_sub(1)),
+                    (None, usize::MAX),
+                    (Some(0), len + 1),
+                    (Some(len.saturating_sub(1)), 0),
+                    (Some(len + 1), len + 1),
+                    (Some(usize::MAX), usize::MAX),
+                ];
+                for (selected, offset) in positions {
+                    for column in [None, Some(0), Some(3), Some(usize::MAX)] {
+                        let state = TableState::default()
+                            .with_selected(selected)
+                            .with_offset(offset)
+                            .with_selected_column(column);
+                        let block = panel(panel_title("Entries", true), true);
+                        let visible = visible_entry_range(&state, len, block.inner(area));
+                        let table = |rows| {
+                            Table::new(
+                                rows,
+                                [
+                                    Constraint::Length(4),
+                                    Constraint::Length(12),
+                                    Constraint::Length(8),
+                                    Constraint::Fill(1),
+                                ],
+                            )
+                            .column_spacing(2)
+                            .block(block.clone())
+                            .row_highlight_style(highlight())
+                            .highlight_symbol("▌")
+                        };
+                        let full = table((0..len).map(row).collect::<Vec<_>>());
+                        let windowed = table(
+                            (0..len)
+                                .map(|index| {
+                                    if visible.contains(&index) {
+                                        row(index)
+                                    } else {
+                                        Row::default().height(1)
+                                    }
+                                })
+                                .collect::<Vec<_>>(),
+                        );
+                        let mut full_buffer = Buffer::empty(area);
+                        let mut windowed_buffer = Buffer::empty(area);
+                        let mut full_state = state.clone();
+                        let mut windowed_state = state;
+                        StatefulWidget::render(full, area, &mut full_buffer, &mut full_state);
+                        StatefulWidget::render(windowed, area, &mut windowed_buffer, &mut windowed_state);
+                        assert_eq!(
+                            full_buffer, windowed_buffer,
+                            "len={len}, area={area:?}, selected={selected:?}, offset={offset}, column={column:?}"
+                        );
+                        assert_eq!(full_state, windowed_state);
+                    }
+                }
+            }
+        }
+    }
 }

@@ -539,14 +539,53 @@ pub struct CategoryMatches {
     pub items: Vec<Entry>,
 }
 
+/// Matching policy shared by bounded category reports and cursor pages.
+/// The default remains directory-only for categories with directory rules.
+#[derive(Clone, Copy)]
+pub struct CategoryQuery {
+    cat: Category,
+    want_dirs: bool,
+    include_files: bool,
+}
+
+impl CategoryQuery {
+    pub fn new(cat: Category, include_files: bool) -> Self {
+        let want_dirs = cat.is_dir_kind();
+        Self {
+            cat,
+            want_dirs,
+            // Resolve active extension ownership once, only for the opt-in.
+            include_files: include_files && want_dirs && crate::category::reg().has_file_rules(cat),
+        }
+    }
+
+    fn matches(self, node: &Node) -> bool {
+        if !self.want_dirs {
+            return !node.is_dir() && node.cat == self.cat;
+        }
+        node.cat == self.cat
+            && (node.special
+                || (self.include_files
+                    && !node.is_dir()
+                    && crate::category::reg().classify_file(&node.name) == self.cat))
+    }
+}
+
+impl From<Category> for CategoryQuery {
+    fn from(cat: Category) -> Self {
+        Self::new(cat, false)
+    }
+}
+
 /// Largest items of one category below `root`: the matching special dirs for
-/// directory categories (e.g. every node_modules), files otherwise.
+/// directory categories (e.g. every node_modules), files otherwise. An opt-in
+/// [`CategoryQuery`] also includes directly classified files for mixed categories.
 /// `known`: freeable bytes can be given (see [`freeable_known`]);
 /// `private`: the scan's private sizes, if it read them.
 pub fn find(
     root: &Node,
     root_path: &Path,
-    cat: Category,
+    query: impl Into<CategoryQuery>,
     top: usize,
     mode: SizeMode,
     known: bool,
@@ -554,13 +593,9 @@ pub fn find(
 ) -> CategoryMatches {
     let mut list = TopN::new(top);
     let mut matched_items = 0u64;
-    let want_dirs = cat.is_dir_kind();
+    let query = query.into();
     walk(root, &mut PathBuf::new(), false, &mut |n, sizes, p, lossy| {
-        let hit = if want_dirs {
-            n.special && n.cat == cat
-        } else {
-            !n.is_dir() && n.cat == cat
-        };
+        let hit = query.matches(n);
         let rank = mode.pick(n.size, sizes.dedup);
         if hit {
             matched_items = matched_items.saturating_add(1);
@@ -568,7 +603,7 @@ pub fn find(
                 list.push(Item::of(n, sizes, private_of(private, n, p, lossy), p, mode, known));
             }
         }
-        !(hit && want_dirs)
+        !(hit && n.is_dir())
     });
     let items: Vec<_> = list.into_sorted().into_iter().map(|i| i.entry(root_path)).collect();
     CategoryMatches {
@@ -657,12 +692,11 @@ fn page_increment(value: &mut u64) -> Result<(), CategoryPageError> {
 /// zero reserved for an invalid boundary. A rejected match still prunes.
 fn walk_page(
     root: &Node,
-    cat: Category,
+    query: CategoryQuery,
     mut visit: impl FnMut(&Node, Sizes, &Path, bool, u64) -> Result<(), CategoryPageError>,
 ) -> Result<(), CategoryPageError> {
     #[cfg(test)]
     page_metrics::record(|m| m.walks += 1);
-    let want_dirs = cat.is_dir_kind();
     let mut ordinal = 0;
     let mut error = None;
     walk(root, &mut PathBuf::new(), false, &mut |n, sizes, rel, lossy| {
@@ -675,15 +709,11 @@ fn walk_page(
         }
         #[cfg(test)]
         page_metrics::record(|m| m.visited_nodes += 1);
-        let hit = if want_dirs {
-            n.special && n.cat == cat
-        } else {
-            !n.is_dir() && n.cat == cat
-        };
+        let hit = query.matches(n);
         if hit {
             error = visit(n, sizes, rel, lossy, ordinal).err();
         }
-        !(hit && want_dirs)
+        !(hit && n.is_dir())
     });
     error.map_or(Ok(()), Err)
 }
@@ -700,7 +730,7 @@ fn walk_page(
 pub fn find_page(
     root: &Node,
     root_path: &Path,
-    cat: Category,
+    query: impl Into<CategoryQuery>,
     top: usize,
     mode: SizeMode,
     known: bool,
@@ -713,9 +743,10 @@ pub fn find_page(
     if after == Some(0) {
         return Err(CategoryPageError::InvalidBoundary);
     }
+    let query = query.into();
     let boundary = if let Some(after) = after {
         let mut boundary = None;
-        walk_page(root, cat, |n, sizes, rel, _, ordinal| {
+        walk_page(root, query, |n, sizes, rel, _, ordinal| {
             if ordinal == after {
                 #[cfg(test)]
                 page_metrics::record(|m| m.boundary_paths += 1);
@@ -731,7 +762,7 @@ pub fn find_page(
     let mut list: BinaryHeap<Reverse<PageItem>> = BinaryHeap::with_capacity(top);
     let mut matched_items = 0;
     let mut offset = 0;
-    walk_page(root, cat, |n, sizes, rel, lossy, ordinal| {
+    walk_page(root, query, |n, sizes, rel, lossy, ordinal| {
         page_increment(&mut matched_items)?;
         let rank = mode.pick(n.size, sizes.dedup);
         if let Some((boundary_rank, boundary_rel, boundary_ordinal)) = &boundary
@@ -1309,6 +1340,112 @@ mod tests {
                     if mode == SizeMode::Du { "clone.pdf" } else { "owner.pdf" },
                 );
                 assert_eq!(first.items[0].freeable_min_bytes.is_some(), known);
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_query_pages_keep_snapshot_accounting_pruning_and_bounded_selection() {
+        use crate::scan::Shared;
+
+        let cat = reg().find_by_name("PDF").unwrap();
+        // Model a custom directory+PDF category without mutating the global registry.
+        // Integration tests exercise construction from an actual custom configuration.
+        let query = CategoryQuery {
+            cat,
+            want_dirs: true,
+            include_files: true,
+        };
+        let mut cloned = file("clone.pdf", 100, cat);
+        cloned.clone = true;
+        let mut linked = file("link.pdf", 0, cat);
+        linked.hardlink = true;
+        let mut root = directory(
+            "root",
+            cat,
+            true,
+            vec![
+                cloned,
+                file("owner.pdf", 50, cat),
+                linked,
+                file("zero.pdf", 0, cat),
+                directory("special", cat, true, vec![file("pruned.pdf", 1, cat)]),
+                file("inherited.asset", 1000, cat),
+                file("wrong-category.pdf", 1000, reg().other()),
+            ],
+        );
+        let clone_index = root
+            .children()
+            .iter()
+            .position(|node| &*node.name == "clone.pdf")
+            .unwrap();
+        root.dir.as_mut().unwrap().clones_mut().shared = vec![Shared {
+            idx: clone_index as u32,
+            key: (1, 1),
+            is_clone: true,
+            ino: 1,
+            nlink: 1,
+            refcnt: 2,
+            dup: true,
+            reflink: None,
+        }]
+        .into_boxed_slice();
+        let mut private = PrivateSizes::default();
+        private.0.insert(PathBuf::from("clone.pdf"), 9);
+        private.0.insert(PathBuf::from("owner.pdf"), 7);
+        for mode in [SizeMode::Du, SizeMode::Dedup] {
+            for known in [false, true] {
+                let full = find(&root, Path::new("root"), query, 5, mode, known, Some(&private));
+                assert_eq!(full.matched_items, 5);
+                assert!(!full.items_truncated);
+                assert_eq!(
+                    Path::new(&full.items[0].path).file_name().unwrap(),
+                    if mode == SizeMode::Du { "clone.pdf" } else { "owner.pdf" }
+                );
+                assert_eq!(full.items[0].freeable_min_bytes.is_some(), known);
+                assert!(full.items.iter().all(|item| !item.path.contains("pruned")
+                    && !item.path.contains("inherited")
+                    && !item.path.contains("wrong-category")));
+                let clone = full.items.iter().find(|item| item.path.ends_with("clone.pdf")).unwrap();
+                assert_eq!(clone.size_bytes, 100);
+                assert_eq!(clone.dedup_bytes, 0);
+                assert_eq!(clone.private_bytes, Some(9));
+                assert!(
+                    full.items
+                        .iter()
+                        .find(|item| item.path.ends_with("special"))
+                        .unwrap()
+                        .private_bytes
+                        .is_none()
+                );
+                for top in [0, 1, 2, 5] {
+                    let limited = find(&root, Path::new("root"), query, top, mode, known, Some(&private));
+                    assert_eq!(limited.matched_items, 5);
+                    assert_eq!(limited.items_truncated, top < 5);
+                    assert_eq!(
+                        serde_json::to_value(&limited.items).unwrap(),
+                        serde_json::to_value(&full.items[..top]).unwrap()
+                    );
+                }
+                let mut after = None;
+                let mut joined = Vec::new();
+                loop {
+                    page_metrics::reset();
+                    let page =
+                        find_page(&root, Path::new("root"), query, 2, mode, known, Some(&private), after).unwrap();
+                    assert_page_bounds(2, if after.is_some() { 2 } else { 1 });
+                    assert_eq!(page.matched_items, 5);
+                    assert_eq!(page.offset as usize, joined.len());
+                    joined.extend(page_items(&page).as_array().unwrap().iter().cloned());
+                    after = page.next_after;
+                    if after.is_none() {
+                        break;
+                    }
+                }
+                assert_eq!(
+                    serde_json::Value::Array(joined),
+                    serde_json::to_value(&full.items).unwrap()
+                );
             }
         }
     }

@@ -163,6 +163,7 @@ Options:
       --report           Print a text report instead of opening the TUI
       --json             Print a JSON report (for scripts and LLM agents)
       --category <NAME>  With --report / --json: only list the largest items of this category
+      --include-files    With --category and --report / --json: add matching files for mixed categories
       --top <N>          Number of entries in each list of --report / --json [default: 20]
       --cross-fs         Descend into other filesystems / mount points
       --config <FILE>    Category config file [default: ~/.config/dutype/config.toml]
@@ -315,6 +316,16 @@ extents are not read at all (dedup equals the `du` size).
 Add rules in `~/.config/dutype/config.toml` (or pass `--config`). A
 `[[category]]` with an existing name extends it; a new name creates a category.
 
+Config paths are selected in this order: `--config FILE`, `$DUTYPE_CONFIG`,
+then `$XDG_CONFIG_HOME/dutype/config.toml` (or `~/.config/dutype/config.toml`
+when `XDG_CONFIG_HOME` is unset). Windows uses
+`%APPDATA%\dutype\config.toml` for the default location. A missing implicit
+config, including a missing `$DUTYPE_CONFIG` target or dangling symlink, uses
+only the built-in rules; no config file is created. Other read errors (such
+as permission denied), invalid UTF-8 and invalid config contents stop startup
+before scanning, including in `--report`, `--json` and `--mcp` modes.
+An explicit `--config FILE` is always required to be readable, even if missing.
+
 ```toml
 icons = "nerd"            # emoji (default) | nerd | none
 
@@ -332,6 +343,30 @@ extensions = ["unitypackage"]
 ```
 
 Directory rules beat extension rules, and your rules beat the built-in ones.
+Extensions match the suffix after the final dot, ignoring ASCII case; non-ASCII
+characters match exactly. Custom extensions longer than 16 UTF-8 bytes are also
+supported. A leading dot in a rule is optional; a dotfile without another dot
+(such as `.bashrc`) has no extension.
+
+For a category combining directory and file rules, the default category query
+still lists matching directories only. To include loose exports as well:
+
+```sh
+dutype --json --category Unity --include-files /projects
+# or: dutype --report --category Unity --include-files /projects
+```
+
+This adds files only when both their scanned category and their direct filename
+classification match Unity. A matching directory is returned once and prunes
+its descendants, even if it falls below `--top`; its files are not listed again.
+The queried root itself is excluded. Beneath an excluded Unity root,
+`export.unitypackage` can match, but an arbitrary inherited `imported.asset`
+cannot. Final active extension rules (after overrides) determine eligibility;
+Other also uses its filename fallback. Pure-directory and pure-file categories
+keep their existing matches. `--include-files` requires `--category` and either
+`--report` or `--json`; it cannot be used with `--mcp` or `--dump-config` and does
+not change the TUI. Inventory totals need not equal the category summary:
+root/directory-own bytes and inherited files can remain outside the list.
 
 ## For LLM agents
 
@@ -380,6 +415,12 @@ filesystem state. Both text report forms show cached-snapshot and unreadable
 notices when applicable. A cached partial scan keeps its unreadable count
 even after permissions change; use `--refresh` (MCP: `refresh: true`) to rescan.
 
+MCP `find_by_category` accepts `include_files: true` for the same mixed-category
+inventory as CLI `--include-files`; it defaults to false and is not a
+`disk_usage` option. True is echoed as `include_files: true` in category JSON
+and MCP results so it can be repeated on continuation requests. False/omitted
+options preserve the existing result shape.
+
 Category JSON (`--category` and MCP `find_by_category`) also includes:
 
 - `matched_items` (unsigned integer): matching items below the root in the
@@ -420,7 +461,7 @@ run.
 
 **MCP server** — `dutype --mcp` exposes two read-only tools,
 `disk_usage(path, top?, cross_fs?, refresh?, clones?, size_mode?, private?)` and
-`find_by_category(path, category, top?, cross_fs?, refresh?, clones?, size_mode?, private?, paginate?, cursor?)`
+`find_by_category(path, category, top?, cross_fs?, refresh?, clones?, size_mode?, private?, include_files?, paginate?, cursor?)`
 (`clones: true`, `size_mode: "dedup"` or `private: true` turns on clone detection).
 They never write files.
 With `dutype --mcp --cache`, repeated calls on the same path reuse the scan from
@@ -446,10 +487,12 @@ The result keeps every existing category field and adds:
 ```
 
 For the next page, repeat the exact absolute `path` returned by the first page,
-the category, and effective query options, and pass `cursor: next_cursor`.
+the category, and effective query options (including `include_files`), and pass
+`cursor: next_cursor`. Changing `include_files` rejects the cursor, even for a
+pure-directory or pure-file category.
 Cursor presence implies pagination; `top` may change between pages (1–500,
 default 50). Omitted options still use their usual defaults, so repeat any
-nondefault `size_mode`, `cross_fs`, `clones`, and `private` settings. Category
+nondefault `size_mode`, `cross_fs`, `clones`, `private`, and `include_files` settings. Category
 aliases are equivalent; `dedup` or `private: true` still imply clones. A cursor
 cannot be combined with `refresh: true` or `paginate: false`.
 

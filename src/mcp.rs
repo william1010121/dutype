@@ -58,7 +58,8 @@ fn tools() -> Value {
             "description": "List the largest items of one category below a directory, e.g. every \
                 node_modules or Python env with its size, or the biggest PDF / video files. \
                 Directory categories return the matching directories, file categories \
-                return files. matched_items counts matches in the scanned snapshot before \
+                return files. include_files adds directly matching files for mixed categories; \
+                matching directories still prune descendants and the root is excluded. matched_items counts matches in the scanned snapshot before \
                 the top limit; a matching directory counts once, without its descendants. \
                 items_truncated is true when matched_items exceeds items.length. \
                 unreadable counts entries that could not be read across the \
@@ -70,6 +71,7 @@ fn tools() -> Value {
                 "properties": {
                     "path": {"type": "string", "description": "Directory to scan."},
                     "category": {"type": "string", "enum": categories, "description": "Category name."},
+                    "include_files": {"type": "boolean", "default": false, "description": "For categories with directory and file rules, also return files whose scanned category and direct filename classification both match. Matching directories prune descendants; the root itself is excluded. Repeat this option with a cursor."},
                     "top": {"type": "integer", "minimum": 1, "maximum": 500, "default": 50},
                     "paginate": {"type": "boolean", "default": false, "description": "Opt in to snapshot-consistent sequential pages (requires --mcp --cache without --refresh)."},
                     "cursor": {"type": "string", "description": "Opaque next_cursor from the preceding page; implies pagination. Repeat its returned absolute path, category and effective options. top may change; refresh is forbidden."},
@@ -281,6 +283,7 @@ fn call_tool(name: &str, args: &Value, opts: CacheOpts) -> Result<Value, ToolErr
     let cross_fs = args.get("cross_fs").and_then(Value::as_bool).unwrap_or(false);
     let refresh = opts.always_refresh || args.get("refresh").and_then(Value::as_bool).unwrap_or(false);
     let private = args.get("private").and_then(Value::as_bool).unwrap_or(false);
+    let include_files = args.get("include_files").and_then(Value::as_bool).unwrap_or(false);
     let size_mode = match args.get("size_mode").filter(|v| !v.is_null()) {
         None => report::SizeMode::Du,
         Some(v) if v == "du" => report::SizeMode::Du,
@@ -311,7 +314,15 @@ fn call_tool(name: &str, args: &Value, opts: CacheOpts) -> Result<Value, ToolErr
     let query = |path: &std::path::Path, c: crate::category::Category| {
         fingerprint(
             &state.query,
-            (path, c, size_mode == report::SizeMode::Dedup, one_fs, clones, private),
+            (
+                path,
+                c,
+                size_mode == report::SizeMode::Dedup,
+                one_fs,
+                clones,
+                private,
+                include_files,
+            ),
         )
     };
     let render =
@@ -338,7 +349,7 @@ fn call_tool(name: &str, args: &Value, opts: CacheOpts) -> Result<Value, ToolErr
                 let page = report::find_page(
                     &snap.root,
                     path,
-                    c,
+                    report::CategoryQuery::new(c, include_files),
                     top.unwrap_or(50),
                     size_mode,
                     known,
@@ -367,7 +378,15 @@ fn call_tool(name: &str, args: &Value, opts: CacheOpts) -> Result<Value, ToolErr
                     })),
                 )
             } else {
-                let found = report::find(&snap.root, path, c, top.unwrap_or(50), size_mode, known, meta.private);
+                let found = report::find(
+                    &snap.root,
+                    path,
+                    report::CategoryQuery::new(c, include_files),
+                    top.unwrap_or(50),
+                    size_mode,
+                    known,
+                    meta.private,
+                );
                 (found.matched_items, found.items_truncated, found.items, None)
             };
             let mut result = json!({
@@ -380,6 +399,9 @@ fn call_tool(name: &str, args: &Value, opts: CacheOpts) -> Result<Value, ToolErr
                 "items_truncated": items_truncated,
                 "items": items,
             });
+            if include_files {
+                result["include_files"] = true.into();
+            }
             if let Some(pagination) = pagination {
                 result["pagination"] = pagination;
             }
@@ -517,6 +539,9 @@ fn validate_tool_args(name: &str, args: &Value) -> Result<(), String> {
         }
     }
     if name == "find_by_category" {
+        if args.get("include_files").is_some_and(|value| !value.is_boolean()) {
+            return Err("include_files must be a boolean".into());
+        }
         if args.get("paginate").is_some_and(|value| !value.is_boolean()) {
             return Err("paginate must be a boolean".into());
         }
@@ -532,6 +557,9 @@ fn validate_tool_args(name: &str, args: &Value) -> Result<(), String> {
         }
     } else if args.get("paginate").is_some() || args.get("cursor").is_some() {
         return Err("pagination is only supported by find_by_category".into());
+    }
+    if name != "find_by_category" && args.get("include_files").is_some() {
+        return Err("include_files is only supported by find_by_category".into());
     }
     if let Some(top) = args.get("top")
         && top_value(top).is_none()

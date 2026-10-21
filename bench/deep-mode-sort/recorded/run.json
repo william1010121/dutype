@@ -1,0 +1,6 @@
+{
+  "elapsed_s": 1.4611822079968988,
+  "timestamp_utc": "2026-10-21T07:02:04Z",
+  "status": "passed",
+  "method": "15 samples after 3 warmups; each sample averages N dedup/du toggle pairs; sequential alternating variant order; 3 fresh-child RSS samples, includes whole process; separate frame-capacity binary."
+}

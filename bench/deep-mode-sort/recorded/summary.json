@@ -1,0 +1,182 @@
+{
+  "nonclone": {
+    "before": {
+      "median_pair_ns": 4.48346,
+      "min_pair_ns": 4.33083,
+      "max_pair_ns": 6.09436,
+      "pairs_per_sample": 100000,
+      "digests": {
+        "before": 15530592981814449639,
+        "dedup": 15530592981814449639,
+        "du": 15530592981814449639
+      },
+      "rss_kib": [
+        912,
+        912,
+        912
+      ]
+    },
+    "after": {
+      "median_pair_ns": 4.39563,
+      "min_pair_ns": 4.33093,
+      "max_pair_ns": 4.62768,
+      "pairs_per_sample": 100000,
+      "digests": {
+        "before": 15530592981814449639,
+        "dedup": 15530592981814449639,
+        "du": 15530592981814449639
+      },
+      "rss_kib": [
+        912,
+        912,
+        912
+      ],
+      "peak_iterator_capacity_bytes": 0
+    },
+    "ratio": 0.9804102188934438
+  },
+  "ordinary": {
+    "after": {
+      "median_pair_ns": 6985.68,
+      "min_pair_ns": 6546.43,
+      "max_pair_ns": 8651.26,
+      "pairs_per_sample": 100,
+      "digests": {
+        "before": 1281223503059239135,
+        "dedup": 12943841944308004139,
+        "du": 2448661926965243889
+      },
+      "rss_kib": [
+        912,
+        912,
+        912
+      ],
+      "peak_iterator_capacity_bytes": 64
+    },
+    "before": {
+      "median_pair_ns": 6877.32,
+      "min_pair_ns": 6517.18,
+      "max_pair_ns": 10157.89,
+      "pairs_per_sample": 100,
+      "digests": {
+        "before": 1281223503059239135,
+        "dedup": 12943841944308004139,
+        "du": 2448661926965243889
+      },
+      "rss_kib": [
+        912,
+        912,
+        912
+      ]
+    },
+    "ratio": 1.0157561375652144
+  },
+  "wide-files": {
+    "before": {
+      "median_pair_ns": 11953659.5,
+      "min_pair_ns": 11409000.5,
+      "max_pair_ns": 17979842.0,
+      "pairs_per_sample": 2,
+      "digests": {
+        "before": 9048819389248362937,
+        "dedup": 1138324363548196836,
+        "du": 7530987814487062294
+      },
+      "rss_kib": [
+        6064,
+        6060,
+        6060
+      ]
+    },
+    "after": {
+      "median_pair_ns": 11473310.5,
+      "min_pair_ns": 11014138.5,
+      "max_pair_ns": 12174197.0,
+      "pairs_per_sample": 2,
+      "digests": {
+        "before": 9048819389248362937,
+        "dedup": 1138324363548196836,
+        "du": 7530987814487062294
+      },
+      "rss_kib": [
+        6060,
+        6064,
+        6060
+      ],
+      "peak_iterator_capacity_bytes": 16
+    },
+    "ratio": 0.9598157367624534
+  },
+  "wide-dirs": {
+    "after": {
+      "median_pair_ns": 162773.8,
+      "min_pair_ns": 141971.0,
+      "max_pair_ns": 220559.6,
+      "pairs_per_sample": 5,
+      "digests": {
+        "before": 7198504362376489415,
+        "dedup": 1731026683640875439,
+        "du": 1731026683640875439
+      },
+      "rss_kib": [
+        1936,
+        1936,
+        1936
+      ],
+      "peak_iterator_capacity_bytes": 64
+    },
+    "before": {
+      "median_pair_ns": 160364.2,
+      "min_pair_ns": 155104.4,
+      "max_pair_ns": 174893.8,
+      "pairs_per_sample": 5,
+      "digests": {
+        "before": 7198504362376489415,
+        "dedup": 1731026683640875439,
+        "du": 1731026683640875439
+      },
+      "rss_kib": [
+        1936,
+        1936,
+        1936
+      ]
+    },
+    "ratio": 1.0150257975283759
+  },
+  "deep": {
+    "before": {
+      "median_pair_ns": 32856.8,
+      "min_pair_ns": 32669.6,
+      "max_pair_ns": 38813.6,
+      "pairs_per_sample": 10,
+      "digests": {
+        "before": 12026320426689666305,
+        "dedup": 16356994760808382938,
+        "du": 16356994760808382938
+      },
+      "rss_kib": [
+        1296,
+        1296,
+        1296
+      ]
+    },
+    "after": {
+      "median_pair_ns": 34214.8,
+      "min_pair_ns": 34014.5,
+      "max_pair_ns": 39246.3,
+      "pairs_per_sample": 10,
+      "digests": {
+        "before": 12026320426689666305,
+        "dedup": 16356994760808382938,
+        "du": 16356994760808382938
+      },
+      "rss_kib": [
+        1296,
+        1168,
+        1296
+      ],
+      "peak_iterator_capacity_bytes": 16384
+    },
+    "ratio": 1.041330866061211
+  }
+}
