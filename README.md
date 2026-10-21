@@ -384,7 +384,8 @@ candidates) and the biggest files, with absolute paths and byte sizes (here
   "dedup_bytes": 186126925824,
   "clone_shared_bytes": 4855193600,
   "freeable_min_bytes": 171798691840,
-  "accounting": { "size": "du-allocated", "size_mode": "du", "clone_detection": "apfs-full",
+  "accounting": { "size": "du-allocated", "measurement_basis": "allocated",
+                  "hardlink_deduplication": "count-once", "size_mode": "du", "clone_detection": "apfs-full",
                   "caveats": ["partial-clones-not-deduplicated", "snapshots-not-considered"] },
   "files": 666884,
   "categories": [{ "name": "Data", "size_bytes": 87828418560, "size": "81.8 GiB", "percent": 46.0 }, …],
@@ -395,7 +396,18 @@ candidates) and the biggest files, with absolute paths and byte sizes (here
 }
 ```
 
-`size_bytes` is always the `du` size. With `--clones`, `dedup_bytes` counts
+`accounting.measurement_basis` is authoritative for `size_bytes`: `"allocated"`
+on Unix (allocated blocks, like `du`) and `"logical"` on non-Unix platforms
+(including Windows, using file lengths). `accounting.hardlink_deduplication`
+is `"count-once"` on Unix and `"unsupported"` on non-Unix platforms, where
+hardlinked paths are counted separately. These fields describe the native scan
+policy/capability, not whether duplicates were observed. The existing
+`accounting.size: "du-allocated"` is a legacy compatibility label, not an
+authoritative measurement description. Native disk caches are assumed to be
+reused on the same platform: they have no producer-platform tag and are not
+portable snapshots.
+
+With `--clones`, `dedup_bytes` counts
 each APFS clone family (or, on Linux, each shared extent) once and
 `freeable_min_bytes` is a lower bound of what deleting the item frees (see
 [APFS clones](#apfs-clones) and

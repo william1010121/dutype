@@ -79,7 +79,16 @@ in that snapshot, not a guarantee that unreadable entries were classified.
 
 ## Shared blocks (APFS clones, hard links)
 
-`size_bytes` is what `du` reports. On macOS, APFS clones (made by uv, bun,
+Read `accounting.measurement_basis` for `size_bytes`: `"allocated"` on Unix
+(like `du`), `"logical"` on non-Unix including Windows (file lengths).
+`accounting.hardlink_deduplication` is `"count-once"` on Unix and
+`"unsupported"` elsewhere (linked paths count separately). These describe
+native scan policy/capability, not observed duplicates. The legacy
+`accounting.size: "du-allocated"` label is non-authoritative. Caches assume
+same-platform reuse; they have no producer-platform tag and are not portable
+snapshots.
+
+On macOS, APFS clones (made by uv, bun,
 pnpm, `cp -c`, Finder Duplicate) share blocks, so `size_bytes` can be far
 more than deleting would free. Clone detection is opt-in because it slows the
 scan: on macOS, pass `--clones` (MCP: `clones: true`) whenever you will tell
@@ -101,8 +110,8 @@ also credits a hard-linked file to the folder holding all its links.
   `"apfs-partial"` when some files' clone flags could not be read (another
   volume; those count in full and as possibly shared),
   `"unsupported"` when `--clones` was given but the filesystem has no clone
-  information (then `dedup_bytes == size_bytes` and only hard links make
-  `freeable_min_bytes` smaller), `"off"` without `--clones`. `accounting.caveats` lists what is
+  information (then `dedup_bytes == size_bytes`; `freeable_min_bytes` can
+  remain `null` where sharing cannot be ruled out, including Windows), `"off"` without `--clones`. `accounting.caveats` lists what is
   not considered, e.g. APFS snapshots: freed space may appear only after Time
   Machine local snapshots expire.
 

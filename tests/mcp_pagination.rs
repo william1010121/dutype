@@ -213,6 +213,7 @@ fn successful(response: Value) -> Value {
     assert!(text.get("cached_at").is_some());
     assert!(text["cached_at"].is_null() || text["cached_at"].is_u64());
     assert!(text["accounting"].is_object());
+    assert_native_accounting(&text["accounting"]);
     if let Some(items) = text["items"].as_array() {
         let matched = text["matched_items"].as_u64().unwrap();
         assert!(matched >= items.len() as u64);
@@ -1021,4 +1022,98 @@ fn include_files_schema_type_validation_and_pure_category_cursor_binding() {
     let mut next = continuation(&opted, 1);
     next["include_files"] = json!(true);
     assert_page(&server.find(next), 1, 1, 3, true);
+}
+
+// The fields describe native scan policy even when no duplicates exist. Cache
+// parity here deliberately uses a snapshot produced on the same platform.
+#[test]
+fn native_accounting_matches_cli_cache_mcp_and_pages() {
+    let fixture = Fixture::new();
+    let owner = fixture.root.join("a.pdf");
+    fs::write(&owner, b"1234567").unwrap();
+    fs::hard_link(&owner, fixture.root.join("z.pdf")).unwrap();
+    for options in [vec![], vec!["--clones"], vec!["--private"]] {
+        let full = fixture.cli(&fixture.root, None, 10, &options, "1");
+        let category = fixture.cli(&fixture.root, Some("PDF"), 10, &options, "4");
+        let accounting = &full["accounting"];
+        assert_native_accounting(accounting);
+        assert_eq!(&category["accounting"], accounting);
+        let items = category["items"].as_array().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(category["items"], full["largest_files"]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let allocated = fs::metadata(&owner).unwrap().blocks() * 512;
+            for item in items {
+                let name = Path::new(item["path"].as_str().unwrap()).file_name().unwrap();
+                let expected = if name == "a.pdf" { allocated } else { 0 };
+                assert_eq!(item["size_bytes"], expected);
+            }
+            assert_eq!(
+                full["size_bytes"],
+                allocated + fs::metadata(&fixture.root).unwrap().blocks() * 512
+            );
+        }
+        #[cfg(not(unix))]
+        {
+            assert_eq!(accounting["private"], false);
+            assert_eq!(full["size_bytes"], 14);
+            assert_eq!(full["dedup_bytes"], 14);
+            assert!(full["freeable_min_bytes"].is_null());
+            for item in items.iter().chain(full["children"].as_array().unwrap()) {
+                assert_eq!(item["size_bytes"], 7);
+                assert_eq!(item["dedup_bytes"], 7);
+                assert!(item["freeable_min_bytes"].is_null());
+                assert!(item.get("private_bytes").is_none());
+            }
+        }
+        // Replace the cache for each option set, then verify actual cache hits.
+        let mut refresh = options.clone();
+        refresh.extend(["--cache", "--refresh"]);
+        let fresh = fixture.cli(&fixture.root, None, 10, &refresh, "2");
+        assert!(fresh["cached_at"].is_null());
+        assert_eq!(&fresh["accounting"], accounting);
+        let mut cached_options = options.clone();
+        cached_options.push("--cache");
+        for cat in [None, Some("PDF")] {
+            let cached = fixture.cli(&fixture.root, cat, 10, &cached_options, "2");
+            assert!(cached["cached_at"].is_u64());
+            assert_eq!(&cached["accounting"], accounting);
+        }
+        let mut server = fixture.server(&cached_options, "4");
+        let clones = options.contains(&"--clones");
+        let private = options.contains(&"--private");
+        let args = json!({"path": fixture.root, "refresh": true, "clones": clones, "private": private});
+        let mcp_full = successful(server.call("disk_usage", args));
+        assert_eq!(&mcp_full["accounting"], accounting);
+        let mcp_category =
+            server.find(json!({"path": fixture.root, "category": "PDF", "clones": clones, "private": private}));
+        assert_eq!(&mcp_category["accounting"], accounting);
+        assert_eq!(mcp_category["items"], category["items"]);
+        let mut args = start(&fixture.root, "PDF", 1);
+        args["clones"] = clones.into();
+        args["private"] = private.into();
+        let first = server.find(args);
+        let mut args = continuation(&first, 1);
+        args["clones"] = clones.into();
+        args["private"] = private.into();
+        let second = server.find(args);
+        assert_page(&first, 0, 1, 2, true);
+        assert_page(&second, 1, 1, 2, false);
+        for page in [&first, &second] {
+            assert_eq!(&page["accounting"], accounting);
+        }
+        assert_eq!(json!([first["items"][0], second["items"][0]]), category["items"]);
+    }
+}
+
+fn assert_native_accounting(accounting: &Value) {
+    assert_eq!(accounting["size"], "du-allocated");
+    #[cfg(unix)]
+    let expected = ("allocated", "count-once");
+    #[cfg(not(unix))]
+    let expected = ("logical", "unsupported");
+    assert_eq!(accounting["measurement_basis"], expected.0);
+    assert_eq!(accounting["hardlink_deduplication"], expected.1);
 }
