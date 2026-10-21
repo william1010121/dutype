@@ -1087,6 +1087,134 @@ mod tests {
     }
 
     #[test]
+    fn deep_popup_jump_and_size_modes_preserve_snapshot_on_small_stack() {
+        use crate::scan::{CloneInfo, Shared};
+
+        const DEPTH: usize = 1000;
+        let mut shared = jump_file("deep.pdf", 8192);
+        shared.clone = true;
+        let special_cat = reg().find_by_name("node_modules").unwrap();
+        let special = |children| {
+            let mut node = jump_dir("node_modules", children);
+            node.special = true;
+            node.cat = special_cat;
+            node
+        };
+        let mut branch = jump_dir(
+            "d",
+            vec![shared, jump_file("plain.pdf", 4096), special(vec![special(vec![])])],
+        );
+        branch.dir.as_mut().unwrap().clones = Some(Box::new(CloneInfo {
+            dup: 8192,
+            shared: vec![Shared {
+                idx: 0,
+                key: (1, 1),
+                is_clone: true,
+                ino: 1,
+                nlink: 1,
+                refcnt: 2,
+                dup: true,
+                reflink: None,
+            }]
+            .into_boxed_slice(),
+            ..CloneInfo::default()
+        }));
+        for _ in 1..DEPTH {
+            branch = jump_dir("d", vec![branch]);
+            branch.dir.as_mut().unwrap().clones_mut().dup = 8192;
+        }
+        // The shared file's representative is elsewhere in the snapshot.
+        // This shape changes both root order and deepest-child order in dedup
+        // mode, rather than merely visiting a single-child chain.
+        let mut representative = jump_file("sibling.pdf", 8192);
+        representative.clone = true;
+        let mut root = jump_dir("root", vec![branch, representative]);
+        root.dir.as_mut().unwrap().clones = Some(Box::new(CloneInfo {
+            dup: 8192,
+            shared: vec![Shared {
+                idx: 1,
+                key: (1, 1),
+                is_clone: true,
+                ino: 2,
+                nlink: 1,
+                refcnt: 2,
+                dup: false,
+                reflink: None,
+            }]
+            .into_boxed_slice(),
+            ..CloneInfo::default()
+        }));
+        std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(move || {
+                let mut app = jump_app(root);
+                app.mode = Mode::Extension;
+                app.refresh_breakdown();
+                assert_eq!(app.breakdown.len(), 1);
+                assert_eq!(app.breakdown[0].count, Some(3));
+                assert_eq!(app.breakdown[0].size, 20480);
+                // Location restoration need not repeatedly aggregate the
+                // extension of every ancestor while testing sort identity.
+                app.mode = Mode::Category;
+                app.set_size_mode(SizeMode::Dedup);
+                assert_eq!(app.root.children()[0].name.as_ref(), "sibling.pdf");
+                assert_eq!((app.root.size, app.root.dedup(), app.root.files()), (20480, 12288, 3));
+
+                assert_eq!(app.root.dir.as_ref().unwrap().shared()[0].idx, 0);
+                rank_popup(&mut app, Key::Cat(special_cat));
+                let popup = app.popup.as_ref().unwrap();
+                assert_eq!(popup.items.len(), 1, "the nested matching directory is pruned");
+                assert_eq!(popup.items[0].target.len(), DEPTH + 1);
+                assert_eq!(popup.items[0].target[DEPTH], 2);
+
+                for key in [Key::Cat(reg().classify_file("deep.pdf")), Key::Ext("pdf".into())] {
+                    rank_popup(&mut app, key);
+                    let popup = app.popup.as_mut().unwrap();
+                    assert_eq!(
+                        popup.items.iter().map(|item| item.size).collect::<Vec<_>>(),
+                        [8192, 4096, 0]
+                    );
+                    let target = &popup.items[2].target;
+                    assert_eq!(target.len(), DEPTH + 1);
+                    assert_eq!((target[0], target[DEPTH]), (1, 1));
+                    assert!(target[1..DEPTH].iter().all(|&i| i == 0));
+                    assert!(popup.items[2].path.ends_with("deep.pdf"));
+                }
+                app.popup.as_mut().unwrap().state.select(Some(2));
+                app.jump_to_result();
+                assert_eq!(app.stack.len(), DEPTH);
+                assert_eq!(app.states.len(), DEPTH + 1);
+                assert_eq!(
+                    app.current().children()[app.selected_entry().unwrap()].name.as_ref(),
+                    "deep.pdf"
+                );
+                assert_eq!(app.current().dir.as_ref().unwrap().shared()[0].idx, 1);
+
+                // Sorting preserves the location and selected identity while
+                // remapping the shared record back to its original file.
+                app.set_size_mode(SizeMode::Du);
+                assert_eq!(app.stack[0], 0);
+                assert_eq!(app.root.dir.as_ref().unwrap().shared()[0].idx, 1);
+                assert_eq!(app.selected_entry(), Some(0));
+                assert_eq!(app.current().children()[0].name.as_ref(), "deep.pdf");
+                assert_eq!(app.current().dir.as_ref().unwrap().shared()[0].idx, 0);
+                app.set_size_mode(SizeMode::Dedup);
+                assert_eq!(app.stack[0], 1);
+                assert_eq!(app.selected_entry(), Some(1));
+                app.in_du_order(|root| assert_eq!(root.children()[0].name.as_ref(), "d"));
+                assert_eq!(app.stack.len(), DEPTH);
+                assert_eq!(app.stack[0], 1);
+                assert_eq!(app.selected_entry(), Some(1));
+                assert_eq!(app.current().dir.as_ref().unwrap().shared()[0].idx, 1);
+                assert_eq!((app.root.size, app.root.dedup(), app.root.files()), (20480, 12288, 3));
+                // Drop on the same bounded stack as all traversal operations.
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
     fn borrowed_extension_match_is_exactly_normalized_key_equality() {
         let mut names: Vec<String> = [
             "",
