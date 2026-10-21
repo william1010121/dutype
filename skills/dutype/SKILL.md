@@ -5,6 +5,15 @@ description: Find out what is filling a disk or directory, broken down by kind â
 
 # dutype
 
+## Match the skill to the binary
+
+This `main`-branch skill documents the matching source revision, including
+features not present in the current published v0.1.4 package. For that package,
+use the [v0.1.4 skill](https://github.com/william1010121/dutype/blob/v0.1.4/skills/dutype/SKILL.md)
+instead. CLI `--include-files` and MCP pagination/cursors below require a source
+build that exposes those options. Check `dutype --help` and the MCP tool schema;
+the version string alone may not distinguish development builds.
+
 `dutype` scans a directory in parallel and attributes every byte to a category.
 Directory rules win over extensions: everything inside `node_modules/` counts as
 `node_modules`, everything inside a folder with `pyvenv.cfg` counts as `Python env`.
@@ -27,8 +36,10 @@ dutype --dump-config                      # list all categories and rules
 Never run plain `dutype PATH` from an agent: without `--json` / `--report` it
 opens an interactive TUI and waits for keyboard input.
 
-If `dutype` is not installed, run it through npx with the same arguments:
-`npx -y dutype --json PATH` (or install with `npm i -g dutype`).
+If using the published package, pair `npx -y dutype@0.1.4 --json PATH` (or
+`npm i -g dutype@0.1.4`) with the tagged v0.1.4 skill above. Do not send the
+unreleased options in this `main` skill to that binary. Update package and skill
+versions together when a new release becomes available.
 
 ## JSON report fields
 
