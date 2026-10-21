@@ -1,0 +1,30 @@
+{
+  "before-time": {
+    "app_rs_sha256": "bdd5935d87fa594e89e53d175e757b48283f4fb198c8dd25a6c41351c5eec0a6",
+    "expectation": "buggy",
+    "instrumented": false,
+    "variant": "before",
+    "binary_sha256": "3129d4da2c53917958a9bb98ffd801780eee2f1d9f8dc38b8a2cba09ef23c3e7"
+  },
+  "before-metrics": {
+    "app_rs_sha256": "bdd5935d87fa594e89e53d175e757b48283f4fb198c8dd25a6c41351c5eec0a6",
+    "expectation": "buggy",
+    "instrumented": true,
+    "variant": "before",
+    "binary_sha256": "df47c606f0174ebbfb1fbb1c6cbf4c6304553b67c5f7df125ffc62e792844eb0"
+  },
+  "after-time": {
+    "app_rs_sha256": "6693c2416462def27690f539c79c21673440c0aeec0d3eebddf3e5eaa078d48d",
+    "expectation": "correct",
+    "instrumented": false,
+    "variant": "after",
+    "binary_sha256": "8e5d4d9f1c7e614e31f3dbcec23641f18aa1d0cbac5067c583d1d668fc9a93e5"
+  },
+  "after-metrics": {
+    "app_rs_sha256": "6693c2416462def27690f539c79c21673440c0aeec0d3eebddf3e5eaa078d48d",
+    "expectation": "correct",
+    "instrumented": true,
+    "variant": "after",
+    "binary_sha256": "15236ae3cfefb9bde7d462bd837cd46ded4e0bf88d588e1f45dddb202290148f"
+  }
+}
