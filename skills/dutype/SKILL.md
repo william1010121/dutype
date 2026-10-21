@@ -103,7 +103,7 @@ On macOS, APFS clones (made by uv, bun,
 pnpm, `cp -c`, Finder Duplicate) share blocks, so `size_bytes` can be far
 more than deleting would free. Clone detection is opt-in because it slows the
 scan: on macOS, pass `--clones` (MCP: `clones: true`) whenever you will tell
-the user how much a deletion frees. Without it, `freeable_min_bytes` is
+the user a model-based deletion estimate. Without it, `freeable_min_bytes` is
 `null` on macOS and `accounting.clone_detection` is `"off"`. It is also
 `null` on Linux filesystems with reflinks (btrfs, XFS, bcachefs, OCFS2, ZFS)
 and with `--cross-fs`, and always on Windows: then no lower bound is known, so do not promise freed
@@ -111,9 +111,10 @@ space. Without `--clones`, hard-linked files never count in
 `freeable_min_bytes` (it stays a lower bound, just a lower one); `--clones`
 also credits a hard-linked file to the folder holding all its links.
 
-- `freeable_min_bytes`: at least this much is freed by deleting the item.
-  Use it, not `size_bytes`, when you tell the user how much a cleanup frees.
-  It is a lower bound and does not add up across items (two venvs cloned from
+- `freeable_min_bytes`: a lower-bound estimate under the scan accounting model.
+  Quote it with `accounting.caveats`, not as guaranteed immediately available
+  filesystem space. Open handles, retained snapshots and later changes matter;
+  OS available-space accounting can differ. It does not add up across items (two venvs cloned from
   each other each free little alone, both together free one copy).
 - `dedup_bytes`: size with each clone family counted once; it adds up like
   `size_bytes`. `clone_shared_bytes = size_bytes - dedup_bytes`.
@@ -127,16 +128,19 @@ also credits a hard-linked file to the folder holding all its links.
   Machine local snapshots expire.
 
 When `freeable_min_bytes` is much smaller than `size_bytes`, say so ("12 GB
-on disk, but its files are clones of your uv cache: deleting it frees at least
-1 GB"), and suggest cleaning the shared source (e.g. `uv cache clean`) if the
-user wants the space back.
+on disk; the scan model estimates a 1 GB freeable lower bound, subject to its
+caveats"). Do not infer the source of sharing from that difference alone.
+Explain clone/source relationships only when established, and inspect remaining
+references and the package manager’s documented cache policy before suggesting
+cleanup. Removing only a cache need not release blocks still held by environments.
 
 On macOS, `--private` (implies `--clones`) adds `private_bytes` to files that
-are partial APFS clones: what deleting that one file frees right now
-(`accounting.private` is `true` when collected). Use it before promising space
-from deleting cloned files (uv / bun caches, `cp -c` copies). Files older than
-an APFS local snapshot report 0 until the snapshot expires. Never add these up
-per folder.
+are partial APFS clones (`accounting.private` is `true` when collected). This
+scan-time APFS attribute reports bytes not retained by clones or snapshots that
+actual file deletion would release; it is not a promise of a future available-
+space delta. Open file references can delay actual deletion, and cached values
+can be stale. Snapshot-retained blocks are excluded from this attribute, unlike
+the clone-family estimate above. Never add these values up per folder.
 
 ## Workflow for "my disk is full"
 
@@ -145,7 +149,8 @@ per folder.
 2. Drill into the biggest child, or use `--category` for the dominant kind.
 3. Propose concrete actions with sizes: regenerable items first (`Build output`,
    `Package cache`, `Python cache`, `node_modules`, `Cache`), then user data.
-   Quote `freeable_min_bytes` as the space a deletion frees.
+   Quote `freeable_min_bytes` as the scan model’s lower-bound estimate with its
+   caveats, not a guaranteed available-space increase.
 4. Never delete anything without explicit confirmation of the exact paths.
    Prefer the tool's own cleanup where it exists (`cargo clean`,
    `npm cache clean --force`, `uv cache clean`, `docker system prune`).

@@ -221,14 +221,22 @@ it scans and adds two numbers next to the `du` size:
   implies `--clones`) to show
   and sort by it; the header then says `clones: −X shared` and rows holding
   clones counted elsewhere get a `⧉`.
-- **freeable** (`frees ≥` in the details panel): a lower bound of what
-  deleting a folder would free right now: files that share no blocks, plus
+- **freeable** (`frees ≥` in the details panel): a lower-bound estimate under
+  the scan’s accounting model: files that share no blocks, plus
   clone families and hard links whose every member is inside the folder.
   It does not add up across folders.
 
 For example, a 21.5 GB `~/.cache/uv` holds 16.8 GB once clones are counted
-once, and deleting all of it frees at least 9.4 GB (the rest is shared with
-virtualenvs elsewhere).
+once, and the model reports 9.4 GB as its freeable lower bound (the rest is
+shared with virtualenvs elsewhere).
+
+These are scan-time estimates, not guarantees of an immediate increase in
+available filesystem space. Open files can retain storage after their last
+name is removed ([Linux `unlink(2)`](https://man7.org/linux/man-pages/man2/unlink.2.html)),
+and snapshots can retain blocks. OS available-space accounting is a different
+measure: macOS counts [Time Machine local snapshot space as available](https://support.apple.com/en-ca/102154).
+Do not equate these values with a predicted change in `df` or the OS storage UI;
+read the scan’s `accounting.caveats`, including snapshot limitations.
 
 Clone detection is off by default because it makes warm scans slower: APFS
 has to look up every file's clone flags (on an Apple M4, +31% on a 100k-file
@@ -419,7 +427,8 @@ portable snapshots.
 
 With `--clones`, `dedup_bytes` counts
 each APFS clone family (or, on Linux, each shared extent) once and
-`freeable_min_bytes` is a lower bound of what deleting the item frees (see
+`freeable_min_bytes` is a lower-bound estimate under the scan accounting model,
+not guaranteed immediately available space (see
 [APFS clones](#apfs-clones) and
 [Linux reflinks](#linux-reflinks-btrfs-xfs-bcachefs); without `--clones` it
 is `null` on macOS and on btrfs / XFS / bcachefs); children, special dirs, files and
@@ -464,8 +473,12 @@ changed (a *partial clone*) shares only some blocks with other files, so neither
 `--private` (MCP: `private: true`; both imply `--clones`, whose flags pick out
 partial clones), every file that may share blocks (`EF_MAY_SHARE_BLOCKS`) but is
 not a full clone (`EF_SHARES_ALL_BLOCKS`), and has a single link, gets
-`private_bytes`: the bytes freed immediately if that file alone is deleted (APFS
-`ATTR_CMNEXT_PRIVATESIZE`). It appears on file entries (`largest_files`,
+`private_bytes`: the scan-time value of APFS `ATTR_CMNEXT_PRIVATESIZE`.
+[Apple defines this attribute](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/man/man2/getattrlist.2#L1239-L1243)
+as bytes not retained by clones or snapshots that deletion of the file would
+release immediately. This API meaning is not a promise of a future change in
+available volume space: the file must actually be removed, and the scan or cache
+may be stale. It appears on file entries (`largest_files`,
 `--category` items, file `children`) and in the TUI details pane; it is omitted
 on other files (and on one that vanished or could not be read meanwhile) and
 never summed into folder values. `accounting.private` is `true` when the scan
@@ -581,7 +594,9 @@ mkdir -p ~/.claude/skills/dutype && curl -fsSL -o ~/.claude/skills/dutype/SKILL.
 ```
 
 When a new version is released, update this pin and the packaged skill guidance
-together. Changing these source docs does not update an already-published npm
+together. The scan-time estimate caveats above also qualify interpretation of
+older guides; their deletion wording is not a promise of immediate available
+space. Changing these source docs does not update an already-published npm
 package README.
 
 There is also an [`llms.txt`](llms.txt).
