@@ -109,14 +109,22 @@ pub fn reg() -> &'static Registry {
 }
 
 /// Load built-in rules plus the user config (explicit path, or the default
-/// location if it exists). Returns the user config path that was applied.
+/// location if present). Only a missing implicit config is ignored; other read
+/// errors and all explicit-path errors are reported. Returns the applied path.
 pub fn init(explicit: Option<&Path>, icons: Option<IconMode>) -> Result<Option<PathBuf>, String> {
-    let path = match explicit {
+    let mut path = match explicit {
         Some(p) => Some(p.to_path_buf()),
-        None => default_config_path().filter(|p| p.exists()),
+        None => default_config_path(),
     };
     let user = match &path {
-        Some(p) => Some(std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))?),
+        Some(p) => match std::fs::read_to_string(p) {
+            Ok(user) => Some(user),
+            Err(e) if explicit.is_none() && e.kind() == std::io::ErrorKind::NotFound => {
+                path = None;
+                None
+            }
+            Err(e) => return Err(format!("{}: {e}", p.display())),
+        },
         None => None,
     };
     let mut sources = vec![DEFAULT_CONFIG];

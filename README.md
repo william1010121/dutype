@@ -316,6 +316,16 @@ extents are not read at all (dedup equals the `du` size).
 Add rules in `~/.config/dutype/config.toml` (or pass `--config`). A
 `[[category]]` with an existing name extends it; a new name creates a category.
 
+Config paths are selected in this order: `--config FILE`, `$DUTYPE_CONFIG`,
+then `$XDG_CONFIG_HOME/dutype/config.toml` (or `~/.config/dutype/config.toml`
+when `XDG_CONFIG_HOME` is unset). Windows uses
+`%APPDATA%\dutype\config.toml` for the default location. A missing implicit
+config, including a missing `$DUTYPE_CONFIG` target or dangling symlink, uses
+only the built-in rules; no config file is created. Other read errors (such
+as permission denied), invalid UTF-8 and invalid config contents stop startup
+before scanning, including in `--report`, `--json` and `--mcp` modes.
+An explicit `--config FILE` is always required to be readable, even if missing.
+
 ```toml
 icons = "nerd"            # emoji (default) | nerd | none
 
