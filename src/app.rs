@@ -50,7 +50,9 @@ pub enum Rescan {
 /// One folder of a location. The name alone is not an identity: an escaped
 /// non-UTF-8 name (e.g. `d\xffir`) can be spelled exactly like a sibling's
 /// real UTF-8 name, so lossiness is part of the match. On unix escapes are
-/// reversible, so two different non-UTF-8 names never share a Step.
+/// reversible, so two different non-UTF-8 names never share a Step. Elsewhere,
+/// distinct raw names can share a lossy rendering: never infer their identity
+/// across rescans, and require unique matches within the same snapshot.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Step {
     pub name: Box<str>,
@@ -67,6 +69,12 @@ impl Step {
 
     fn matches(&self, n: &Node) -> bool {
         n.lossy == self.lossy && n.name == self.name
+    }
+
+    fn position(&self, children: &[Node]) -> Option<usize> {
+        let mut matches = children.iter().enumerate().filter(|(_, n)| self.matches(n));
+        let (index, _) = matches.next()?;
+        (!self.lossy || matches.next().is_none()).then_some(index)
     }
 }
 
@@ -321,8 +329,9 @@ impl App {
         })
     }
 
-    /// Folders from the root to the current directory.
-    pub fn location(&self) -> Vec<Step> {
+    /// Folders from the root to the current directory, for navigation assertions.
+    #[cfg(test)]
+    fn location(&self) -> Vec<Step> {
         let mut n = &self.root;
         self.stack
             .iter()
@@ -336,12 +345,8 @@ impl App {
     /// Descend into the directories of `location` (as far as they exist).
     pub fn go_to(&mut self, location: &[Step]) {
         for step in location {
-            let Some(i) = self
-                .current()
-                .children()
-                .iter()
-                .position(|c| c.is_dir() && step.matches(c))
-            else {
+            let children = self.current().children();
+            let Some(i) = step.position(children).filter(|&i| children[i].is_dir()) else {
                 break;
             };
             self.states.last_mut().unwrap().select(Some(i));
@@ -370,7 +375,7 @@ impl App {
             true => self.clone_ids = clone_ids,
             false => self.clone_ids |= clone_ids,
         }
-        let place = self.remember();
+        let place = self.remember_rescan();
 
         let target = node_at_mut(&mut self.root, &self.stack);
         fresh.name = target.name.clone();
@@ -428,21 +433,40 @@ impl App {
         self.restore(place);
     }
 
-    /// The location and the selected entry at every level, by name.
-    pub fn remember(&self) -> Navigation {
-        let selected = (0..=self.stack.len())
+    /// Remember names within the same tree, where unique lossy names remain
+    /// usable. Sorting does not replace the filesystem identities in the tree.
+    fn remember(&self) -> Navigation {
+        self.remember_with_lossy(true)
+    }
+
+    /// Remember only identities that can survive a new filesystem snapshot.
+    /// Non-reversible names cannot distinguish even one raw name replaced by
+    /// another with the same rendering; fall back instead of guessing.
+    pub fn remember_rescan(&self) -> Navigation {
+        self.remember_with_lossy(crate::scan::LOSSY_NAMES_REVERSIBLE)
+    }
+
+    fn remember_with_lossy(&self, keep_lossy: bool) -> Navigation {
+        let identity = |children: &[Node], index| {
+            let step = Step::of(children.get(index)?);
+            (!step.lossy || (keep_lossy && step.position(children) == Some(index))).then_some(step)
+        };
+        let mut location = Vec::new();
+        let mut node = &self.root;
+        for &index in &self.stack {
+            let Some(step) = identity(node.children(), index) else {
+                break;
+            };
+            location.push(step);
+            node = &node.children()[index];
+        }
+        let selected = (0..=location.len())
             .map(|k| {
                 let node = node_at(&self.root, &self.stack[..k]);
-                self.states[k]
-                    .selected()
-                    .and_then(|i| node.children().get(i))
-                    .map(Step::of)
+                self.states[k].selected().and_then(|i| identity(node.children(), i))
             })
             .collect();
-        Navigation {
-            location: self.location(),
-            selected,
-        }
+        Navigation { location, selected }
     }
 
     /// Back to a [`Self::remember`]ed place after a rescan or re-sort.
@@ -452,9 +476,7 @@ impl App {
         self.go_to(&location);
         for (k, name) in selected.iter().enumerate().take(self.states.len()) {
             let node = node_at(&self.root, &self.stack[..k]);
-            let pos = name
-                .as_ref()
-                .and_then(|step| node.children().iter().position(|c| step.matches(c)));
+            let pos = name.as_ref().and_then(|step| step.position(node.children()));
             self.states[k].select(pos.or(if node.children().is_empty() { None } else { Some(0) }));
         }
         self.popup = None;
@@ -2037,7 +2059,7 @@ mod tests {
     }
 
     fn refreshed_app(old: &App, root: Node) -> App {
-        let navigation = old.remember();
+        let navigation = old.remember_rescan();
         let mut app = jump_app(root);
         app.set_size_mode(old.size_mode);
         app.restore(navigation);
@@ -2189,7 +2211,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_history_keeps_unicode_and_lossy_identity_not_display_collisions() {
+    fn refresh_history_keeps_reversible_unicode_and_lossy_identity_not_display_collisions() {
         let tree = |reverse| {
             let mut raw = jump_file(r"same\xff.pdf", 20);
             raw.lossy = true;
@@ -2217,7 +2239,8 @@ mod tests {
             }]);
             old.states.last_mut().unwrap().select(Some(selected));
             let identity = Step::of(&old.current().children()[selected]);
-            let mut app = refreshed_app(&old, tree(true));
+            let mut app = jump_app(tree(true));
+            app.restore(old.remember_with_lossy(true));
             assert!(app.current().lossy);
             assert_eq!(
                 Step::of(&app.current().children()[app.selected_entry().unwrap()]),
@@ -2231,6 +2254,138 @@ mod tests {
                 press(&mut app, KeyCode::Left);
             }
             press(&mut app, KeyCode::Left);
+            assert!(app.current().children()[app.selected_entry().unwrap()].lossy);
+            consistent_history(&app);
+        }
+    }
+
+    #[test]
+    fn refresh_history_nonreversible_lossy_selections_never_guess_across_rescans() {
+        let raw = |size| {
+            let mut node = jump_file("same�.pdf", size);
+            node.lossy = true;
+            node
+        };
+        // Even a singleton-to-singleton match is not proof: a different raw
+        // surrogate name can replace the old one with identical display text.
+        for old_count in [1, 2] {
+            for fresh_count in [0, 1, 2] {
+                let mut old_files = vec![jump_file("fallback.pdf", 100)];
+                old_files.extend((0..old_count).map(|_| raw(10)));
+                let mut old = jump_app(jump_dir("root", old_files));
+                old.states[0].select(Some(old_count));
+                let saved = old.remember_with_lossy(false);
+                assert!(saved.selected[0].is_none());
+                let mut fresh = vec![jump_file("fallback.pdf", 100)];
+                fresh.extend((0..fresh_count).map(|_| raw(20)));
+                let mut app = jump_app(jump_dir("root", fresh));
+                app.restore(saved);
+                assert_eq!(app.selected_entry(), Some(0));
+                assert_eq!(app.current().children()[0].name.as_ref(), "fallback.pdf");
+                consistent_history(&app);
+            }
+        }
+    }
+
+    #[test]
+    fn refresh_history_nonreversible_lossy_folder_stops_before_it_and_keeps_back_history() {
+        let raw_dir = || {
+            let mut node = jump_dir("same�", vec![jump_file("inside.pdf", 10)]);
+            node.lossy = true;
+            node
+        };
+        for old_count in [1, 2] {
+            let mut children = vec![jump_dir("fallback", vec![])];
+            children.extend((0..old_count).map(|_| raw_dir()));
+            let mut old = jump_app(jump_dir("root", vec![jump_dir("branch", children)]));
+            old.go_to(&["branch".into()]);
+            old.states.last_mut().unwrap().select(Some(old_count));
+            press(&mut old, KeyCode::Enter); // Explicit index navigation is safe.
+            let saved = old.remember_with_lossy(false);
+            assert_eq!(saved.location, [Step::from("branch")]);
+            assert!(saved.selected[1].is_none());
+            let mut app = jump_app(jump_dir(
+                "root",
+                vec![
+                    jump_dir("other", vec![]),
+                    jump_dir("branch", vec![jump_dir("fallback", vec![]), raw_dir()]),
+                ],
+            ));
+            app.restore(saved);
+            assert_eq!(app.location(), [Step::from("branch")]);
+            assert_eq!(app.selected_entry(), Some(0));
+            consistent_history(&app);
+            press(&mut app, KeyCode::Left);
+            assert_eq!(app.selected_entry(), Some(1));
+            assert_eq!(app.current().children()[1].name.as_ref(), "branch");
+            consistent_history(&app);
+        }
+    }
+
+    #[test]
+    fn refresh_history_lossy_uniqueness_checks_source_destination_and_all_node_kinds() {
+        let raw = |directory| {
+            let mut node = if directory {
+                jump_dir("same�", vec![])
+            } else {
+                jump_file("same�", 10)
+            };
+            node.lossy = true;
+            node
+        };
+        let step = Step {
+            name: "same�".into(),
+            lossy: true,
+        };
+        for directory in [false, true] {
+            // A file twin still makes the folder identity ambiguous.
+            let mut old = jump_app(jump_dir("root", vec![raw(directory), raw(true)]));
+            old.go_to(std::slice::from_ref(&step));
+            assert!(old.stack.is_empty());
+            old.states[0].select(Some(1));
+            press(&mut old, KeyCode::Enter);
+            let saved = old.remember_with_lossy(true);
+            assert!(saved.location.is_empty());
+            assert!(saved.selected[0].is_none());
+            let mut singleton = jump_app(jump_dir("root", vec![jump_file("fallback", 1), raw(true)]));
+            singleton.restore(saved);
+            assert!(singleton.stack.is_empty());
+            assert_eq!(singleton.selected_entry(), Some(0));
+            consistent_history(&singleton);
+
+            let mut unique = jump_app(jump_dir("root", vec![raw(true)]));
+            unique.go_to(std::slice::from_ref(&step));
+            let mut ambiguous = jump_app(jump_dir(
+                "root",
+                vec![jump_file("fallback", 1), raw(directory), raw(true)],
+            ));
+            ambiguous.restore(unique.remember_with_lossy(true));
+            assert!(ambiguous.stack.is_empty());
+            assert_eq!(ambiguous.selected_entry(), Some(0));
+            consistent_history(&ambiguous);
+        }
+    }
+
+    #[test]
+    fn refresh_history_same_tree_sort_keeps_unique_nonreversible_lossy_names() {
+        let mut file = jump_file("same�.pdf", 100);
+        file.lossy = true;
+        let mut raw_dir = jump_dir("same�", vec![file]);
+        raw_dir.lossy = true;
+        raw_dir.clone = true;
+        raw_dir.dir.as_mut().unwrap().clones_mut().dup = 100;
+        let mut app = jump_app(jump_dir(
+            "root",
+            vec![raw_dir, jump_dir("other", vec![jump_file("other.pdf", 10)])],
+        ));
+        app.go_to(&[Step {
+            name: "same�".into(),
+            lossy: true,
+        }]);
+        for mode in [SizeMode::Dedup, SizeMode::Du] {
+            app.set_size_mode(mode);
+            assert_eq!(app.stack[0], if mode == SizeMode::Du { 0 } else { 1 });
+            assert!(app.current().lossy);
             assert!(app.current().children()[app.selected_entry().unwrap()].lossy);
             consistent_history(&app);
         }

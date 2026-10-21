@@ -36,7 +36,7 @@ class Session:
                        XDG_CONFIG_HOME=str(root.parent / "config"), XDG_CACHE_HOME=str(root.parent / "cache"),
                        DUTYPE_CACHE_DIR=str(root.parent / "cache" / "dutype"), RAYON_NUM_THREADS="2",
                        PATH="/no-external-commands")
-            self.process = subprocess.Popen([str(binary), "--icons", "none", str(root)],
+            self.process = subprocess.Popen([str(binary), "--icons", "none", "--show-keys", str(root)],
                                             stdin=self.slave, stdout=self.slave, stderr=self.slave,
                                             env=env, start_new_session=True)
             atexit.register(self.cleanup)
@@ -78,9 +78,19 @@ class Session:
         self.key(b"G", lambda: self.selected("z_selected.pdf"))
 
     def refresh(self, key=b"R"):
-        self.key(key, lambda: "Scanning " in self.screen.text())
-        self.frame("observed_progress")
-        self.wait(lambda: "Scanning " not in self.screen.text() and "rescan folder" in self.screen.text())
+        # An inert key paints an acknowledgement in --show-keys mode. A new
+        # App clears it only after a successful full refresh, so the old view
+        # cannot satisfy completion even when no progress frame was drawn.
+        marker = " ! "
+        self.key(b"!", lambda: marker in self.screen.text())
+        self.frame("acknowledged_before_refresh")
+        self.key(key, lambda: self.completed_refresh(marker))
+        self.frame("completed_refresh")
+
+    def completed_refresh(self, marker):
+        text = self.screen.text()
+        return (marker not in text and "Scanning " not in text
+                and "scanned in" in text.split("\n", 1)[0] and "rescan folder" in text)
 
     def cleanup(self):
         try:

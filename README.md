@@ -148,7 +148,7 @@ you and is set to mode 0700, snapshots to 0600. `--json` reports `cached_at`
 | `R` | rescan everything from the root |
 | `q` | quit |
 
-Successful rescans keep the current folder and selected entries by name, even when size ordering changes. Missing selections fall back to the first entry (or none in an empty folder); missing folders fall back to the nearest surviving ancestor. Cancelling a folder-only rescan keeps the previous view; cancelling a full rescan exits.
+Successful rescans keep the current folder and selected entries by name, even when size ordering changes. Missing selections fall back to the first entry (or none in an empty folder); missing folders fall back to the nearest surviving ancestor. Non-reversible lossy names, such as Windows names with unpaired surrogates, use that fallback after a rescan rather than guessing an identity; Unix escaped names remain restorable. Cancelling a folder-only rescan keeps the previous view; cancelling a full rescan exits.
 
 Extension breakdown rows use allocated size descending, then display label ascending for ties. This keeps equal-size rows and the top-60 cutoff stable across refreshes and mode switches.
 

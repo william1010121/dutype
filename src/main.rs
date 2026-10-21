@@ -319,7 +319,7 @@ fn run(args: Args) -> Result<(), String> {
                 std::mem::forget(app);
                 return Ok(());
             }
-            navigation = Some(app.remember());
+            navigation = Some(app.remember_rescan());
             carried_status = app.status.take();
             size_mode = app.size_mode;
             clones = app.clones;

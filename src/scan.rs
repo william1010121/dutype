@@ -481,6 +481,10 @@ impl PrivateSizes {
     }
 }
 
+/// Whether a rendered non-UTF-8 name uniquely encodes its original bytes.
+/// This is navigation metadata only; it does not affect scanning.
+pub use platform::LOSSY_NAMES_REVERSIBLE;
+
 #[cfg(unix)]
 mod platform {
     use super::{Entry, FsKind, Progress, ReadStats};
@@ -616,6 +620,8 @@ mod platform {
         (m.ino(), m.nlink())
     }
 
+    pub const LOSSY_NAMES_REVERSIBLE: bool = true;
+
     /// Escaped rendering of a non-UTF-8 name, like `ls -b` (`\\xff` for bad
     /// bytes, `\\\\` for backslashes): distinct raw names stay distinct and
     /// [`lossy_child`] recovers the exact bytes.
@@ -717,6 +723,8 @@ mod platform {
     pub fn file_id(_: &Metadata) -> (u64, u64) {
         (0, 1)
     }
+
+    pub const LOSSY_NAMES_REVERSIBLE: bool = false;
 
     /// Lossy rendering of a non-UTF-8 (unpaired surrogate) name.
     pub fn lossy_name(raw: &OsStr) -> String {
