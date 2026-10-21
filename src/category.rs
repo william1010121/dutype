@@ -34,6 +34,9 @@ pub struct CategoryDef {
 pub struct Registry {
     pub defs: Vec<CategoryDef>,
     ext: FxHashMap<String, Category>,
+    /// Final normalized rules exceeding the stack-buffer fast path, sorted by
+    /// extension. Keep `ext` authoritative for rule ownership queries.
+    long_ext: Vec<(String, Category)>,
     dirs: FxHashMap<String, Category>,
     /// name -> [(parent, category)]
     parent_dirs: FxHashMap<String, Vec<(String, Category)>>,
@@ -179,6 +182,19 @@ impl Registry {
             });
             Category(r.defs.len() as u8 - 1)
         });
+        // Derive this only after overrides and category-index shifts finish.
+        r.long_ext = r
+            .ext
+            .iter()
+            .filter(|(ext, _)| ext.len() > 16)
+            .map(|(ext, &cat)| (ext.clone(), cat))
+            .collect();
+        r.long_ext.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        if !r.long_ext.is_empty() {
+            // Earlier same-version scans silently classified these rules as
+            // Other. Invalidate those snapshots, not unaffected short rules.
+            r.fingerprint = crate::cache::fnv1a(r.fingerprint, b"\0classification:long-extensions:v1");
+        }
         Ok(r)
     }
 
@@ -301,7 +317,11 @@ impl Registry {
         // Lowercase into a stack buffer: this runs once per file.
         let mut buf = [0u8; 16];
         let Some(dst) = buf.get_mut(..ext.len()) else {
-            return self.other;
+            return self
+                .long_ext
+                .iter()
+                .find(|(rule, _)| rule.eq_ignore_ascii_case(ext))
+                .map_or(self.other, |(_, cat)| *cat);
         };
         dst.copy_from_slice(ext.as_bytes());
         dst.make_ascii_lowercase();
@@ -472,6 +492,137 @@ mod tests {
         assert_eq!(l(".bashrc"), "Other");
         assert_eq!(l("Makefile"), "Other");
         assert_eq!(l("a.averyveryverylongextension"), "Other");
+    }
+
+    #[test]
+    fn custom_extensions_cross_stack_and_utf8_boundaries() {
+        let config = r#"
+            [[category]]
+            name = "Custom"
+            extensions = ["abcdefghijklmno", "abcdefghijklmnop", "...ABCDEFGHIJKLMNOPQ",
+                          "éééééééé", "ééééééééx"]
+        "#;
+        let r = Registry::from_sources(&[DEFAULT_CONFIG, config]).unwrap();
+        let custom = r.find("Custom").unwrap();
+        for ext in [
+            "abcdefghijklmno",
+            "abcdefghijklmnop",
+            "abcdefghijklmnopq",
+            "éééééééé",
+            "ééééééééx",
+        ] {
+            assert_eq!(r.classify_file(&format!("file.{ext}")), custom);
+            assert_eq!(r.classify_file(&format!("file.{}", ext.to_ascii_uppercase())), custom);
+        }
+        assert_eq!(r.classify_file("file.Éééééééé"), r.other());
+        assert_eq!(r.classify_file("file.Ééééééééx"), r.other());
+        assert_eq!(r.classify_file("file.abcdefghijklmnopqr"), r.other());
+        assert_eq!(r.classify_file("file.abcdefghijklmnoqq"), r.other());
+        assert_eq!(
+            r.long_ext.iter().map(|(e, _)| e.as_str()).collect::<Vec<_>>(),
+            ["abcdefghijklmnopq", "ééééééééx"]
+        );
+    }
+
+    #[test]
+    fn long_rules_preserve_extension_extraction() {
+        let r = Registry::from_sources(&[r#"[[category]]
+            name = "Custom"
+            extensions = ["abcdefghijklmnopq", "part.abcdefghijklmnopq"]
+        "#])
+        .unwrap();
+        let custom = r.find("Custom").unwrap();
+        for name in [
+            "",
+            ".",
+            "..",
+            "plain",
+            ".abcdefghijklmnopq",
+            "file.",
+            "file.abcdefghijklmnopq.",
+        ] {
+            assert_eq!(r.classify_file(name), r.other(), "{name}");
+        }
+        for name in [
+            "file.abcdefghijklmnopq",
+            ".hidden.abcdefghijklmnopq",
+            "file.part.abcdefghijklmnopq",
+            "..abcdefghijklmnopq",
+        ] {
+            assert_eq!(r.classify_file(name), custom, "{name}");
+        }
+        assert_eq!(r.classify_file("file.abcdefghijklmnopq.short"), r.other());
+    }
+
+    #[test]
+    fn long_rules_use_final_owners_and_shifted_other() {
+        let base = r#"
+            [[category]]
+            name = "Mixed"
+            dirs = ["special"]
+            extensions = ["zzzzzzzzzzzzzzzzz", "abcdefghijklmnopq"]
+            [[category]]
+            name = "Other"
+            extensions = ["otherotherotherxxx"]
+        "#;
+        let overrides = r#"
+            [[category]]
+            name = "New owner"
+            extensions = [".ABCDEFGHIJKLMNOPQ", "zzzzzzzzzzzzzzzzz"]
+            [[category]]
+            name = "Later"
+            extensions = ["short"]
+        "#;
+        let partial = Registry::from_sources(&[base]).unwrap();
+        assert!(partial.has_file_rules(partial.find("Mixed").unwrap()));
+        let r = Registry::from_sources(&[base, overrides]).unwrap();
+        let new = r.find("New owner").unwrap();
+        assert_eq!(r.classify_file("file.abcdefghijklmnopq"), new);
+        assert_eq!(r.classify_file("file.zzzzzzzzzzzzzzzzz"), new);
+        assert_eq!(r.classify_file("file.otherotherotherxxx"), r.other());
+        assert!(!r.has_file_rules(r.find("Mixed").unwrap()));
+        assert!(r.has_file_rules(new));
+        assert!(r.has_file_rules(r.other()));
+        assert_eq!(r.other().index(), r.len() - 1);
+        assert_eq!(
+            r.long_ext,
+            vec![
+                ("abcdefghijklmnopq".into(), new),
+                ("otherotherotherxxx".into(), r.other()),
+                ("zzzzzzzzzzzzzzzzz".into(), new)
+            ]
+        );
+        assert_eq!(r.long_ext, Registry::from_sources(&[base, overrides]).unwrap().long_ext);
+    }
+
+    #[test]
+    fn fingerprint_revision_is_selective_and_deterministic() {
+        fn legacy(sources: &[&str]) -> u64 {
+            sources.iter().fold(
+                crate::cache::fnv1a(0, env!("CARGO_PKG_VERSION").as_bytes()),
+                |hash, source| crate::cache::fnv1a(hash, source.as_bytes()),
+            )
+        }
+        for config in [
+            "",
+            r#"[[category]]
+            name = "Short"
+            extensions = ["....................PDF", "abcdefghijklmnop", "éééééééé"]
+        "#,
+        ] {
+            let sources = [DEFAULT_CONFIG, config];
+            let r = Registry::from_sources(&sources).unwrap();
+            assert!(r.long_ext.is_empty());
+            assert_eq!(r.fingerprint, legacy(&sources));
+        }
+        for name in ["Long", "Other"] {
+            let config = format!("[[category]]\nname = {name:?}\nextensions = [\"abcdefghijklmnopq\"]");
+            let sources = [DEFAULT_CONFIG, &config];
+            let r = Registry::from_sources(&sources).unwrap();
+            assert_eq!(r.long_ext.len(), 1);
+            assert_ne!(r.fingerprint, legacy(&sources));
+            assert_eq!(r.fingerprint, Registry::from_sources(&sources).unwrap().fingerprint);
+        }
     }
 
     #[test]

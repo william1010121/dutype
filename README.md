@@ -343,6 +343,10 @@ extensions = ["unitypackage"]
 ```
 
 Directory rules beat extension rules, and your rules beat the built-in ones.
+Extensions match the suffix after the final dot, ignoring ASCII case; non-ASCII
+characters match exactly. Custom extensions longer than 16 UTF-8 bytes are also
+supported. A leading dot in a rule is optional; a dotfile without another dot
+(such as `.bashrc`) has no extension.
 
 For a category combining directory and file rules, the default category query
 still lists matching directories only. To include loose exports as well:
