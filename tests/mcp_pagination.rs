@@ -213,6 +213,7 @@ fn successful(response: Value) -> Value {
     assert!(text.get("cached_at").is_some());
     assert!(text["cached_at"].is_null() || text["cached_at"].is_u64());
     assert!(text["accounting"].is_object());
+    assert_native_accounting(&text["accounting"]);
     if let Some(items) = text["items"].as_array() {
         let matched = text["matched_items"].as_u64().unwrap();
         assert!(matched >= items.len() as u64);
@@ -889,4 +890,230 @@ fn scan_wide_unreadable_warning_survives_each_page_and_permission_recovery() {
     assert_eq!(refreshed["unreadable"], 0);
     stale_cursor(server.call("find_by_category", continuation(&first, 1)));
     fixture.no_disk_cache();
+}
+
+#[test]
+fn mixed_inventory_pages_partition_606_matches_and_bind_include_files() {
+    let fixture = Fixture::new();
+    fs::write(
+        &fixture.config,
+        r#"
+        [[category]]
+        name = "Unity"
+        dirs = ["Library", "Temp"]
+        markers = ["ProjectSettings"]
+        extensions = ["unitypackage"]
+    "#,
+    )
+    .unwrap();
+    for i in 0..303 {
+        let directory = fixture.root.join(format!("p{i:03}/Library/Temp"));
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("pruned.unitypackage"), b"").unwrap();
+        // Ties, zero-byte matches, and pages that interleave directory/file ranks.
+        fs::write(
+            fixture.root.join(format!("{i:03}.unitypackage")),
+            vec![b'x'; if i % 2 == 0 { 16384 } else { 0 }],
+        )
+        .unwrap();
+    }
+    for mode in ["du", "dedup"] {
+        let expected = fixture.cli(
+            &fixture.root,
+            Some("Unity"),
+            1000,
+            &["--include-files", "--size-mode", mode],
+            "1",
+        );
+        assert_eq!(expected["matched_items"], 606);
+        assert_eq!(expected["items_truncated"], false);
+        assert_eq!(
+            expected,
+            fixture.cli(
+                &fixture.root,
+                Some("Unity"),
+                1000,
+                &["--include-files", "--size-mode", mode],
+                "4"
+            )
+        );
+        for threads in ["1", "4"] {
+            let mut server = fixture.server(&["--cache"], threads);
+            let base = json!({"path":fixture.root, "category":"Unity", "size_mode":mode});
+            // Prime the retained snapshot before exact default/explicit-false comparison.
+            server.find(base.clone());
+            let legacy = server.find(base.clone());
+            let mut explicit_false = base.clone();
+            explicit_false["include_files"] = json!(false);
+            assert_eq!(legacy, server.find(explicit_false));
+            assert_eq!(legacy["matched_items"], 303);
+            assert!(legacy.get("include_files").is_none());
+            for top in [500, 137] {
+                let mut first = base.clone();
+                first["top"] = json!(top);
+                first["paginate"] = json!(true);
+                first["include_files"] = json!(true);
+                let mut page = server.find(first);
+                let snapshot_id = page["pagination"]["snapshot_id"].clone();
+                let mut all = Vec::new();
+                loop {
+                    let count = (606 - all.len()).min(top);
+                    let more = all.len() + count < 606;
+                    assert_page(&page, all.len() as u64, count, 606, more);
+                    assert_eq!(page["include_files"], true);
+                    assert_eq!(page["accounting"], expected["accounting"]);
+                    assert_eq!(page["pagination"]["snapshot_id"], snapshot_id);
+                    all.extend_from_slice(page["items"].as_array().unwrap());
+                    if !more {
+                        break;
+                    }
+                    let mut next = continuation(&page, top);
+                    next["size_mode"] = json!(mode);
+                    invalid_arguments(server.call("find_by_category", next.clone()));
+                    next["include_files"] = json!(false);
+                    invalid_arguments(server.call("find_by_category", next.clone()));
+                    next["include_files"] = json!(true);
+                    let following = server.find(next.clone());
+                    assert_eq!(following, server.find(next));
+                    page = following;
+                }
+                assert_eq!(json!(all), expected["items"]);
+            }
+        }
+    }
+    fixture.no_disk_cache();
+}
+
+#[test]
+fn include_files_schema_type_validation_and_pure_category_cursor_binding() {
+    let fixture = Fixture::new();
+    fixture.pdfs(3);
+    let mut server = fixture.server(&["--cache"], "1");
+    let schema = server.request("tools/list", json!({}));
+    let tools = schema["result"]["tools"].as_array().unwrap();
+    for tool in tools {
+        let property = &tool["inputSchema"]["properties"]["include_files"];
+        if tool["name"] == "find_by_category" {
+            assert_eq!(property["type"], "boolean");
+            assert_eq!(property["default"], false);
+        } else {
+            assert!(property.is_null());
+        }
+    }
+    for invalid in [json!(null), json!(1), json!("true"), json!([]), json!({})] {
+        invalid_arguments(server.call(
+            "find_by_category",
+            json!({"path":fixture.root, "category":"PDF", "include_files":invalid}),
+        ));
+    }
+    for value in [true, false] {
+        invalid_arguments(server.call("disk_usage", json!({"path":fixture.root, "include_files":value})));
+    }
+    let first = server.find(start(&fixture.root, "PDF", 1));
+    let mut changed = continuation(&first, 1);
+    changed["include_files"] = json!(true);
+    invalid_arguments(server.call("find_by_category", changed));
+    let mut opted = start(&fixture.root, "PDF", 1);
+    opted["include_files"] = json!(true);
+    let opted = server.find(opted);
+    assert_eq!(first["items"], opted["items"]);
+    assert_eq!(first["matched_items"], opted["matched_items"]);
+    invalid_arguments(server.call("find_by_category", continuation(&opted, 1)));
+    let mut next = continuation(&opted, 1);
+    next["include_files"] = json!(true);
+    assert_page(&server.find(next), 1, 1, 3, true);
+}
+
+// The fields describe native scan policy even when no duplicates exist. Cache
+// parity here deliberately uses a snapshot produced on the same platform.
+#[test]
+fn native_accounting_matches_cli_cache_mcp_and_pages() {
+    let fixture = Fixture::new();
+    let owner = fixture.root.join("a.pdf");
+    fs::write(&owner, b"1234567").unwrap();
+    fs::hard_link(&owner, fixture.root.join("z.pdf")).unwrap();
+    for options in [vec![], vec!["--clones"], vec!["--private"]] {
+        let full = fixture.cli(&fixture.root, None, 10, &options, "1");
+        let category = fixture.cli(&fixture.root, Some("PDF"), 10, &options, "4");
+        let accounting = &full["accounting"];
+        assert_native_accounting(accounting);
+        assert_eq!(&category["accounting"], accounting);
+        let items = category["items"].as_array().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(category["items"], full["largest_files"]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let allocated = fs::metadata(&owner).unwrap().blocks() * 512;
+            for item in items {
+                let name = Path::new(item["path"].as_str().unwrap()).file_name().unwrap();
+                let expected = if name == "a.pdf" { allocated } else { 0 };
+                assert_eq!(item["size_bytes"], expected);
+            }
+            assert_eq!(
+                full["size_bytes"],
+                allocated + fs::metadata(&fixture.root).unwrap().blocks() * 512
+            );
+        }
+        #[cfg(not(unix))]
+        {
+            assert_eq!(accounting["private"], false);
+            assert_eq!(full["size_bytes"], 14);
+            assert_eq!(full["dedup_bytes"], 14);
+            assert!(full["freeable_min_bytes"].is_null());
+            for item in items.iter().chain(full["children"].as_array().unwrap()) {
+                assert_eq!(item["size_bytes"], 7);
+                assert_eq!(item["dedup_bytes"], 7);
+                assert!(item["freeable_min_bytes"].is_null());
+                assert!(item.get("private_bytes").is_none());
+            }
+        }
+        // Replace the cache for each option set, then verify actual cache hits.
+        let mut refresh = options.clone();
+        refresh.extend(["--cache", "--refresh"]);
+        let fresh = fixture.cli(&fixture.root, None, 10, &refresh, "2");
+        assert!(fresh["cached_at"].is_null());
+        assert_eq!(&fresh["accounting"], accounting);
+        let mut cached_options = options.clone();
+        cached_options.push("--cache");
+        for cat in [None, Some("PDF")] {
+            let cached = fixture.cli(&fixture.root, cat, 10, &cached_options, "2");
+            assert!(cached["cached_at"].is_u64());
+            assert_eq!(&cached["accounting"], accounting);
+        }
+        let mut server = fixture.server(&cached_options, "4");
+        let clones = options.contains(&"--clones");
+        let private = options.contains(&"--private");
+        let args = json!({"path": fixture.root, "refresh": true, "clones": clones, "private": private});
+        let mcp_full = successful(server.call("disk_usage", args));
+        assert_eq!(&mcp_full["accounting"], accounting);
+        let mcp_category =
+            server.find(json!({"path": fixture.root, "category": "PDF", "clones": clones, "private": private}));
+        assert_eq!(&mcp_category["accounting"], accounting);
+        assert_eq!(mcp_category["items"], category["items"]);
+        let mut args = start(&fixture.root, "PDF", 1);
+        args["clones"] = clones.into();
+        args["private"] = private.into();
+        let first = server.find(args);
+        let mut args = continuation(&first, 1);
+        args["clones"] = clones.into();
+        args["private"] = private.into();
+        let second = server.find(args);
+        assert_page(&first, 0, 1, 2, true);
+        assert_page(&second, 1, 1, 2, false);
+        for page in [&first, &second] {
+            assert_eq!(&page["accounting"], accounting);
+        }
+        assert_eq!(json!([first["items"][0], second["items"][0]]), category["items"]);
+    }
+}
+
+fn assert_native_accounting(accounting: &Value) {
+    assert_eq!(accounting["size"], "du-allocated");
+    #[cfg(unix)]
+    let expected = ("allocated", "count-once");
+    #[cfg(not(unix))]
+    let expected = ("logical", "unsupported");
+    assert_eq!(accounting["measurement_basis"], expected.0);
+    assert_eq!(accounting["hardlink_deduplication"], expected.1);
 }

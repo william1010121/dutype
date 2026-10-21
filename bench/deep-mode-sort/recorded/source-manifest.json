@@ -1,0 +1,41 @@
+{
+  "category_sha256": "0dcf5b751d505f2b951ac7127d0e49a9501337e871c2b8d54d431a21fefa4c69",
+  "category_decl_sha256": "1c57971129d1dd4741f99b9f84ddd9b8e926f8840adc7abddffb99245b70edb2",
+  "category_index_sha256": "945937477ea3ee5b3c2d5ad141d91d823b30e480772b4ae9d9f4611edb874b74",
+  "scan_sha256": "816e7547561403902365f82c9b191121b7944880a1ee88e3a78207db1fc81e19",
+  "sources": {
+    "before": {
+      "app_sha256": "d03d213177cb059a68f1871900dd416701440b2a6914101d06300490f0288d99",
+      "sort_sha256": "e19c97f9696f0ad381fed3925a292bd9c7c855c643267639c827158483321caf",
+      "binary_sha256": "afc7cfb5963dd9640afc21b546c32e4e30fda49ac81e2888c033a4472c96fbb1"
+    },
+    "after": {
+      "app_sha256": "779e58644e2369125c0286bee68db1b3fb7948bd3ffba08770635270fd887f2b",
+      "sort_sha256": "ecf54d44b0affcd53bf3167c9b8936d5478eeb2a2e177bd37605171de7a0223b",
+      "binary_sha256": "2fc3d84eb544db275c113708e32cf9a1137eb970689f9557e78777638cb95fc2"
+    },
+    "frames": {
+      "app_sha256": "779e58644e2369125c0286bee68db1b3fb7948bd3ffba08770635270fd887f2b",
+      "sort_sha256": "ecf54d44b0affcd53bf3167c9b8936d5478eeb2a2e177bd37605171de7a0223b",
+      "binary_sha256": "9fcdb2f46f96096fdaeac5eb04e9315913e55011f955ab423817e1f8fcc6f7b7"
+    }
+  },
+  "stub": "One-category Registry used only outside sorting; Node and DirInfo/accounting/sort methods copied verbatim.",
+  "flags": [
+    "-C",
+    "opt-level=3",
+    "-C",
+    "lto=true",
+    "-C",
+    "codegen-units=1",
+    "--edition=2024"
+  ],
+  "layout_bytes": {
+    "category": 1,
+    "node": 40,
+    "dir_info": 72,
+    "shared": 48,
+    "iterator": 16
+  },
+  "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)\nbinary: rustc\ncommit-hash: 58cf8f9c35b355199727627d07ae34a4e2846d67\ncommit-date: 2026-10-13\nhost: x86_64-unknown-linux-gnu\nrelease: 1.99.1\nLLVM version: 23.1.1\n"
+}

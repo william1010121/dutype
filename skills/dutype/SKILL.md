@@ -5,6 +5,15 @@ description: Find out what is filling a disk or directory, broken down by kind �
 
 # dutype
 
+## Match the skill to the binary
+
+This `main`-branch skill documents the matching source revision, including
+features not present in the current published v0.1.4 package. For that package,
+use the [v0.1.4 skill](https://github.com/william1010121/dutype/blob/v0.1.4/skills/dutype/SKILL.md)
+instead. CLI `--include-files` and MCP pagination/cursors below require a source
+build that exposes those options. Check `dutype --help` and the MCP tool schema;
+the version string alone may not distinguish development builds.
+
 `dutype` scans a directory in parallel and attributes every byte to a category.
 Directory rules win over extensions: everything inside `node_modules/` counts as
 `node_modules`, everything inside a folder with `pyvenv.cfg` counts as `Python env`.
@@ -17,6 +26,7 @@ dutype --json --top 50 PATH               # longer lists
 dutype --json --category node_modules PATH   # largest node_modules with sizes (default: 20)
 dutype --json --category "Python env" ~      # largest venvs / conda envs (default: 20)
 dutype --json --category Video ~/Movies      # biggest video files
+dutype --json --category Unity --include-files PATH # custom mixed directory/file category
 dutype --json --clones PATH               # macOS: also detect APFS clones (slower)
 dutype --json --size-mode dedup PATH      # rank by size with APFS clones counted once (implies --clones)
 dutype --report PATH                      # same data as plain text
@@ -26,8 +36,10 @@ dutype --dump-config                      # list all categories and rules
 Never run plain `dutype PATH` from an agent: without `--json` / `--report` it
 opens an interactive TUI and waits for keyboard input.
 
-If `dutype` is not installed, run it through npx with the same arguments:
-`npx -y dutype --json PATH` (or install with `npm i -g dutype`).
+If using the published package, pair `npx -y dutype@0.1.4 --json PATH` (or
+`npm i -g dutype@0.1.4`) with the tagged v0.1.4 skill above. Do not send the
+unreleased options in this `main` skill to that binary. Update package and skill
+versions together when a new release becomes available.
 
 ## JSON report fields
 
@@ -59,13 +71,35 @@ complete: `unreadable` is scan-wide and unclassifiable entries are not inferred.
 Text totals cover only displayed items. CLI `--top 0` still counts matches;
 MCP `top` remains 1–500.
 
+Directory categories list matching directories by default. For a custom mixed
+category (for example Unity with `Library` directories and `unitypackage`
+files), add `--include-files` or MCP `include_files: true`. A file must match
+both the scanned category and direct filename classification under final rules.
+Matching directories still prune descendants regardless of the top-N cutoff.
+The root is excluded; explicitly matching files below an excluded special root
+can appear, but arbitrary inherited files cannot. Other's filename fallback is
+included when Other has directory rules. Pure-category matches stay unchanged.
+True is echoed in category JSON; false/omitted preserves the default payload.
+CLI requires `--category` and `--report` or `--json`, rejects `--mcp` and
+`--dump-config`, and never changes the TUI. MCP accepts the option only on
+`find_by_category`. Inventory totals need not equal category summary totals.
+
 For a category inventory, increase CLI `--top` to at least `matched_items`
 and check that `items_truncated` is false in the result. This lists all matches
 in that snapshot, not a guarantee that unreadable entries were classified.
 
 ## Shared blocks (APFS clones, hard links)
 
-`size_bytes` is what `du` reports. On macOS, APFS clones (made by uv, bun,
+Read `accounting.measurement_basis` for `size_bytes`: `"allocated"` on Unix
+(like `du`), `"logical"` on non-Unix including Windows (file lengths).
+`accounting.hardlink_deduplication` is `"count-once"` on Unix and
+`"unsupported"` elsewhere (linked paths count separately). These describe
+native scan policy/capability, not observed duplicates. The legacy
+`accounting.size: "du-allocated"` label is non-authoritative. Caches assume
+same-platform reuse; they have no producer-platform tag and are not portable
+snapshots.
+
+On macOS, APFS clones (made by uv, bun,
 pnpm, `cp -c`, Finder Duplicate) share blocks, so `size_bytes` can be far
 more than deleting would free. Clone detection is opt-in because it slows the
 scan: on macOS, pass `--clones` (MCP: `clones: true`) whenever you will tell
@@ -87,8 +121,8 @@ also credits a hard-linked file to the folder holding all its links.
   `"apfs-partial"` when some files' clone flags could not be read (another
   volume; those count in full and as possibly shared),
   `"unsupported"` when `--clones` was given but the filesystem has no clone
-  information (then `dedup_bytes == size_bytes` and only hard links make
-  `freeable_min_bytes` smaller), `"off"` without `--clones`. `accounting.caveats` lists what is
+  information (then `dedup_bytes == size_bytes`; `freeable_min_bytes` can
+  remain `null` where sharing cannot be ruled out, including Windows), `"off"` without `--clones`. `accounting.caveats` lists what is
   not considered, e.g. APFS snapshots: freed space may appear only after Time
   Machine local snapshots expire.
 
@@ -120,7 +154,7 @@ per folder.
 
 `dutype --mcp` is an MCP server on stdio with two read-only tools,
 `disk_usage(path, top?, cross_fs?, refresh?, clones?, size_mode?, private?)` and
-`find_by_category(path, category, top?, cross_fs?, refresh?, clones?, size_mode?, private?, paginate?, cursor?)`,
+`find_by_category(path, category, top?, cross_fs?, refresh?, clones?, size_mode?, private?, include_files?, paginate?, cursor?)`,
 with the same fields as `--json`. `size_mode` is `"du"` (default) or `"dedup"`
 (implies `clones: true`); `private: true` adds `private_bytes` (implies
 `clones: true`).
@@ -133,7 +167,8 @@ Claude Code: `claude mcp add dutype -- npx -y dutype --mcp`.
 For category inventories beyond 500 matches, use `dutype --mcp --cache` without
 server-wide `--refresh`. Start with `paginate: true`; follow
 `pagination.next_cursor`, repeating the returned absolute `path`, category and
-effective options. `top` remains 1–500 (default 50) and may change between pages.
+effective options, including `include_files` (changing it rejects the cursor,
+even for pure categories). `top` remains 1–500 (default 50) and may change between pages.
 Cursor presence implies pagination; never combine it with `refresh: true` or
 `paginate: false`. Stop on `pagination.has_more: false` / `next_cursor: null`,
 not `items_truncated`, which still compares all matches to this page's length.

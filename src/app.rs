@@ -867,13 +867,27 @@ fn walk_popup(
 /// Re-sort the dirs whose order can depend on the size mode: those with
 /// clones below (elsewhere the deduplicated size equals the size).
 fn sort_tree(node: &mut Node, by_dedup: bool) {
-    let Some(d) = node.dir.as_mut() else { return };
     if !node.clone {
         return;
     }
+    let Some(d) = node.dir.as_mut() else { return };
     d.sort_children(by_dedup);
-    for c in d.children.iter_mut() {
-        sort_tree(c, by_dedup);
+    // Keep one remaining-siblings iterator per ancestor, not one pending
+    // entry per child. Deep clone trees use O(depth) heap state instead of
+    // recursive stack frames, while wide directories need only one frame.
+    let mut stack = vec![d.children.iter_mut()];
+    while let Some(children) = stack.last_mut() {
+        let Some(child) = children.next() else {
+            stack.pop();
+            continue;
+        };
+        if !child.clone {
+            continue;
+        }
+        if let Some(d) = child.dir.as_mut() {
+            d.sort_children(by_dedup);
+            stack.push(d.children.iter_mut());
+        }
     }
 }
 
@@ -1116,6 +1130,303 @@ mod tests {
         // Exercise collection directly: repeated test opens must never dispatch
         // Enter to an existing popup's external reveal action.
         app.open_popup();
+    }
+
+    // Original implementation, kept only as a bounded differential oracle.
+    // It runs on the ordinary test thread, never the 128 KiB regression worker.
+    fn recursive_sort_tree(node: &mut Node, by_dedup: bool) {
+        let Some(d) = node.dir.as_mut() else { return };
+        if !node.clone {
+            return;
+        }
+        d.sort_children(by_dedup);
+        for child in &mut d.children {
+            recursive_sort_tree(child, by_dedup);
+        }
+    }
+
+    fn assert_same_sort_snapshot(actual: &Node, expected: &Node) {
+        let mut pending = vec![(actual, expected)];
+        while let Some((a, b)) = pending.pop() {
+            assert_eq!(
+                (&a.name, a.size, a.cat, a.special, a.hardlink, a.lossy, a.clone),
+                (&b.name, b.size, b.cat, b.special, b.hardlink, b.lossy, b.clone)
+            );
+            assert_eq!((a.dedup(), a.freeable()), (b.dedup(), b.freeable()));
+            match (&a.dir, &b.dir) {
+                (None, None) => {}
+                (Some(a), Some(b)) => {
+                    assert_eq!(
+                        (&a.cats, a.files, a.errors, a.free_base),
+                        (&b.cats, b.files, b.errors, b.free_base)
+                    );
+                    match (&a.clones, &b.clones) {
+                        (None, None) => {}
+                        (Some(a), Some(b)) => {
+                            assert_eq!((a.group_free, a.dup, a.gaps), (b.group_free, b.dup, b.gaps));
+                            // Includes all shared-index, inode, clone and reflink fields.
+                            assert_eq!(a.shared, b.shared);
+                        }
+                        _ => panic!("clone bookkeeping presence changed"),
+                    }
+                    assert_eq!(a.children.len(), b.children.len());
+                    for i in 0..a.children.len() {
+                        assert_eq!(a.child_dedup(i), b.child_dedup(i));
+                        assert_eq!(a.child_freeable(i), b.child_freeable(i));
+                        pending.push((&a.children[i], &b.children[i]));
+                    }
+                }
+                _ => panic!("directory presence changed"),
+            }
+        }
+    }
+
+    fn sort_snapshot_fixture() -> Node {
+        use crate::scan::{CloneInfo, Reflink, Shared};
+
+        let mut duplicate = jump_file("duplicate.pdf", 8192);
+        duplicate.clone = true;
+        let mut partial = jump_file("partial.pdf", 8192);
+        partial.clone = true;
+        let mut representative = jump_file("representative.pdf", 8192);
+        representative.clone = true;
+        representative.hardlink = true;
+        let mut empty = jump_dir("empty", vec![]);
+        empty.clone = true;
+        let mut same_name = jump_file("tie.pdf", 4096);
+        same_name.lossy = true;
+        let mut node = jump_dir(
+            "mixed",
+            vec![
+                duplicate,
+                partial,
+                representative,
+                jump_file("z-zero", 0),
+                jump_file("a-zero", 0),
+                jump_file("tie.pdf", 4096),
+                same_name,
+                // Intentionally unsorted: a non-clone subtree must be pruned.
+                jump_dir("plain", vec![jump_file("z.txt", 1), jump_file("a.txt", 2)]),
+                empty,
+            ],
+        );
+        node.special = true;
+        node.hardlink = true;
+        let dir = node.dir.as_mut().unwrap();
+        dir.errors = 3;
+        dir.free_base = 17;
+        dir.clones = Some(Box::new(CloneInfo {
+            group_free: 29,
+            dup: 12288,
+            gaps: 5,
+            shared: (0..3)
+                .map(|idx| Shared {
+                    idx,
+                    key: (7, 11 + u64::from(idx)),
+                    is_clone: true,
+                    ino: 23 + u64::from(idx),
+                    nlink: if idx == 2 { 2 } else { 1 },
+                    refcnt: 2,
+                    dup: idx == 0,
+                    reflink: (idx == 1).then(|| {
+                        Box::new(Reflink {
+                            extents: vec![(1024, 4096), (8192, 1024)].into_boxed_slice(),
+                            dup: 4096,
+                            opaque: false,
+                        })
+                    }),
+                })
+                .collect(),
+        }));
+        node
+    }
+
+    fn check_sort_against_recursive(mut actual: Node, mut expected: Node) {
+        for by_dedup in [false, true, true, false, false, true] {
+            sort_tree(&mut actual, by_dedup);
+            recursive_sort_tree(&mut expected, by_dedup);
+            assert_same_sort_snapshot(&actual, &expected);
+        }
+    }
+
+    #[test]
+    fn size_mode_sort_matches_recursive_snapshot_state() {
+        check_sort_against_recursive(sort_snapshot_fixture(), sort_snapshot_fixture());
+        let siblings = || jump_dir("root", (0..16).map(|_| sort_snapshot_fixture()).collect());
+        check_sort_against_recursive(siblings(), siblings());
+        let non_clone = || jump_dir("plain", vec![jump_file("z.txt", 1), jump_file("a.txt", 2)]);
+        check_sort_against_recursive(non_clone(), non_clone());
+        check_sort_against_recursive(jump_file("file.pdf", 0), jump_file("file.pdf", 0));
+        let clone_file = || {
+            let mut file = jump_file("clone.pdf", 0);
+            file.clone = true;
+            file
+        };
+        check_sort_against_recursive(clone_file(), clone_file());
+    }
+
+    #[test]
+    fn size_mode_sort_matches_recursive_deep_and_wide_snapshots() {
+        let deep = || {
+            let mut node = sort_snapshot_fixture();
+            // The mixed fixture already has two directory levels.
+            for _ in 2..1000 {
+                node = jump_dir("d", vec![node]);
+                node.dir.as_mut().unwrap().clones_mut().dup = 12288;
+            }
+            node
+        };
+        check_sort_against_recursive(deep(), deep());
+        let wide = || jump_dir("wide", (0..1000).map(|_| sort_snapshot_fixture()).collect());
+        check_sort_against_recursive(wide(), wide());
+    }
+
+    fn check_deep_tui_snapshot(depth: usize, stack_bytes: Option<usize>) {
+        use crate::scan::{CloneInfo, Shared};
+
+        let mut shared = jump_file("deep.pdf", 8192);
+        shared.clone = true;
+        let special_cat = reg().find_by_name("node_modules").unwrap();
+        let special = |children| {
+            let mut node = jump_dir("node_modules", children);
+            node.special = true;
+            node.cat = special_cat;
+            node
+        };
+        let mut branch = jump_dir(
+            "d",
+            vec![shared, jump_file("plain.pdf", 4096), special(vec![special(vec![])])],
+        );
+        branch.dir.as_mut().unwrap().clones = Some(Box::new(CloneInfo {
+            dup: 8192,
+            shared: vec![Shared {
+                idx: 0,
+                key: (1, 1),
+                is_clone: true,
+                ino: 1,
+                nlink: 1,
+                refcnt: 2,
+                dup: true,
+                reflink: None,
+            }]
+            .into_boxed_slice(),
+            ..CloneInfo::default()
+        }));
+        for _ in 1..depth {
+            branch = jump_dir("d", vec![branch]);
+            branch.dir.as_mut().unwrap().clones_mut().dup = 8192;
+        }
+        // The shared file's representative is elsewhere in the snapshot.
+        // This shape changes both root order and deepest-child order in dedup
+        // mode, rather than merely visiting a single-child chain.
+        let mut representative = jump_file("sibling.pdf", 8192);
+        representative.clone = true;
+        let mut root = jump_dir("root", vec![branch, representative]);
+        root.dir.as_mut().unwrap().clones = Some(Box::new(CloneInfo {
+            dup: 8192,
+            shared: vec![Shared {
+                idx: 1,
+                key: (1, 1),
+                is_clone: true,
+                ino: 2,
+                nlink: 1,
+                refcnt: 2,
+                dup: false,
+                reflink: None,
+            }]
+            .into_boxed_slice(),
+            ..CloneInfo::default()
+        }));
+        let builder = std::thread::Builder::new();
+        let builder = match stack_bytes {
+            Some(bytes) => builder.stack_size(bytes),
+            None => builder,
+        };
+        builder
+            .spawn(move || {
+                let mut app = jump_app(root);
+                app.mode = Mode::Extension;
+                app.refresh_breakdown();
+                assert_eq!(app.breakdown.len(), 1);
+                assert_eq!(app.breakdown[0].count, Some(3));
+                assert_eq!(app.breakdown[0].size, 20480);
+                // Location restoration need not repeatedly aggregate the
+                // extension of every ancestor while testing sort identity.
+                app.mode = Mode::Category;
+                app.set_size_mode(SizeMode::Dedup);
+                assert_eq!(app.root.children()[0].name.as_ref(), "sibling.pdf");
+                assert_eq!((app.root.size, app.root.dedup(), app.root.files()), (20480, 12288, 3));
+
+                assert_eq!(app.root.dir.as_ref().unwrap().shared()[0].idx, 0);
+                rank_popup(&mut app, Key::Cat(special_cat));
+                let popup = app.popup.as_ref().unwrap();
+                assert_eq!(popup.items.len(), 1, "the nested matching directory is pruned");
+                assert_eq!(popup.items[0].target.len(), depth + 1);
+                assert_eq!(popup.items[0].target[depth], 2);
+
+                for key in [Key::Cat(reg().classify_file("deep.pdf")), Key::Ext("pdf".into())] {
+                    rank_popup(&mut app, key);
+                    let popup = app.popup.as_mut().unwrap();
+                    assert_eq!(
+                        popup.items.iter().map(|item| item.size).collect::<Vec<_>>(),
+                        [8192, 4096, 0]
+                    );
+                    let target = &popup.items[2].target;
+                    assert_eq!(target.len(), depth + 1);
+                    assert_eq!((target[0], target[depth]), (1, 1));
+                    assert!(target[1..depth].iter().all(|&i| i == 0));
+                    assert!(popup.items[2].path.ends_with("deep.pdf"));
+                }
+                app.popup.as_mut().unwrap().state.select(Some(2));
+                app.jump_to_result();
+                assert_eq!(app.stack.len(), depth);
+                assert_eq!(app.states.len(), depth + 1);
+                assert_eq!(
+                    app.current().children()[app.selected_entry().unwrap()].name.as_ref(),
+                    "deep.pdf"
+                );
+                assert_eq!(app.current().dir.as_ref().unwrap().shared()[0].idx, 1);
+
+                // Sorting preserves the location and selected identity while
+                // remapping the shared record back to its original file.
+                app.set_size_mode(SizeMode::Du);
+                assert_eq!(app.stack[0], 0);
+                assert_eq!(app.root.dir.as_ref().unwrap().shared()[0].idx, 1);
+                assert_eq!(app.selected_entry(), Some(0));
+                assert_eq!(app.current().children()[0].name.as_ref(), "deep.pdf");
+                assert_eq!(app.current().dir.as_ref().unwrap().shared()[0].idx, 0);
+                app.set_size_mode(SizeMode::Dedup);
+                assert_eq!(app.stack[0], 1);
+                assert_eq!(app.selected_entry(), Some(1));
+                app.in_du_order(|root| assert_eq!(root.children()[0].name.as_ref(), "d"));
+                assert_eq!(app.stack.len(), depth);
+                assert_eq!(app.stack[0], 1);
+                assert_eq!(app.selected_entry(), Some(1));
+                assert_eq!(app.current().dir.as_ref().unwrap().shared()[0].idx, 1);
+                assert_eq!((app.root.size, app.root.dedup(), app.root.files()), (20480, 12288, 3));
+                // Drop on the same selected stack as all traversal operations.
+                drop(app);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn deep_popup_jump_and_size_modes_preserve_snapshot_on_small_stack() {
+        check_deep_tui_snapshot(1000, Some(128 * 1024));
+    }
+
+    #[test]
+    fn shallow_popup_jump_and_size_modes_preserve_snapshot_on_small_stack() {
+        check_deep_tui_snapshot(32, Some(128 * 1024));
+    }
+
+    #[test]
+    fn deep_popup_jump_and_size_modes_preserve_snapshot_on_default_stack() {
+        // Leave Builder::stack_size unset; this is a default Rust worker,
+        // not a claim about the process main thread or the production TUI.
+        check_deep_tui_snapshot(1000, None);
     }
 
     #[test]
