@@ -117,7 +117,11 @@ fn apportion(cats: &[u64], len: usize) -> Vec<(Category, usize)> {
 /// proportional to the category sizes, on a dim track.
 fn stacked_bar(cats: &[u64], size: u64, max: u64, width: u16, glyph: &str) -> Line<'static> {
     let len = (ratio(size, max) * width as f64).round() as usize;
-    let len = if size > 0 { len.clamp(1, width as usize) } else { 0 };
+    let len = if size > 0 && width > 0 {
+        len.clamp(1, width as usize)
+    } else {
+        0
+    };
     let mut spans: Vec<Span> = apportion(cats, len)
         .into_iter()
         .map(|(c, n)| Span::styled(glyph.repeat(n), Style::new().fg(c.color())))
@@ -205,7 +209,13 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_details(f, app, details);
 
     let keys: &[(&str, &str)] = if app.popup.is_some() {
-        &[("↑↓", "move"), ("⏎ o", "reveal"), ("y", "copy path"), ("esc", "close")]
+        &[
+            ("s", "jump in TUI"),
+            ("esc", "close"),
+            ("↑↓", "move"),
+            ("⏎ o", "reveal"),
+            ("y", "copy path"),
+        ]
     } else {
         &[
             ("↑↓", "move"),
@@ -666,9 +676,10 @@ fn draw_popup(f: &mut Frame, app: &mut App) {
         .areas(area);
     f.render_widget(Clear, area);
 
-    let total: u64 = popup.items.iter().map(|i| i.1).sum();
-    let max = popup.items.first().map_or(1, |i| i.1);
-    let rows = popup.items.iter().enumerate().map(|(i, (p, s, _))| {
+    let total: u64 = popup.items.iter().map(|i| i.size).sum();
+    let max = popup.items.first().map_or(1, |i| i.size);
+    let rows = popup.items.iter().enumerate().map(|(i, item)| {
+        let (p, s) = (&item.path, item.size);
         let parent = p.parent().map(|d| d.display().to_string()).filter(|d| !d.is_empty());
         let name = p
             .file_name()
@@ -681,8 +692,8 @@ fn draw_popup(f: &mut Frame, app: &mut App) {
         path.push(Span::styled(name, Style::new().fg(TEXT).bold()));
         Row::new(vec![
             Cell::from(Line::from(Span::styled(format!("{}", i + 1), Style::new().fg(DIM))).right_aligned()),
-            Cell::from(Line::from(Span::styled(human(*s), size_style(*s))).right_aligned()),
-            Cell::from(Span::styled(smooth_bar(ratio(*s, max), 12), Style::new().fg(ACCENT))),
+            Cell::from(Line::from(Span::styled(human(s), size_style(s))).right_aligned()),
+            Cell::from(Span::styled(smooth_bar(ratio(s, max), 12), Style::new().fg(ACCENT))),
             Cell::from(Line::from(path)),
         ])
     });
@@ -702,10 +713,11 @@ fn draw_popup(f: &mut Frame, app: &mut App) {
             .right_aligned(),
         )
         .title_bottom(keycaps(&[
+            ("s", "jump in TUI"),
+            ("esc", "close"),
             ("↑↓", "move"),
             ("⏎ o", "reveal"),
             ("y", "copy"),
-            ("esc", "close"),
         ]))
         .padding(Padding::new(1, 1, 1, 0));
     let table = Table::new(
