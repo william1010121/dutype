@@ -148,6 +148,8 @@ you and is set to mode 0700, snapshots to 0600. `--json` reports `cached_at`
 | `R` | rescan everything from the root |
 | `q` | quit |
 
+Extension breakdown rows use allocated size descending, then display label ascending for ties. This keeps equal-size rows and the top-60 cutoff stable across refreshes and mode switches.
+
 <details>
 <summary>All options</summary>
 

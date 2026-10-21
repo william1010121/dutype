@@ -884,7 +884,9 @@ fn ext_breakdown(cur: &Node) -> Vec<BreakdownItem> {
             count: Some(count),
         })
         .collect();
-    items.sort_by_key(|i| std::cmp::Reverse(i.size));
+    // HashMap iteration is arbitrary; equal-size rows and the top-60 cutoff
+    // must use the same stable display-label order on every refresh.
+    items.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.label.cmp(&b.label)));
     items.truncate(EXT_LIMIT);
     items
 }
@@ -1436,6 +1438,85 @@ mod tests {
         }
         assert!(app.rescan.is_none());
         assert!(!app.quit);
+    }
+
+    #[test]
+    fn extension_ties_cover_zero_unicode_counts_and_cutoff() {
+        let root = jump_dir(
+            "root",
+            vec![
+                jump_file("a", 0),
+                jump_file("a.ZIP", 0),
+                jump_file("b.zip", 0),
+                jump_file("a.é", 0),
+                jump_file("a.中", 0),
+                jump_file("large.rs", 1),
+            ],
+        );
+        let rows = ext_breakdown(&root);
+        assert_eq!(
+            rows.iter().map(|i| i.label.as_str()).collect::<Vec<_>>(),
+            [".rs", "(none)", ".zip", ".é", ".中"]
+        );
+        assert_eq!(rows.iter().find(|i| i.label == ".zip").unwrap().count, Some(2));
+        for count in [59, 60, 61] {
+            let root = jump_dir(
+                "root",
+                (0..count).rev().map(|i| jump_file(&format!("f.e{i:02}"), 0)).collect(),
+            );
+            let expected: Vec<_> = (0..count.min(EXT_LIMIT)).map(|i| format!(".e{i:02}")).collect();
+            for _ in 0..16 {
+                assert_eq!(
+                    ext_breakdown(&root).into_iter().map(|i| i.label).collect::<Vec<_>>(),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn extension_ties_are_alphabetical_across_refreshes() {
+        let mut app = jump_app(jump_dir(
+            "root",
+            vec![
+                jump_file("x.zip", 4096),
+                jump_file("x.pdf", 4096),
+                jump_file("x.mp4", 4096),
+                jump_file("x.rs", 4096),
+            ],
+        ));
+        app.clones = true;
+        app.root.clone = true;
+        app.root.dir.as_mut().unwrap().children[0].clone = true;
+        let clones = app.root.dir.as_mut().unwrap().clones_mut();
+        clones.dup = 4096;
+        clones.shared = vec![crate::scan::Shared {
+            idx: 0,
+            key: (1, 1),
+            is_clone: true,
+            ino: 1,
+            nlink: 1,
+            refcnt: 1,
+            dup: true,
+            reflink: None,
+        }]
+        .into_boxed_slice();
+        for _ in 0..32 {
+            app.mode = Mode::Extension;
+            app.refresh_breakdown();
+            let labels: Vec<_> = app.breakdown.iter().map(|i| i.label.as_str()).collect();
+            assert_eq!(labels, [".mp4", ".pdf", ".rs", ".zip"]);
+            press(&mut app, KeyCode::Char('m'));
+            press(&mut app, KeyCode::Char('m'));
+            let before = app.size_mode;
+            press(&mut app, KeyCode::Char('c'));
+            assert_ne!(app.size_mode, before);
+            assert_eq!(
+                app.shown_total(&app.root),
+                if app.size_mode == SizeMode::Du { 16384 } else { 12288 }
+            );
+            assert!(app.breakdown.iter().all(|item| item.size == 4096));
+        }
     }
 
     #[test]
