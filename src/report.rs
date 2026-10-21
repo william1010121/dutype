@@ -2,6 +2,7 @@
 //! meant for scripts and LLM agents.
 
 use crate::category::{Category, by_size, dominant};
+use crate::display;
 use crate::scan::{Node, PrivateSizes, ReflinkFs, TopN};
 use crate::ui::human;
 use serde::Serialize;
@@ -466,7 +467,10 @@ pub fn to_text(r: &Report, root: &Node) -> String {
     let _ = writeln!(
         out,
         "{}  —  {}  ·  {} files  ·  {:.2}s",
-        r.path, r.size, r.files, r.scan_seconds
+        display::path_text(&r.path),
+        r.size,
+        r.files,
+        r.scan_seconds
     );
     if r.clone_shared_bytes > 0 {
         let frees = r.freeable_min_bytes.map(human).unwrap_or_else(|| "?".into());
@@ -500,7 +504,7 @@ pub fn to_text(r: &Report, root: &Node) -> String {
             "  {:>10}  {:<14} {}{}",
             shown(c.size_bytes, c.dedup_bytes),
             dominant(&node.cats()).label(),
-            c.name,
+            display::name(&c.name),
             suffix
         );
     }
@@ -508,7 +512,13 @@ pub fn to_text(r: &Report, root: &Node) -> String {
         let _ = writeln!(out, "\nLargest special directories:");
         for e in &r.special_dirs {
             let size = shown(e.size_bytes, e.dedup_bytes);
-            let _ = writeln!(out, "  {:>10}  {:<14} {}", size, e.category, e.path);
+            let _ = writeln!(
+                out,
+                "  {:>10}  {:<14} {}",
+                size,
+                e.category,
+                display::path_text(&e.path)
+            );
         }
     }
     let _ = writeln!(
@@ -525,7 +535,14 @@ pub fn to_text(r: &Report, root: &Node) -> String {
         let private = e
             .private_bytes
             .map_or(String::new(), |p| format!("  (private {})", human(p)));
-        let _ = writeln!(out, "  {:>10}  {:<14} {}{}", size, e.category, e.path, private);
+        let _ = writeln!(
+            out,
+            "  {:>10}  {:<14} {}{}",
+            size,
+            e.category,
+            display::path_text(&e.path),
+            private
+        );
     }
     out
 }
@@ -876,7 +893,13 @@ pub fn find_to_text(cat: Category, found: &CategoryMatches, meta: &Meta) -> Stri
         let private = e
             .private_bytes
             .map_or(String::new(), |p| format!("  (private {})", human(p)));
-        let _ = writeln!(out, "  {:>10}  {}{}", human(size(e)), e.path, private);
+        let _ = writeln!(
+            out,
+            "  {:>10}  {}{}",
+            human(size(e)),
+            display::path_text(&e.path),
+            private
+        );
     }
     out
 }
@@ -1842,5 +1865,56 @@ mod tests {
             },
         );
         assert_eq!(warned, format!("(2 entries unreadable)\n{dedup}"));
+    }
+    #[test]
+    fn human_reports_escape_paths_without_changing_json_payloads() {
+        let pdf = reg().classify_file("a.pdf");
+        let special = reg().classify_file("a.txt");
+        let names = [
+            "a\nb.pdf",
+            "a\\nb.pdf",
+            "ab.pdf",
+            "a\tb.pdf",
+            "a\rb.pdf",
+            "a\x1bb.pdf",
+            "a\u{0085}b.pdf",
+            "a\u{202e}b.pdf",
+            "a\u{2028}b.pdf",
+            "-leading.pdf",
+            "résumé-👩\u{200d}💻.pdf",
+        ];
+        let children = names
+            .iter()
+            .map(|name| file(name, 4096, pdf))
+            .chain([directory("special\n", special, true, vec![])])
+            .collect();
+        let root = directory("root\n", reg().other(), false, children);
+        let path = Path::new("/root\n");
+        let meta = plain_meta();
+        let report = build(&root, path, &meta, 100);
+        let before = serde_json::to_vec(&report).unwrap();
+        let text = to_text(&report, &root);
+        assert!(text.starts_with("/root\\n  —"));
+        assert!(text.contains("a\\nb.pdf"));
+        assert!(text.contains("a\\\\nb.pdf"));
+        assert!(text.contains("a\\x1bb.pdf"));
+        assert!(text.contains("a\\u{0085}b.pdf"));
+        assert!(text.contains("a\\u{202e}b.pdf"));
+        assert!(text.contains("a\\u{2028}b.pdf"));
+        assert!(text.contains("special\\n/"));
+        assert!(text.contains(display::path(&path.join("special\n")).as_ref()));
+        assert!(text.contains("résumé-👩\u{200d}💻.pdf"));
+        assert!(!text.chars().any(|c| c.is_control() && c != '\n'));
+        assert_eq!(serde_json::to_vec(&report).unwrap(), before);
+        assert_eq!(report.path, "/root\n");
+        for name in names {
+            assert!(report.children.iter().any(|child| child.name == name));
+        }
+        let found = find(&root, path, pdf, 100, SizeMode::Du, true, None);
+        let before = serde_json::to_vec(&found.items).unwrap();
+        let text = find_to_text(pdf, &found, &meta);
+        assert_eq!(text.lines().count(), names.len() + 1);
+        assert!(text.contains(display::path(&path.join("a\nb.pdf")).as_ref()));
+        assert_eq!(serde_json::to_vec(&found.items).unwrap(), before);
     }
 }

@@ -63,7 +63,7 @@ summary.csv retains all measured medians rather than selecting favorable cases.
 
 The 2,880 full-UI differential cases compare every styled buffer cell and global
 TableState field, including tiny/empty views, stale or maximum offsets/selection,
-column selection, no selection, Unicode/newline/long labels, all-zero sizes,
+column selection, no selection, Unicode/long labels, all-zero sizes,
 navigation and resizing. Durable production tests additionally compare full
 ratatui tables with placeholder tables.
 
@@ -78,3 +78,8 @@ The local evidence bundle retains raw numeric samples, full PTY transcripts,
 source and binary hashes, and allocator/differential logs outside the repository.
 No generated fixture, executable, target directory, reference-source copy, or
 terminal transcript belongs in a published patch.
+
+Since filename display escaping was added, this parity corpus uses ordinary
+multi-line/tab-name spellings rather than actual newline/tab controls. Intentional
+control-name differences and ordinary full-buffer parity are covered separately
+by `../filename-display/run.sh verify`. The historical results above are unchanged.

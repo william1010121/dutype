@@ -13,7 +13,7 @@ python3 - "$work" <<'PY'
 from pathlib import Path
 import sys
 root=Path(sys.argv[1]);s=(root/'src/ui.rs').read_text()
-for signature,counter in [("fn entry_name(c: &Node) -> Line<'static> {",'ENTRY_CALLS'),('fn apportion(cats: &[u64], len: usize) -> Vec<(Category, usize)> {','APPORTION_CALLS')]:
+for signature,counter in [("fn entry_name(c: &Node) -> Line<'_> {",'ENTRY_CALLS'),('fn apportion(cats: &[u64], len: usize) -> Vec<(Category, usize)> {','APPORTION_CALLS')]:
     assert s.count(signature)==1, f'Expected one instrumentation point: {signature}'
     s=s.replace(signature,signature+f'\n    crate::{counter}.fetch_add(1, std::sync::atomic::Ordering::Relaxed);')
 (root/'bench/shallow-redraw/ui_probe.rs').write_text(s)

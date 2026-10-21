@@ -2,6 +2,7 @@ mod account;
 mod app;
 mod cache;
 mod category;
+mod display;
 mod mcp;
 mod report;
 mod scan;
@@ -140,7 +141,7 @@ fn run(args: Args) -> Result<(), String> {
         return Err("--category needs --report or --json".into());
     }
 
-    let path = std::fs::canonicalize(&args.path).map_err(|e| format!("{}: {e}", args.path.display()))?;
+    let path = std::fs::canonicalize(&args.path).map_err(|e| format!("{}: {e}", display::path(&args.path)))?;
     // After validating the target (so an invalid path is never created as a
     // side effect) and before any scan (see cache::prepare).
     if use_cache && let Err(e) = cache::prepare() {
@@ -167,8 +168,8 @@ fn run(args: Args) -> Result<(), String> {
                 };
                 let started = Instant::now();
                 let root_dev = scan::device_of(&path).ok();
-                let root =
-                    scan::scan(&path, one_fs, clones, &progress).map_err(|e| format!("{}: {e}", path.display()))?;
+                let root = scan::scan(&path, one_fs, clones, &progress)
+                    .map_err(|e| format!("{}: {e}", display::path(&path)))?;
                 let snap = Snapshot {
                     root,
                     cached_at: None,
@@ -403,7 +404,7 @@ fn scan_with_progress<T: Send + 'static>(
     let root = handle
         .join()
         .expect("scan thread panicked")
-        .map_err(|e| format!("{}: {e}", path.display()))?;
+        .map_err(|e| format!("{}: {e}", display::path(path)))?;
     Ok(Some((
         root,
         started.elapsed(),

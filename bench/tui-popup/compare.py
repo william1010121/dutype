@@ -90,7 +90,10 @@ def build(args):
             'cargo_lock_sha256': sha(source / 'Cargo.lock'),
             'copied_module_hashes': production,
         }
-        shutil.copy2(HERE / 'main.rs', target / 'src/main.rs')
+        harness = (HERE / 'main.rs').read_text()
+        if (target / 'src/display.rs').exists():
+            harness = harness.replace('mod category;', 'mod category;\nmod display;')
+        (target / 'src/main.rs').write_text(harness)
         (target / 'src/bench_variant.txt').write_text(variant)
         (target / 'src/bench_expectation.txt').write_text(expectation)
         (target / 'src/bench_app_sha256.txt').write_text(metadata['variants'][variant]['app_rs_sha256'])
