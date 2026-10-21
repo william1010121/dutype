@@ -137,8 +137,8 @@ pub fn accounting(meta: &Meta) -> Accounting {
     }
     Accounting {
         size: "du-allocated",
-        measurement_basis: if cfg!(unix) { "allocated" } else { "logical" },
-        hardlink_deduplication: if cfg!(unix) { "count-once" } else { "unsupported" },
+        measurement_basis: crate::scan::MEASUREMENT_BASIS,
+        hardlink_deduplication: crate::scan::HARDLINK_DEDUPLICATION,
         size_mode: meta.size_mode,
         clone_detection: match (meta.clones, meta.reflink_fs, meta.clone_ids, meta.clone_gaps) {
             (false, ..) => "off",
