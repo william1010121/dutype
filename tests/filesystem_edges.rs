@@ -977,7 +977,22 @@ fn mixed_inventory_preserves_hardlink_accounting() {
         let mixed = fixture.category_report_with_top("Unity", 100, &["--include-files", "--size-mode", mode]);
         let items = mixed["items"].as_array().unwrap();
         assert_eq!(mixed["matched_items"], 2);
+        assert_eq!(items.len(), 2);
+        assert_eq!(mixed["items_truncated"], false);
+        let mut paths = relative_items(&mixed);
+        paths.sort();
+        assert_eq!(paths, ["a.unitypackage", "z.unitypackage"].map(PathBuf::from));
+        // Unix identifies hard-linked inodes and attributes their bytes once.
+        #[cfg(unix)]
         assert_eq!(items.iter().filter(|i| i["size_bytes"] == 0).count(), 1);
+        // The non-Unix scanner currently uses file lengths without hardlink
+        // identities. Preserve that accounting instead of requiring Unix dedup.
+        #[cfg(not(unix))]
+        for item in items {
+            assert_eq!(item["size_bytes"], 8192);
+            assert_eq!(item["dedup_bytes"], 8192);
+            assert!(item["freeable_min_bytes"].is_null());
+        }
         let full: Value = serde_json::from_str(&fixture.output("--json", &["--size-mode", mode])).unwrap();
         assert_eq!(mixed["items"], full["largest_files"]);
         assert_eq!(mixed["accounting"], full["accounting"]);
