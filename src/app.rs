@@ -2530,13 +2530,18 @@ mod tests {
         }
         TEST_CLIPBOARD.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
         let _capture = Capture;
-        for name in [
+        let names = [
             "a\nb.pdf",
+            // A literal backslash is a filename character only off Windows.
+            // Pure render-boundary tests cover its encoding on every platform.
+            #[cfg(not(windows))]
             "a\\nb.pdf",
             "a\u{202e}b.pdf",
             "résumé-日本語.pdf",
             "-leading.pdf",
-        ] {
+        ];
+        for name in names {
+            assert_eq!(Path::new(name).components().count(), 1, "fixture name {name:?}");
             let mut app = jump_app(jump_dir("root", vec![jump_file(name, 4096)]));
             let original_path = app.root_path.join(name);
             press(&mut app, KeyCode::Char('y'));
@@ -2562,6 +2567,9 @@ mod tests {
             assert_eq!(app.selected_entry(), Some(0));
             assert_eq!(&*app.current().children()[0].name, name);
         }
-        assert_eq!(TEST_CLIPBOARD.with(|slot| slot.borrow().as_ref().unwrap().len()), 10);
+        assert_eq!(
+            TEST_CLIPBOARD.with(|slot| slot.borrow().as_ref().unwrap().len()),
+            names.len() * 2
+        );
     }
 }

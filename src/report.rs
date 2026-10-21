@@ -1872,6 +1872,9 @@ mod tests {
         let special = reg().classify_file("a.txt");
         let names = [
             "a\nb.pdf",
+            // Backslash is a separator on Windows, never part of one scanned
+            // node name. Keep traversal fixtures within that native invariant.
+            #[cfg(not(windows))]
             "a\\nb.pdf",
             "ab.pdf",
             "a\tb.pdf",
@@ -1883,6 +1886,9 @@ mod tests {
             "-leading.pdf",
             "résumé-👩\u{200d}💻.pdf",
         ];
+        for name in names {
+            assert_eq!(Path::new(name).components().count(), 1, "fixture name {name:?}");
+        }
         let children = names
             .iter()
             .map(|name| file(name, 4096, pdf))
@@ -1896,6 +1902,7 @@ mod tests {
         let text = to_text(&report, &root);
         assert!(text.starts_with("/root\\n  —"));
         assert!(text.contains("a\\nb.pdf"));
+        #[cfg(not(windows))]
         assert!(text.contains("a\\\\nb.pdf"));
         assert!(text.contains("a\\x1bb.pdf"));
         assert!(text.contains("a\\u{0085}b.pdf"));
@@ -1916,5 +1923,31 @@ mod tests {
         assert_eq!(text.lines().count(), names.len() + 1);
         assert!(text.contains(display::path(&path.join("a\nb.pdf")).as_ref()));
         assert_eq!(serde_json::to_vec(&found.items).unwrap(), before);
+    }
+    #[test]
+    fn report_component_collision_encoding_does_not_depend_on_native_path_parsing() {
+        let pdf = reg().classify_file("a.pdf");
+        let root = directory(
+            "root",
+            reg().other(),
+            false,
+            vec![file("a\nb.pdf", 4096, pdf), file("placeholder.pdf", 4096, pdf)],
+        );
+        let mut report = build(&root, Path::new("root"), &plain_meta(), 100);
+        // Test the raw report-name rendering boundary on every platform without
+        // pushing an impossible Windows backslash component through a tree walk.
+        report
+            .children
+            .iter_mut()
+            .find(|child| child.name == "placeholder.pdf")
+            .unwrap()
+            .name = "a\\nb.pdf".into();
+        let before = serde_json::to_vec(&report).unwrap();
+        let text = to_text(&report, &root);
+        assert!(text.contains("a\\nb.pdf"));
+        assert!(text.contains("a\\\\nb.pdf"));
+        assert_eq!(serde_json::to_vec(&report).unwrap(), before);
+        assert!(report.children.iter().any(|child| child.name == "a\nb.pdf"));
+        assert!(report.children.iter().any(|child| child.name == "a\\nb.pdf"));
     }
 }

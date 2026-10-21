@@ -25,6 +25,8 @@ impl Fixture {
         fs::create_dir(&base).unwrap();
         let root = base.join(root);
         fs::create_dir(&root).unwrap();
+        // CLI/MCP paths are canonical, including macOS /var -> /private/var.
+        let root = fs::canonicalize(root).unwrap();
         let config = base.join("config.toml");
         fs::write(&config, "").unwrap();
         Self { base, root, config }
@@ -161,12 +163,38 @@ fn leading_dash_paths_and_human_error_prefixes_keep_their_roles() {
     assert_eq!(output.stderr.iter().filter(|&&b| b == b'\n').count(), 1);
 }
 
+// Some Unix filesystems (notably APFS) reject invalid UTF-8 filenames. This
+// guard applies only to the first invalid-name creation, never later operations.
+fn invalid_name_fixture_supported(result: std::io::Result<()>) -> std::io::Result<bool> {
+    match result {
+        Ok(()) => Ok(true),
+        Err(error) if error.raw_os_error() == Some(libc::EILSEQ) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+#[test]
+fn invalid_name_fixture_guard_skips_only_eilseq() {
+    assert!(invalid_name_fixture_supported(Ok(())).unwrap());
+    assert!(!invalid_name_fixture_supported(Err(std::io::Error::from_raw_os_error(libc::EILSEQ))).unwrap());
+    for code in [libc::EACCES, libc::ENOENT, libc::ENOSPC, libc::ENAMETOOLONG] {
+        let error = invalid_name_fixture_supported(Err(std::io::Error::from_raw_os_error(code))).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(code));
+    }
+    let error = invalid_name_fixture_supported(Err(std::io::Error::other("fixture failure"))).unwrap_err();
+    assert_eq!(error.to_string(), "fixture failure");
+}
+
 #[test]
 fn existing_non_utf8_display_aliases_are_not_claimed_to_be_unique() {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
     let fixture = Fixture::new("lossy");
-    fs::write(fixture.root.join(OsStr::from_bytes(b"bad\xff\n.txt")), b"a").unwrap();
+    if !invalid_name_fixture_supported(fs::write(fixture.root.join(OsStr::from_bytes(b"bad\xff\n.txt")), b"a")).unwrap()
+    {
+        eprintln!("skipping invalid-name fixture: this filesystem rejects non-UTF-8 names (EILSEQ)");
+        return;
+    }
     fs::write(fixture.root.join("bad\\xff\n.txt"), b"b").unwrap();
     let raw: Value = serde_json::from_slice(&fixture.success(&["--json"])).unwrap();
     assert_eq!(raw["children"].as_array().unwrap().len(), 2);
