@@ -88,6 +88,17 @@ syscalls.
 
 ## Install
 
+**Match the docs to your build.** This README on `main` describes current source;
+npm and release installers below use published binaries (currently
+[v0.1.4](https://github.com/william1010121/dutype/releases/tag/v0.1.4)). For that
+release, use its [tagged README](https://github.com/william1010121/dutype/blob/v0.1.4/README.md)
+and [tagged agent skill](https://github.com/william1010121/dutype/blob/v0.1.4/skills/dutype/SKILL.md)
+directly, not the tagged README’s older skill-download snippet pointing to `main`.
+Newer options such as `--include-files` and MCP pagination need a matching source
+build (the **From source** method below), not merely an installed release. Check
+`dutype --help` and MCP tool schemas: development builds can retain the release
+version string. Update these documentation pins with future releases.
+
 **Run without installing** (needs Node.js 16+; downloads a native binary, nothing runs in Node):
 
 ```bash
@@ -367,7 +378,8 @@ supported. A leading dot in a rule is optional; a dotfile without another dot
 (such as `.bashrc`) has no extension.
 
 For a category combining directory and file rules, the default category query
-still lists matching directories only. To include loose exports as well:
+still lists matching directories only. To include loose exports as well with a
+matching source build (`--include-files` is not in v0.1.4; see [Install](#install)):
 
 ```sh
 dutype --json --category Unity --include-files /projects
