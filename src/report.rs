@@ -99,8 +99,8 @@ pub struct Accounting {
     /// (macOS; btrfs, XFS, bcachefs, OCFS2, ZFS; Linux with `--cross-fs`).
     pub clone_detection: &'static str,
     /// `private_bytes` were collected (`--private`, APFS): on files that may
-    /// share blocks but are not full clones, what deleting the file alone
-    /// frees right now. Never summed into folders.
+    /// share blocks but are not full clones, APFS bytes not retained by clones
+    /// or snapshots at scan time. Never summed into folders.
     pub private: bool,
     pub caveats: Vec<&'static str>,
 }
@@ -211,8 +211,8 @@ pub struct Child {
     /// It is, or holds, a file that may share blocks with others (APFS
     /// clones, shared extents).
     pub clone: bool,
-    /// Files with `--private`: APFS bytes freed immediately if this file
-    /// alone is deleted (affected by APFS snapshots). Only on files that may
+    /// Files with `--private`: scan-time APFS bytes not retained by clones or
+    /// snapshots, released on actual deletion. Only on files that may
     /// share blocks but are not full clones (absent if it could not be read).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub private_bytes: Option<u64>,
@@ -479,7 +479,7 @@ pub fn to_text(r: &Report, root: &Node) -> String {
         let frees = r.freeable_min_bytes.map(human).unwrap_or_else(|| "?".into());
         let _ = writeln!(
             out,
-            "({}: {} counted once is {}; deleting it all frees at least {})",
+            "({}: {} counted once is {}; model freeable lower bound: {})",
             shared_label(r.accounting.clone_detection),
             r.size,
             human(r.dedup_bytes),
@@ -1585,6 +1585,31 @@ mod tests {
             .unwrap()
             .join()
             .unwrap();
+    }
+
+    #[test]
+    fn shared_text_qualifies_freeable_without_changing_machine_values() {
+        let root = directory("root", reg().other(), false, vec![file("sample", 8192, reg().other())]);
+        for (value, shown) in [(Some(4096), "4.0 KiB"), (Some(0), "0 B"), (None, "?")] {
+            let mut report = build(&root, Path::new("root"), &plain_meta(), 20);
+            // A completed synthetic report tests presentation, not real reclamation.
+            report.clone_shared_bytes = 4096;
+            report.dedup_bytes = 4096;
+            report.freeable_min_bytes = value;
+            let before = serde_json::to_value(&report).unwrap();
+            let text = to_text(&report, &root);
+            assert!(
+                text.lines()
+                    .nth(1)
+                    .unwrap()
+                    .ends_with(&format!("; model freeable lower bound: {shown})"))
+            );
+            assert!(!text.contains("deleting it all frees"));
+            assert_eq!(serde_json::to_value(&report).unwrap(), before);
+            assert_eq!(before["freeable_min_bytes"], serde_json::json!(value));
+            report.clone_shared_bytes = 0;
+            assert!(!to_text(&report, &root).contains("model freeable lower bound"));
+        }
     }
 
     #[test]
