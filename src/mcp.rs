@@ -605,6 +605,36 @@ fn handle_tool_call(params: &Value, opts: CacheOpts) -> Result<Value, Value> {
     })
 }
 
+/// Validate the required initialization structure, not the full capability
+/// schema. Unknown versions and extension fields remain forward-compatible.
+fn validate_initialize(params: &Value) -> Result<(), Value> {
+    for key in ["protocolVersion", "capabilities", "clientInfo"] {
+        let valid = params.get(key).is_some_and(|value| {
+            if key == "protocolVersion" {
+                value.is_string()
+            } else {
+                value.is_object()
+            }
+        });
+        if !valid {
+            return Err(rpc_error(
+                -32602,
+                format!("missing or invalid initialize parameter: {key}"),
+            ));
+        }
+    }
+    let info = &params["clientInfo"];
+    for key in ["name", "version"] {
+        if info.get(key).and_then(Value::as_str).is_none() {
+            return Err(rpc_error(-32602, format!("missing or invalid clientInfo field: {key}")));
+        }
+    }
+    if info.get("title").is_some_and(|value| !value.is_string()) {
+        return Err(rpc_error(-32602, "clientInfo.title must be a string"));
+    }
+    Ok(())
+}
+
 fn handle(msg: &Value, opts: CacheOpts) -> Option<Value> {
     let id = msg.get("id");
     // MCP requires string or integer request IDs (unlike JSON-RPC, not null).
@@ -623,14 +653,16 @@ fn handle(msg: &Value, opts: CacheOpts) -> Option<Value> {
     }
     let method = msg["method"].as_str().unwrap();
     let result = match method {
-        "initialize" => Ok(json!({
-            "protocolVersion": PROTOCOL_VERSION,
-            "capabilities": {"tools": {}},
-            "serverInfo": {"name": "dutype", "title": "dutype", "version": env!("CARGO_PKG_VERSION")},
-            "instructions": "Use disk_usage to see what kinds of data fill a directory, and \
-                find_by_category to list e.g. every node_modules or the biggest videos. \
-                Both are read-only; never delete files without the user's confirmation."
-        })),
+        "initialize" => validate_initialize(&msg["params"]).map(|()| {
+            json!({
+                "protocolVersion": PROTOCOL_VERSION,
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "dutype", "title": "dutype", "version": env!("CARGO_PKG_VERSION")},
+                "instructions": "Use disk_usage to see what kinds of data fill a directory, and \
+                    find_by_category to list e.g. every node_modules or the biggest videos. \
+                    Both are read-only; never delete files without the user's confirmation."
+            })
+        }),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({"tools": tools()})),
         "tools/call" => handle_tool_call(&msg["params"], opts),

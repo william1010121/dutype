@@ -152,6 +152,81 @@ fn stdio_recovers_from_malformed_messages_without_losing_following_requests() {
 }
 
 #[test]
+fn initialize_validates_structure_and_preserves_negotiation() {
+    let fixture = Fixture::new();
+    let valid = json!({"protocolVersion": "2025-06-18", "capabilities": {},
+        "clientInfo": {"name": "test", "version": "1"}});
+    let mut invalid = vec![
+        None,
+        Some(json!({})),
+        Some(Value::Null),
+        Some(json!([])),
+        Some(json!(1)),
+    ];
+    for key in ["protocolVersion", "capabilities", "clientInfo"] {
+        let mut missing = valid.clone();
+        missing.as_object_mut().unwrap().remove(key);
+        invalid.push(Some(missing));
+        for value in [Value::Null, json!(false), json!(1), json!([]), json!("text"), json!({})] {
+            if (key == "protocolVersion" && value.is_string()) || (key != "protocolVersion" && value.is_object()) {
+                continue;
+            }
+            let mut wrong = valid.clone();
+            wrong[key] = value;
+            invalid.push(Some(wrong));
+        }
+    }
+    invalid.push(Some(
+        json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {}}),
+    ));
+    for key in ["name", "version", "title"] {
+        if key != "title" {
+            let mut missing = valid.clone();
+            missing["clientInfo"].as_object_mut().unwrap().remove(key);
+            invalid.push(Some(missing));
+        }
+        for value in [Value::Null, json!(false), json!(1), json!([]), json!({})] {
+            let mut wrong = valid.clone();
+            wrong["clientInfo"][key] = value;
+            invalid.push(Some(wrong));
+        }
+    }
+    let mut requests = Vec::new();
+    for (i, params) in invalid.iter().enumerate() {
+        let mut request = json!({"jsonrpc": "2.0", "id": format!("invalid-{i}"), "method": "initialize"});
+        if let Some(params) = params {
+            request["params"] = params.clone();
+        }
+        requests.push(request);
+    }
+    let invalid_count = requests.len();
+    for version in ["2025-06-18", "future-version", ""] {
+        requests.push(
+            json!({"jsonrpc": "2.0", "id": requests.len(), "method": "initialize", "params": {
+                "protocolVersion": version, "capabilities": {"futureCapability": {"enabled": true}},
+                "clientInfo": {"name": "", "version": "", "title": "", "extra": 1}, "extension": true
+            }}),
+        );
+    }
+    requests.push(json!({"jsonrpc": "2.0", "id": "after-invalid", "method": "ping"}));
+    let responses = fixture.run(&requests.iter().map(Value::to_string).collect::<Vec<_>>().join("\n"));
+    assert_eq!(responses.len(), requests.len());
+    for (i, (request, response)) in requests.iter().zip(&responses).enumerate() {
+        assert_eq!(response["id"], request["id"]);
+        if i < invalid_count {
+            assert_eq!(response["error"]["code"], -32602, "{request}: {response}");
+            assert!(response.get("result").is_none());
+        } else if i < requests.len() - 1 {
+            assert!(response.get("error").is_none(), "{response}");
+            assert_eq!(response["result"]["protocolVersion"], "2025-06-18");
+        } else {
+            assert_eq!(response["result"], json!({}));
+            assert!(response.get("error").is_none());
+        }
+    }
+}
+
+#[test]
 fn tool_text_and_structured_content_agree_and_execution_errors_stay_results() {
     let fixture = Fixture::new();
     // Unicode and spaces are portable; the Unix filename also checks that
