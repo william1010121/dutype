@@ -1,0 +1,134 @@
+[
+  {
+    "kind": "name",
+    "case": "ascii",
+    "candidate": false,
+    "median_ns_each": 10.30952,
+    "allocation": {
+      "allocations": 1,
+      "reallocations": 0,
+      "requested_bytes": 17
+    }
+  },
+  {
+    "kind": "name",
+    "case": "ascii",
+    "candidate": true,
+    "median_ns_each": 31.21396,
+    "allocation": {
+      "allocations": 0,
+      "reallocations": 0,
+      "requested_bytes": 0
+    }
+  },
+  {
+    "kind": "name",
+    "case": "unicode",
+    "candidate": false,
+    "median_ns_each": 9.16482,
+    "allocation": {
+      "allocations": 1,
+      "reallocations": 0,
+      "requested_bytes": 34
+    }
+  },
+  {
+    "kind": "name",
+    "case": "unicode",
+    "candidate": true,
+    "median_ns_each": 37.14118,
+    "allocation": {
+      "allocations": 0,
+      "reallocations": 0,
+      "requested_bytes": 0
+    }
+  },
+  {
+    "kind": "name",
+    "case": "affected",
+    "candidate": false,
+    "median_ns_each": 9.57142,
+    "allocation": {
+      "allocations": 1,
+      "reallocations": 0,
+      "requested_bytes": 11
+    }
+  },
+  {
+    "kind": "name",
+    "case": "affected",
+    "candidate": true,
+    "median_ns_each": 69.90036,
+    "allocation": {
+      "allocations": 1,
+      "reallocations": 1,
+      "requested_bytes": 33
+    }
+  },
+  {
+    "kind": "name",
+    "case": "heavy",
+    "candidate": false,
+    "median_ns_each": 12.88434,
+    "allocation": {
+      "allocations": 1,
+      "reallocations": 0,
+      "requested_bytes": 320
+    }
+  },
+  {
+    "kind": "name",
+    "case": "heavy",
+    "candidate": true,
+    "median_ns_each": 1781.5167,
+    "allocation": {
+      "allocations": 1,
+      "reallocations": 2,
+      "requested_bytes": 2240
+    }
+  },
+  {
+    "kind": "frame",
+    "case": "ordinary",
+    "candidate": false,
+    "median_ns_each": 347742.1,
+    "allocation": {
+      "allocations": 974,
+      "reallocations": 118,
+      "requested_bytes": 719771
+    }
+  },
+  {
+    "kind": "frame",
+    "case": "ordinary",
+    "candidate": true,
+    "median_ns_each": 352559.8,
+    "allocation": {
+      "allocations": 903,
+      "reallocations": 118,
+      "requested_bytes": 718363
+    }
+  },
+  {
+    "kind": "frame",
+    "case": "affected",
+    "candidate": false,
+    "median_ns_each": 329711.85,
+    "allocation": {
+      "allocations": 928,
+      "reallocations": 116,
+      "requested_bytes": 717240
+    }
+  },
+  {
+    "kind": "frame",
+    "case": "affected",
+    "candidate": true,
+    "median_ns_each": 350529.25,
+    "allocation": {
+      "allocations": 926,
+      "reallocations": 149,
+      "requested_bytes": 718570
+    }
+  }
+]

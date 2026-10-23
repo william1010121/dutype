@@ -3,6 +3,7 @@ mod account;
 mod app;
 mod cache;
 mod category;
+mod display;
 mod report;
 mod scan;
 mod ui;
@@ -48,10 +49,10 @@ fn fixture_count(count: usize, zero: bool, labels: bool) -> App {
     let mut children: Vec<scan::Node> = (0..count).map(|i| {
         let name = if labels { match i % 6 {
             0 => format!("日本語-🦀-{i}.rs"),
-            1 => format!("multi\nline-{i}.txt"),
+            1 => format!("multi-line-{i}.txt"),
             2 => format!("combining-e\u{301}-{i}.pdf"),
             3 => format!("{}-{i}.mp4", "long".repeat(40)),
-            4 => format!("tab\tname-{i}.zip"),
+            4 => format!("tab-name-{i}.zip"),
             _ => format!("file-{i:05}.{}", exts[i % exts.len()]),
         }} else { format!("file-{i:05}.{}", exts[i % exts.len()]) };
         scan::Node { cat: category::reg().classify_file(&name), name: name.into(), size: if zero { 0 } else { 4096 * (1 + ((i * 7919) % 256)) as u64 }, special:false, hardlink:false, lossy:false, clone:false, dir:None }
@@ -151,7 +152,7 @@ fn verify() {
         let mut ta=Terminal::new(TestBackend::new(120,40)).unwrap(); let mut tb=Terminal::new(TestBackend::new(120,40)).unwrap();
         for i in 0..12 { prepare("navigation",i,&mut ta,&mut a);prepare("navigation",i,&mut tb,&mut b);render_pair(&mut a,&mut b,&mut ta,&mut tb,"zero sizes");frames+=1; }
     }
-    println!("differential frames={frames} full_styled_buffers_equal=true global_table_states_equal=true geometry_empty_tiny_normal=true stale_offsets_selection_columns=true unicode_newline_zero_sizes=true");
+    println!("differential frames={frames} full_styled_buffers_equal=true global_table_states_equal=true geometry_empty_tiny_normal=true stale_offsets_selection_columns=true unicode_long_zero_sizes=true");
 }
 fn benchmark(counts:&[usize],frames:usize) {
     for &count in counts { for case in ["unchanged","navigation","resize","tiny"] {

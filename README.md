@@ -200,6 +200,25 @@ Options:
 
 </details>
 
+### Filename display
+
+Human reports and TUI filename/path fields show control characters visibly:
+newline, tab and carriage return become `\n`, `\t` and `\r`; other C0/DEL
+characters use `\xNN`, and C1, Unicode line/paragraph separators and
+Bidi_Control characters use `\u{NNNN}`. Literal backslashes in filename
+components are doubled; native Windows path separators stay structural.
+Ordinary multilingual text, combining marks, ZWJ/ZWNJ and emoji are unchanged.
+
+This is display-only: JSON/MCP paths, copied paths, navigation targets, sorting,
+classification and cache identities are unchanged. It does not make all Unicode
+glyphs or existing non-UTF-8 display aliases unique, and displayed Windows paths
+are not a reversible encoding across component boundaries. Copy paths with `y`
+or use JSON/MCP rather than interpreting the human display as a path.
+
+This is not complete error-diagnostic sanitization. Explicit CLI scan-path
+prefixes are escaped, but shared configuration/cache errors, TOML diagnostic
+bodies and configured category labels are outside this filename-only policy.
+
 ### Hard-link attribution
 
 On Unix, hard-linked files count once, just like `du -skx`. Their allocated

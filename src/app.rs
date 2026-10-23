@@ -938,9 +938,27 @@ fn reveal(path: &Path) {
         .spawn();
 }
 
+// Thread-local test interception exercises the real key handlers without ever
+// spawning a clipboard program or writing OSC 52 bytes to a terminal.
+#[cfg(test)]
+thread_local! {
+    static TEST_CLIPBOARD: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
+}
+
 /// Copy `text` with the OS clipboard tool, or with an OSC 52 escape sequence
 /// over SSH or when no tool is found (most terminals, tmux with set-clipboard).
 fn copy_to_clipboard(text: &str) -> Result<(), String> {
+    #[cfg(test)]
+    if TEST_CLIPBOARD.with(|slot| {
+        if let Some(captured) = slot.borrow_mut().as_mut() {
+            captured.push(text.to_owned());
+            true
+        } else {
+            false
+        }
+    }) {
+        return Ok(());
+    }
     use std::process::{Command, Stdio};
     let var = |k| std::env::var_os(k).is_some();
     let tools: &[&[&str]] = if var("SSH_CONNECTION") || var("SSH_TTY") {
@@ -2812,5 +2830,57 @@ mod tests {
         assert_eq!(super::base64(b"fo"), "Zm8=");
         assert_eq!(super::base64(b"foo"), "Zm9v");
         assert_eq!(super::base64("/路徑".as_bytes()), "L+i3r+W+kQ==");
+    }
+    #[test]
+    fn display_escaping_keeps_key_handler_clipboard_and_jump_identity_raw() {
+        struct Capture;
+        impl Drop for Capture {
+            fn drop(&mut self) {
+                TEST_CLIPBOARD.with(|slot| *slot.borrow_mut() = None);
+            }
+        }
+        TEST_CLIPBOARD.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
+        let _capture = Capture;
+        let names = [
+            "a\nb.pdf",
+            // A literal backslash is a filename character only off Windows.
+            // Pure render-boundary tests cover its encoding on every platform.
+            #[cfg(not(windows))]
+            "a\\nb.pdf",
+            "a\u{202e}b.pdf",
+            "résumé-日本語.pdf",
+            "-leading.pdf",
+        ];
+        for name in names {
+            assert_eq!(Path::new(name).components().count(), 1, "fixture name {name:?}");
+            let mut app = jump_app(jump_dir("root", vec![jump_file(name, 4096)]));
+            let original_path = app.root_path.join(name);
+            press(&mut app, KeyCode::Char('y'));
+            assert_eq!(
+                TEST_CLIPBOARD.with(|slot| slot.borrow().as_ref().unwrap().last().cloned()),
+                Some(original_path.to_str().unwrap().to_owned())
+            );
+            assert_eq!(
+                app.status.as_deref(),
+                Some(format!("copied {}", crate::ui::display_path(&original_path)).as_str())
+            );
+            jump_popup(&mut app, Key::Ext("pdf".into()));
+            let item = &app.popup.as_ref().unwrap().items[0];
+            assert_eq!(item.path, Path::new(name));
+            assert_eq!(item.fs_path.as_deref(), Some(original_path.as_path()));
+            assert_eq!(item.target, [0]);
+            press(&mut app, KeyCode::Char('y'));
+            assert_eq!(
+                TEST_CLIPBOARD.with(|slot| slot.borrow().as_ref().unwrap().last().cloned()),
+                Some(original_path.to_str().unwrap().to_owned())
+            );
+            press(&mut app, KeyCode::Char('s'));
+            assert_eq!(app.selected_entry(), Some(0));
+            assert_eq!(&*app.current().children()[0].name, name);
+        }
+        assert_eq!(
+            TEST_CLIPBOARD.with(|slot| slot.borrow().as_ref().unwrap().len()),
+            names.len() * 2
+        );
     }
 }

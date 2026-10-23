@@ -1,5 +1,6 @@
 use crate::app::{App, Focus, Mode, node_at};
 use crate::category::{Category, by_size, dominant, folder_icon};
+use crate::display;
 use crate::report::SizeMode;
 use crate::scan::Node;
 use ratatui::Frame;
@@ -285,8 +286,8 @@ fn home_dir() -> Option<std::path::PathBuf> {
 pub fn display_path(path: &Path) -> String {
     match home_dir().and_then(|h| path.strip_prefix(h).ok().map(Path::to_path_buf)) {
         Some(rest) if rest.as_os_str().is_empty() => "~".into(),
-        Some(rest) => format!("~/{}", rest.display()),
-        None => path.display().to_string(),
+        Some(rest) => format!("~/{}", display::path(&rest)),
+        None => display::path(path).into_owned(),
     }
 }
 
@@ -297,7 +298,7 @@ fn breadcrumb(path: &Path, width: usize) -> Line<'static> {
     let segs: Vec<String> = path
         .components()
         .filter_map(|c| match c {
-            std::path::Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
+            std::path::Component::Normal(s) => Some(display::name(&s.to_string_lossy()).into_owned()),
             _ => None,
         })
         .collect();
@@ -395,7 +396,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-fn entry_name(c: &Node) -> Line<'static> {
+fn entry_name(c: &Node) -> Line<'_> {
     let cats = c.cats();
     let dot = if c.is_dir() && !c.special {
         icon_span(folder_icon(), dominant(&cats).color())
@@ -405,7 +406,7 @@ fn entry_name(c: &Node) -> Line<'static> {
     if c.is_dir() {
         let mut spans = vec![
             dot,
-            Span::styled(c.name.to_string(), Style::new().fg(TEXT).bold()),
+            Span::styled(display::name(&c.name), Style::new().fg(TEXT).bold()),
             Span::styled("/", Style::new().fg(MUTED)),
         ];
         if c.special {
@@ -416,7 +417,7 @@ fn entry_name(c: &Node) -> Line<'static> {
     } else {
         Line::from(vec![
             dot,
-            Span::styled(c.name.to_string(), Style::new().fg(Color::Indexed(250))),
+            Span::styled(display::name(&c.name), Style::new().fg(Color::Indexed(250))),
         ])
     }
 }
@@ -550,7 +551,14 @@ fn draw_breakdown(f: &mut Frame, app: &mut App, area: Rect) {
         let mut cells = vec![
             Cell::from(Line::from(vec![
                 icon_span(b.cat.icon(), b.cat.color()),
-                Span::styled(b.label.clone(), Style::new().fg(TEXT)),
+                Span::styled(
+                    if ext_mode {
+                        display::name(&b.label)
+                    } else {
+                        std::borrow::Cow::Borrowed(b.label.as_str())
+                    },
+                    Style::new().fg(TEXT),
+                ),
             ])),
             Cell::from(Span::styled(
                 smooth_bar(ratio(b.size, max), BREAKDOWN_BAR),
@@ -695,6 +703,7 @@ fn draw_details(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_popup(f: &mut Frame, app: &mut App) {
+    let ext_mode = app.mode == Mode::Extension;
     let popup = app.popup.as_mut().unwrap();
     let [area] = Layout::horizontal([Constraint::Percentage(86)])
         .flex(Flex::Center)
@@ -708,10 +717,13 @@ fn draw_popup(f: &mut Frame, app: &mut App) {
     let max = popup.items.first().map_or(1, |i| i.size);
     let rows = popup.items.iter().enumerate().map(|(i, item)| {
         let (p, s) = (&item.path, item.size);
-        let parent = p.parent().map(|d| d.display().to_string()).filter(|d| !d.is_empty());
+        let parent = p
+            .parent()
+            .map(|d| display::path(d).into_owned())
+            .filter(|d| !d.is_empty());
         let name = p
             .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
+            .map(|n| display::name(&n.to_string_lossy()).into_owned())
             .unwrap_or_default();
         let mut path = Vec::new();
         if let Some(d) = parent {
@@ -730,7 +742,14 @@ fn draw_popup(f: &mut Frame, app: &mut App) {
         .border_style(Style::new().fg(ACCENT))
         .title(Line::from(vec![
             Span::raw(" "),
-            chip(&popup.title, ACCENT),
+            chip(
+                &if ext_mode {
+                    display::name(&popup.title)
+                } else {
+                    std::borrow::Cow::Borrowed(popup.title.as_str())
+                },
+                ACCENT,
+            ),
             Span::raw(" "),
         ]))
         .title(
@@ -899,6 +918,204 @@ mod entry_viewport_tests {
                     }
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod filename_display_tests {
+    use super::*;
+    use crate::category::reg;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent};
+    use ratatui::widgets::{StatefulWidget, Widget};
+    use std::path::PathBuf;
+
+    fn file(name: &str) -> Node {
+        Node {
+            name: name.into(),
+            size: 4096,
+            cat: reg().classify_file(name),
+            special: false,
+            hardlink: false,
+            lossy: false,
+            clone: false,
+            dir: None,
+        }
+    }
+
+    fn app(name: &str) -> App {
+        let child = file(name);
+        let root = Node {
+            name: "root".into(),
+            size: child.size,
+            cat: reg().other(),
+            special: false,
+            hardlink: false,
+            lossy: false,
+            clone: false,
+            dir: Some(Box::new(crate::scan::DirInfo {
+                cats: child.cats(),
+                files: 1,
+                errors: 0,
+                children: vec![child],
+                free_base: 0,
+                clones: None,
+            })),
+        };
+        App::new(root, PathBuf::from("/root\n"), Duration::ZERO, 0)
+    }
+
+    fn cells(line: Line<'_>, table: bool) -> Buffer {
+        let area = Rect::new(0, 0, 160, 1);
+        let mut buffer = Buffer::empty(area);
+        if table {
+            StatefulWidget::render(
+                Table::new([Row::new([Cell::from(line)])], [Constraint::Fill(1)]),
+                area,
+                &mut buffer,
+                &mut TableState::default(),
+            );
+        } else {
+            Widget::render(Paragraph::new(line), area, &mut buffer);
+        }
+        buffer
+    }
+
+    fn text(buffer: &Buffer) -> String {
+        buffer.content.iter().map(|c| c.symbol()).collect()
+    }
+
+    #[test]
+    fn ordinary_entry_cells_and_styles_match_the_original_renderer() {
+        for name in [
+            "plain.txt",
+            "-leading.txt",
+            "résumé-日本語.txt",
+            "e\u{301}.txt",
+            "👩\u{200d}💻.txt",
+            "a\u{200c}b.txt",
+        ] {
+            let node = file(name);
+            let original = Line::from(vec![
+                icon_span(node.cat.icon(), node.cat.color()),
+                Span::styled(node.name.to_string(), Style::new().fg(Color::Indexed(250))),
+            ]);
+            for table in [false, true] {
+                assert_eq!(
+                    cells(entry_name(&node), table),
+                    cells(original.clone(), table),
+                    "{name:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn controls_and_literal_escape_spellings_have_distinct_safe_cells() {
+        for (raw, escaped) in [
+            ("a\nb.txt", "a\\nb.txt"),
+            ("a\\nb.txt", "a\\\\nb.txt"),
+            ("a\tb.txt", "a\\tb.txt"),
+            ("a\rb.txt", "a\\rb.txt"),
+            ("a\x1bb.txt", "a\\x1bb.txt"),
+            ("a\u{85}b.txt", "a\\u{0085}b.txt"),
+            ("a\u{202e}b.txt", "a\\u{202e}b.txt"),
+            ("a\u{2066}b.txt", "a\\u{2066}b.txt"),
+            ("a\u{2028}b.txt", "a\\u{2028}b.txt"),
+        ] {
+            let node = file(raw);
+            for table in [false, true] {
+                let actual = cells(entry_name(&node), table);
+                assert!(
+                    text(&actual).contains(escaped),
+                    "raw={raw:?}, cells={:?}",
+                    text(&actual)
+                );
+                assert_ne!(actual, cells(entry_name(&file("ab.txt")), table));
+                assert!(!text(&actual).chars().any(char::is_control));
+            }
+            assert_eq!(&*node.name, raw);
+        }
+    }
+
+    #[test]
+    fn headers_scanning_extension_popup_and_status_escape_once_without_mutating_paths() {
+        let mut app = app("child\n.odd\u{202e}");
+        let mut terminal = Terminal::new(TestBackend::new(240, 40)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let screen = text(terminal.backend().buffer());
+        assert!(screen.contains("root\\n"));
+        assert!(screen.contains("child\\n.odd\\u{202e}"));
+        app.mode = Mode::Extension;
+        app.refresh_breakdown();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(text(terminal.backend().buffer()).contains(".odd\\u{202e}"));
+        app.focus = Focus::Breakdown;
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        let raw_title = app.popup.as_ref().unwrap().title.clone();
+        let raw_path = app.popup.as_ref().unwrap().items[0].path.clone();
+        let fs_path = app.popup.as_ref().unwrap().items[0].fs_path.clone();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let screen = text(terminal.backend().buffer());
+        assert!(screen.contains("*.odd\\u{202e} files"));
+        assert!(screen.contains("child\\n.odd\\u{202e}"));
+        assert_eq!(app.popup.as_ref().unwrap().title, raw_title);
+        assert_eq!(app.popup.as_ref().unwrap().items[0].path, raw_path);
+        assert_eq!(app.popup.as_ref().unwrap().items[0].fs_path, fs_path);
+        app.handle_key(KeyEvent::from(KeyCode::Char('s')));
+        assert_eq!(&*app.current().children()[0].name, "child\n.odd\u{202e}");
+        assert_eq!(app.states.last().unwrap().selected(), Some(0));
+        assert_eq!(app.root_path, Path::new("/root\n"));
+        app.status = Some(format!("copied {}", display_path(&app.root_path)));
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let screen = text(terminal.backend().buffer());
+        assert!(screen.contains("copied /root\\n"));
+        assert!(!screen.contains("copied /root\\\\n"));
+        terminal
+            .draw(|f| draw_scanning(f, Path::new("/root\n/child\t"), 1, 4096, Duration::ZERO))
+            .unwrap();
+        assert!(text(terminal.backend().buffer()).contains("/root\\n/child\\t"));
+    }
+    #[test]
+    fn nested_popup_paths_and_breadcrumb_widths_use_escaped_components() {
+        let mut app = app("child\n.pdf");
+        let mut nested = std::mem::replace(&mut app.root, file("placeholder"));
+        nested.name = "nested\t".into();
+        let root = Node {
+            name: "root".into(),
+            size: nested.size,
+            cat: reg().other(),
+            special: false,
+            hardlink: false,
+            lossy: false,
+            clone: false,
+            dir: Some(Box::new(crate::scan::DirInfo {
+                cats: nested.cats(),
+                files: 1,
+                errors: 0,
+                children: vec![nested],
+                free_base: 0,
+                clones: None,
+            })),
+        };
+        let mut app = App::new(root, PathBuf::from("/root\n"), Duration::ZERO, 0);
+        app.focus = Focus::Breakdown;
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        let mut terminal = Terminal::new(TestBackend::new(240, 40)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let screen = text(terminal.backend().buffer());
+        assert!(screen.contains("nested\\t/child\\n.pdf"));
+        app.handle_key(KeyEvent::from(KeyCode::Char('s')));
+        assert_eq!(&*app.current().name, "nested\t");
+        assert_eq!(app.current().children()[0].name.as_ref(), "child\n.pdf");
+        for width in [16, 20, 40, 100] {
+            let line = breadcrumb(Path::new("/a\n/b\u{202e}"), width);
+            assert!(!line.spans.iter().any(|span| span.content.chars().any(char::is_control)));
+            assert!(line.spans.iter().any(|span| span.content.contains("b\\u{202e}")));
+            assert!(line.width() <= width);
         }
     }
 }
