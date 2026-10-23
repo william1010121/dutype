@@ -50,7 +50,9 @@ pub enum Rescan {
 /// One folder of a location. The name alone is not an identity: an escaped
 /// non-UTF-8 name (e.g. `d\xffir`) can be spelled exactly like a sibling's
 /// real UTF-8 name, so lossiness is part of the match. On unix escapes are
-/// reversible, so two different non-UTF-8 names never share a Step.
+/// reversible, so two different non-UTF-8 names never share a Step. Elsewhere,
+/// distinct raw names can share a lossy rendering: never infer their identity
+/// across rescans, and require unique matches within the same snapshot.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Step {
     pub name: Box<str>,
@@ -68,6 +70,12 @@ impl Step {
     fn matches(&self, n: &Node) -> bool {
         n.lossy == self.lossy && n.name == self.name
     }
+
+    fn position(&self, children: &[Node]) -> Option<usize> {
+        let mut matches = children.iter().enumerate().filter(|(_, n)| self.matches(n));
+        let (index, _) = matches.next()?;
+        (!self.lossy || matches.next().is_none()).then_some(index)
+    }
 }
 
 impl From<&str> for Step {
@@ -77,6 +85,13 @@ impl From<&str> for Step {
             lossy: false,
         }
     }
+}
+
+/// Navigation identities retained across a rescan or sort. Only the current
+/// path and one selected child per level are held, never the old tree.
+pub struct Navigation {
+    location: Vec<Step>,
+    selected: Vec<Option<Step>>,
 }
 
 pub struct PopupItem {
@@ -314,8 +329,9 @@ impl App {
         })
     }
 
-    /// Folders from the root to the current directory.
-    pub fn location(&self) -> Vec<Step> {
+    /// Folders from the root to the current directory, for navigation assertions.
+    #[cfg(test)]
+    fn location(&self) -> Vec<Step> {
         let mut n = &self.root;
         self.stack
             .iter()
@@ -329,12 +345,8 @@ impl App {
     /// Descend into the directories of `location` (as far as they exist).
     pub fn go_to(&mut self, location: &[Step]) {
         for step in location {
-            let Some(i) = self
-                .current()
-                .children()
-                .iter()
-                .position(|c| c.is_dir() && step.matches(c))
-            else {
+            let children = self.current().children();
+            let Some(i) = step.position(children).filter(|&i| children[i].is_dir()) else {
                 break;
             };
             self.states.last_mut().unwrap().select(Some(i));
@@ -363,7 +375,7 @@ impl App {
             true => self.clone_ids = clone_ids,
             false => self.clone_ids |= clone_ids,
         }
-        let place = self.remember();
+        let place = self.remember_rescan();
 
         let target = node_at_mut(&mut self.root, &self.stack);
         fresh.name = target.name.clone();
@@ -421,30 +433,50 @@ impl App {
         self.restore(place);
     }
 
-    /// The location and the selected entry at every level, by name.
-    fn remember(&self) -> (Vec<Step>, Vec<Option<Step>>) {
-        let selected = (0..=self.stack.len())
-            .map(|k| {
-                let node = node_at(&self.root, &self.stack[..k]);
-                self.states[k]
-                    .selected()
-                    .and_then(|i| node.children().get(i))
-                    .map(Step::of)
-            })
-            .collect();
-        (self.location(), selected)
+    /// Remember names within the same tree, where unique lossy names remain
+    /// usable. Sorting does not replace the filesystem identities in the tree.
+    fn remember(&self) -> Navigation {
+        self.remember_with_lossy(true)
     }
 
-    /// Back to a [`Self::remember`]ed place after the tree was re-sorted.
-    fn restore(&mut self, (location, selected): (Vec<Step>, Vec<Option<Step>>)) {
+    /// Remember only identities that can survive a new filesystem snapshot.
+    /// Non-reversible names cannot distinguish even one raw name replaced by
+    /// another with the same rendering; fall back instead of guessing.
+    pub fn remember_rescan(&self) -> Navigation {
+        self.remember_with_lossy(crate::scan::LOSSY_NAMES_REVERSIBLE)
+    }
+
+    fn remember_with_lossy(&self, keep_lossy: bool) -> Navigation {
+        let identity = |children: &[Node], index| {
+            let step = Step::of(children.get(index)?);
+            (!step.lossy || (keep_lossy && step.position(children) == Some(index))).then_some(step)
+        };
+        let mut location = Vec::new();
+        let mut node = &self.root;
+        for &index in &self.stack {
+            let Some(step) = identity(node.children(), index) else {
+                break;
+            };
+            location.push(step);
+            node = &node.children()[index];
+        }
+        let selected = (0..=location.len())
+            .map(|k| {
+                let node = node_at(&self.root, &self.stack[..k]);
+                self.states[k].selected().and_then(|i| identity(node.children(), i))
+            })
+            .collect();
+        Navigation { location, selected }
+    }
+
+    /// Back to a [`Self::remember`]ed place after a rescan or re-sort.
+    pub fn restore(&mut self, Navigation { location, selected }: Navigation) {
         self.stack.clear();
         self.states = vec![first_selected(self.root.children().len())];
         self.go_to(&location);
         for (k, name) in selected.iter().enumerate().take(self.states.len()) {
             let node = node_at(&self.root, &self.stack[..k]);
-            let pos = name
-                .as_ref()
-                .and_then(|step| node.children().iter().position(|c| step.matches(c)));
+            let pos = name.as_ref().and_then(|step| step.position(node.children()));
             self.states[k].select(pos.or(if node.children().is_empty() { None } else { Some(0) }));
         }
         self.popup = None;
@@ -2335,6 +2367,366 @@ mod tests {
         consistent_history(&app);
         press(&mut app, KeyCode::Backspace);
         assert!(app.stack.is_empty());
+    }
+
+    fn refreshed_app(old: &App, root: Node) -> App {
+        let navigation = old.remember_rescan();
+        let mut app = jump_app(root);
+        app.set_size_mode(old.size_mode);
+        app.restore(navigation);
+        app
+    }
+
+    #[test]
+    fn refresh_history_keeps_selection_and_back_history_after_reordering() {
+        let tree = |size| {
+            let mut files = vec![jump_file("a.pdf", 20), jump_file("z.pdf", size)];
+            files.sort_by_key(|n| std::cmp::Reverse(n.size));
+            let mut children = vec![
+                jump_dir("other", vec![jump_file("other.txt", 100)]),
+                jump_dir("branch", vec![jump_dir("inner", files)]),
+            ];
+            children.sort_by_key(|n| std::cmp::Reverse(n.size));
+            jump_dir("root", children)
+        };
+        for mode in [SizeMode::Du, SizeMode::Dedup] {
+            let mut app = jump_app(tree(10));
+            app.set_size_mode(mode);
+            app.go_to(&["branch".into(), "inner".into()]);
+            press(&mut app, KeyCode::End);
+            for size in [1000, 1, 2000] {
+                app = refreshed_app(&app, tree(size));
+                assert_eq!(app.location(), [Step::from("branch"), Step::from("inner")]);
+                assert_eq!(
+                    app.current().children()[app.selected_entry().unwrap()].name.as_ref(),
+                    "z.pdf"
+                );
+                consistent_history(&app);
+            }
+            press(&mut app, KeyCode::Left);
+            assert_eq!(
+                app.current().children()[app.selected_entry().unwrap()].name.as_ref(),
+                "inner"
+            );
+            consistent_history(&app);
+            press(&mut app, KeyCode::Backspace);
+            assert_eq!(
+                app.current().children()[app.selected_entry().unwrap()].name.as_ref(),
+                "branch"
+            );
+            consistent_history(&app);
+        }
+    }
+
+    #[test]
+    fn refresh_history_keeps_selection_after_dedup_changes_effective_order() {
+        let tree = |large_size, small_size| {
+            let mut large = jump_file("large.pdf", large_size);
+            large.clone = true;
+            let mut inner = jump_dir("inner", vec![large, jump_file("small.pdf", small_size)]);
+            let clones = inner.dir.as_mut().unwrap().clones_mut();
+            clones.dup = large_size;
+            clones.shared = vec![crate::scan::Shared {
+                idx: 0,
+                key: (1, 1),
+                is_clone: true,
+                ino: 1,
+                nlink: 1,
+                refcnt: 1,
+                dup: true,
+                reflink: None,
+            }]
+            .into_boxed_slice();
+            let mut branch = jump_dir("branch", vec![inner]);
+            branch.dir.as_mut().unwrap().clones_mut().dup = large_size;
+            let mut root = jump_dir(
+                "root",
+                vec![branch, jump_dir("other", vec![jump_file("other.txt", 50)])],
+            );
+            root.dir.as_mut().unwrap().clones_mut().dup = large_size;
+            root
+        };
+        for mode in [SizeMode::Du, SizeMode::Dedup] {
+            let mut old = jump_app(tree(100, 10));
+            old.set_size_mode(mode);
+            old.go_to(&["branch".into(), "inner".into()]);
+            let selected = if mode == SizeMode::Du { 0 } else { 1 };
+            old.states.last_mut().unwrap().select(Some(selected));
+            assert_eq!(old.stack[0], selected);
+            assert_eq!(old.current().children()[selected].name.as_ref(), "large.pdf");
+            let mut app = refreshed_app(&old, tree(1000, 60));
+            assert_eq!(app.stack[0], 0);
+            assert_eq!(app.selected_entry(), Some(selected));
+            assert_eq!(app.current().children()[selected].name.as_ref(), "large.pdf");
+            assert_eq!(
+                app.shown_size(app.current(), selected),
+                if mode == SizeMode::Du { 1000 } else { 0 }
+            );
+            consistent_history(&app);
+            press(&mut app, KeyCode::Left);
+            press(&mut app, KeyCode::Left);
+            assert_eq!(
+                app.current().children()[app.selected_entry().unwrap()].name.as_ref(),
+                "branch"
+            );
+            consistent_history(&app);
+        }
+    }
+
+    #[test]
+    fn refresh_history_root_selection_and_missing_entry_fallback() {
+        for (fresh, selected) in [
+            (
+                vec![jump_file("selected.pdf", 200), jump_file("first.pdf", 20)],
+                Some(0),
+            ),
+            (
+                vec![jump_file("first.pdf", 200), jump_file("selected.pdf", 20)],
+                Some(1),
+            ),
+            (vec![jump_file("renamed.pdf", 200), jump_file("first.pdf", 20)], Some(0)),
+            (vec![jump_file("first.pdf", 20)], Some(0)),
+            (vec![], None),
+        ] {
+            let mut old = jump_app(jump_dir(
+                "root",
+                vec![jump_file("first.pdf", 20), jump_file("selected.pdf", 10)],
+            ));
+            press(&mut old, KeyCode::End);
+            let app = refreshed_app(&old, jump_dir("root", fresh));
+            assert_eq!(app.selected_entry(), selected);
+            consistent_history(&app);
+        }
+    }
+
+    #[test]
+    fn refresh_history_missing_folder_stops_at_surviving_ancestor() {
+        for fresh in [
+            jump_dir("root", vec![jump_dir("branch", vec![])]),
+            jump_dir("root", vec![jump_file("branch", 1)]),
+            jump_dir("root", vec![]),
+        ] {
+            let mut old = jump_app(jump_dir(
+                "root",
+                vec![jump_dir("branch", vec![jump_dir("inner", vec![])])],
+            ));
+            old.go_to(&["branch".into(), "inner".into()]);
+            let app = refreshed_app(&old, fresh);
+            if app.root.children().first().is_some_and(Node::is_dir) {
+                assert_eq!(app.location(), [Step::from("branch")]);
+            } else {
+                assert!(app.stack.is_empty());
+            }
+            consistent_history(&app);
+        }
+    }
+
+    #[test]
+    fn refresh_history_keeps_reversible_unicode_and_lossy_identity_not_display_collisions() {
+        let tree = |reverse| {
+            let mut raw = jump_file(r"same\xff.pdf", 20);
+            raw.lossy = true;
+            let mut files = vec![jump_file(r"same\xff.pdf", 20), raw, jump_dir("日本語", vec![])];
+            if reverse {
+                files.reverse();
+            }
+            let literal_dir = jump_dir(r"dir\xff", vec![jump_file("literal-only.pdf", 20)]);
+            let mut raw_dir = jump_dir(r"dir\xff", files);
+            raw_dir.lossy = true;
+            jump_dir(
+                "root",
+                if reverse {
+                    vec![raw_dir, literal_dir]
+                } else {
+                    vec![literal_dir, raw_dir]
+                },
+            )
+        };
+        for selected in [0, 1, 2] {
+            let mut old = jump_app(tree(false));
+            old.go_to(&[Step {
+                name: r"dir\xff".into(),
+                lossy: true,
+            }]);
+            old.states.last_mut().unwrap().select(Some(selected));
+            let identity = Step::of(&old.current().children()[selected]);
+            let mut app = jump_app(tree(true));
+            app.restore(old.remember_with_lossy(true));
+            assert!(app.current().lossy);
+            assert_eq!(
+                Step::of(&app.current().children()[app.selected_entry().unwrap()]),
+                identity
+            );
+            consistent_history(&app);
+            if selected == 2 {
+                press(&mut app, KeyCode::Enter);
+                assert_eq!(app.current().name.as_ref(), "日本語");
+                consistent_history(&app);
+                press(&mut app, KeyCode::Left);
+            }
+            press(&mut app, KeyCode::Left);
+            assert!(app.current().children()[app.selected_entry().unwrap()].lossy);
+            consistent_history(&app);
+        }
+    }
+
+    #[test]
+    fn refresh_history_nonreversible_lossy_selections_never_guess_across_rescans() {
+        let raw = |size| {
+            let mut node = jump_file("same�.pdf", size);
+            node.lossy = true;
+            node
+        };
+        // Even a singleton-to-singleton match is not proof: a different raw
+        // surrogate name can replace the old one with identical display text.
+        for old_count in [1, 2] {
+            for fresh_count in [0, 1, 2] {
+                let mut old_files = vec![jump_file("fallback.pdf", 100)];
+                old_files.extend((0..old_count).map(|_| raw(10)));
+                let mut old = jump_app(jump_dir("root", old_files));
+                old.states[0].select(Some(old_count));
+                let saved = old.remember_with_lossy(false);
+                assert!(saved.selected[0].is_none());
+                let mut fresh = vec![jump_file("fallback.pdf", 100)];
+                fresh.extend((0..fresh_count).map(|_| raw(20)));
+                let mut app = jump_app(jump_dir("root", fresh));
+                app.restore(saved);
+                assert_eq!(app.selected_entry(), Some(0));
+                assert_eq!(app.current().children()[0].name.as_ref(), "fallback.pdf");
+                consistent_history(&app);
+            }
+        }
+    }
+
+    #[test]
+    fn refresh_history_nonreversible_lossy_folder_stops_before_it_and_keeps_back_history() {
+        let raw_dir = || {
+            let mut node = jump_dir("same�", vec![jump_file("inside.pdf", 10)]);
+            node.lossy = true;
+            node
+        };
+        for old_count in [1, 2] {
+            let mut children = vec![jump_dir("fallback", vec![])];
+            children.extend((0..old_count).map(|_| raw_dir()));
+            let mut old = jump_app(jump_dir("root", vec![jump_dir("branch", children)]));
+            old.go_to(&["branch".into()]);
+            old.states.last_mut().unwrap().select(Some(old_count));
+            press(&mut old, KeyCode::Enter); // Explicit index navigation is safe.
+            let saved = old.remember_with_lossy(false);
+            assert_eq!(saved.location, [Step::from("branch")]);
+            assert!(saved.selected[1].is_none());
+            let mut app = jump_app(jump_dir(
+                "root",
+                vec![
+                    jump_dir("other", vec![]),
+                    jump_dir("branch", vec![jump_dir("fallback", vec![]), raw_dir()]),
+                ],
+            ));
+            app.restore(saved);
+            assert_eq!(app.location(), [Step::from("branch")]);
+            assert_eq!(app.selected_entry(), Some(0));
+            consistent_history(&app);
+            press(&mut app, KeyCode::Left);
+            assert_eq!(app.selected_entry(), Some(1));
+            assert_eq!(app.current().children()[1].name.as_ref(), "branch");
+            consistent_history(&app);
+        }
+    }
+
+    #[test]
+    fn refresh_history_lossy_uniqueness_checks_source_destination_and_all_node_kinds() {
+        let raw = |directory| {
+            let mut node = if directory {
+                jump_dir("same�", vec![])
+            } else {
+                jump_file("same�", 10)
+            };
+            node.lossy = true;
+            node
+        };
+        let step = Step {
+            name: "same�".into(),
+            lossy: true,
+        };
+        for directory in [false, true] {
+            // A file twin still makes the folder identity ambiguous.
+            let mut old = jump_app(jump_dir("root", vec![raw(directory), raw(true)]));
+            old.go_to(std::slice::from_ref(&step));
+            assert!(old.stack.is_empty());
+            old.states[0].select(Some(1));
+            press(&mut old, KeyCode::Enter);
+            let saved = old.remember_with_lossy(true);
+            assert!(saved.location.is_empty());
+            assert!(saved.selected[0].is_none());
+            let mut singleton = jump_app(jump_dir("root", vec![jump_file("fallback", 1), raw(true)]));
+            singleton.restore(saved);
+            assert!(singleton.stack.is_empty());
+            assert_eq!(singleton.selected_entry(), Some(0));
+            consistent_history(&singleton);
+
+            let mut unique = jump_app(jump_dir("root", vec![raw(true)]));
+            unique.go_to(std::slice::from_ref(&step));
+            let mut ambiguous = jump_app(jump_dir(
+                "root",
+                vec![jump_file("fallback", 1), raw(directory), raw(true)],
+            ));
+            ambiguous.restore(unique.remember_with_lossy(true));
+            assert!(ambiguous.stack.is_empty());
+            assert_eq!(ambiguous.selected_entry(), Some(0));
+            consistent_history(&ambiguous);
+        }
+    }
+
+    #[test]
+    fn refresh_history_same_tree_sort_keeps_unique_nonreversible_lossy_names() {
+        let mut file = jump_file("same�.pdf", 100);
+        file.lossy = true;
+        let mut raw_dir = jump_dir("same�", vec![file]);
+        raw_dir.lossy = true;
+        raw_dir.clone = true;
+        raw_dir.dir.as_mut().unwrap().clones_mut().dup = 100;
+        let mut app = jump_app(jump_dir(
+            "root",
+            vec![raw_dir, jump_dir("other", vec![jump_file("other.pdf", 10)])],
+        ));
+        app.go_to(&[Step {
+            name: "same�".into(),
+            lossy: true,
+        }]);
+        for mode in [SizeMode::Dedup, SizeMode::Du] {
+            app.set_size_mode(mode);
+            assert_eq!(app.stack[0], if mode == SizeMode::Du { 0 } else { 1 });
+            assert!(app.current().lossy);
+            assert!(app.current().children()[app.selected_entry().unwrap()].lossy);
+            consistent_history(&app);
+        }
+    }
+
+    #[test]
+    fn refresh_history_popup_and_rescan_key_routes_are_unchanged() {
+        let mut app = jump_app(jump_dir("root", vec![jump_dir("inner", vec![jump_file("a.pdf", 1)])]));
+        jump_popup(&mut app, Key::Ext("pdf".into()));
+        for ch in ['r', 'R'] {
+            press(&mut app, KeyCode::Char(ch));
+            assert!(app.popup.is_some());
+            consistent_history(&app);
+        }
+        let app = refreshed_app(&app, jump_dir("root", vec![jump_file("replacement.pdf", 2)]));
+        assert!(app.popup.is_none());
+        for (nested, ch, rescan, quit) in [
+            (false, 'r', Rescan::All, true),
+            (false, 'R', Rescan::All, true),
+            (true, 'r', Rescan::Current, false),
+            (true, 'R', Rescan::All, true),
+        ] {
+            let mut app = jump_app(jump_dir("root", vec![jump_dir("inner", vec![])]));
+            if nested {
+                press(&mut app, KeyCode::Enter);
+            }
+            press(&mut app, KeyCode::Char(ch));
+            assert_eq!(app.rescan, Some(rescan));
+            assert_eq!(app.quit, quit);
+        }
     }
 
     /// `r` keeps private sizes of the rest of the tree, replaces the

@@ -254,7 +254,7 @@ fn run(args: Args) -> Result<(), String> {
         let mut snap = cached();
         // Once the tree holds private sizes, rescans keep collecting them.
         let mut private = args.private;
-        let mut location = Vec::new();
+        let mut navigation = None;
         // Status to show after a full rescan (e.g. why `r` became `R`).
         let mut carried_status: Option<String> = None;
         // `c` survives a full rescan; so does clone detection from a cache.
@@ -315,7 +315,9 @@ fn run(args: Args) -> Result<(), String> {
             app.privates = privates;
             app.set_size_mode(size_mode);
             app.show_keys = args.show_keys;
-            app.go_to(&location);
+            if let Some(place) = navigation.take() {
+                app.restore(place);
+            }
             app.status = save_error
                 .map(|e| format!("cannot write cache: {e}"))
                 .or(carried_status.take());
@@ -335,7 +337,7 @@ fn run(args: Args) -> Result<(), String> {
                 std::mem::forget(app);
                 return Ok(());
             }
-            location = app.location();
+            navigation = Some(app.remember_rescan());
             carried_status = app.status.take();
             size_mode = app.size_mode;
             clones = app.clones;
