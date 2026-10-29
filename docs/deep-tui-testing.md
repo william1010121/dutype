@@ -101,7 +101,7 @@ An optional Linux PTY check exercises a real temporary 1000-directory fixture:
 
 ```sh
 cargo build
-python3 tests/tui_deep_tree.py --binary target/debug/dutype --output /tmp/dutype-deep-proof
+python3 tests/tui_deep_tree.py --binary target/debug/diskbytype --output /tmp/diskbytype-deep-proof
 ```
 
 Use `--depth 350` for the smaller finite fixture. The helper imports only the

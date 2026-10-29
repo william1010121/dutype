@@ -1,6 +1,6 @@
 # Result-jump validation
 
-The category/extension popup's `s` key jumps inside dutype: directories are
+The category/extension popup's `s` key jumps inside diskbytype: directories are
 entered; files are selected in their parent. Enter/o still reveal externally,
 y still copies, and Left/Backspace retain normal parent navigation. Captured
 child-index chains identify results even when raw names have identical display
@@ -29,7 +29,7 @@ and libc inotify:
 
 ```sh
 cargo +stable build
-python3 tests/tui_result_jump.py --binary target/debug/dutype --output /tmp/dutype-tui-proof
+python3 tests/tui_result_jump.py --binary target/debug/diskbytype --output /tmp/diskbytype-tui-proof
 ```
 
 The harness creates synthetic temporary fixtures, records raw ANSI output and

@@ -6,7 +6,7 @@ else
   OPTS="--warmup 2 --runs 10"
 fi
 eval hyperfine -N $OPTS --export-markdown $OUT --style none \
-  -n dutype       "\"$DUTYPE --report $T\"" \
+  -n diskbytype       "\"$DUTYPE --report $T\"" \
   -n dua          "\"dua -x aggregate $T\"" \
   -n gdu          "\"gdu -npsx $T\"" \
   -n dust         "\"dust -x -d 0 -P $T\"" \

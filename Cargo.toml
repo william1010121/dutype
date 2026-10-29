@@ -1,16 +1,26 @@
 [package]
-name = "dutype"
+name = "diskbytype"
 version = "0.1.4"
+default-run = "diskbytype"
 edition = "2024"
 rust-version = "1.88"
 description = "Disk usage by kind: a fast parallel TUI that shows how much of a folder is video, PDFs, node_modules, Python envs, caches, ML models, ..."
 license = "MIT"
-repository = "https://github.com/william1010121/dutype"
-homepage = "https://github.com/william1010121/dutype"
+repository = "https://github.com/william1010121/diskbytype"
+homepage = "https://github.com/william1010121/diskbytype"
 readme = "README.md"
 keywords = ["disk-usage", "tui", "du", "cli", "mcp"]
 categories = ["command-line-utilities", "filesystem"]
 exclude = ["assets/", "bench/", ".github/", "pyproject.toml"]
+
+[[bin]]
+name = "diskbytype"
+path = "src/main.rs"
+
+# Compatibility alias for the old name; same program (see src/bin/dutype.rs).
+[[bin]]
+name = "dutype"
+path = "src/bin/dutype.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

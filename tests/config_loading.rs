@@ -30,7 +30,7 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let base = std::env::temp_dir().join(format!(
-            "dutype-config-{}-{}",
+            "diskbytype-config-{}-{}",
             std::process::id(),
             NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
         ));
@@ -40,7 +40,7 @@ impl Fixture {
         fs::write(root.join("sample.fixtureconfig"), vec![b'x'; 8192]).unwrap();
         Self {
             root,
-            config: base.join("config-home").join("dutype").join("config.toml"),
+            config: base.join("config-home").join("diskbytype").join("config.toml"),
             cache: base.join("cache"),
             base,
         }
@@ -52,7 +52,7 @@ impl Fixture {
     }
 
     fn command(&self, mode: &str, source: Source, root: &Path) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_dutype"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_diskbytype"));
         command
             .args([mode, "--cache"])
             .current_dir(&self.base)
@@ -136,7 +136,7 @@ impl Fixture {
             assert!(output.stdout.is_empty(), "{source:?} {mode}: {output:?}");
             let error = String::from_utf8(output.stderr).unwrap();
             assert!(
-                error.starts_with(&format!("dutype: {}: ", self.config.display())),
+                error.starts_with(&format!("diskbytype: {}: ", self.config.display())),
                 "{source:?} {mode}: {error}"
             );
             assert!(!error.contains("missing-scan-root"), "{error}");
@@ -276,7 +276,7 @@ fn explicit_then_environment_config_precedence_is_preserved() {
 fn xdg_precedes_home_and_unset_xdg_uses_home() {
     let fixture = Fixture::new();
     fixture.write_config(config("XDG rules"));
-    let home_config = fixture.base.join("home/.config/dutype/config.toml");
+    let home_config = fixture.base.join("home/.config/diskbytype/config.toml");
     fs::create_dir_all(home_config.parent().unwrap()).unwrap();
     fs::write(home_config, config("Home rules")).unwrap();
     assert_category(&fixture.json(), "XDG rules");

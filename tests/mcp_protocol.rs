@@ -13,7 +13,7 @@ struct Fixture(PathBuf);
 impl Fixture {
     fn new() -> Self {
         let path = std::env::temp_dir().join(format!(
-            "dutype-mcp-protocol-{}-{}",
+            "diskbytype-mcp-protocol-{}-{}",
             std::process::id(),
             NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
         ));
@@ -39,7 +39,7 @@ impl Fixture {
     ) -> Vec<Value> {
         let stdout = self.0.join("stdout.jsonl");
         let stderr = self.0.join("stderr.txt");
-        let mut child = Command::new(env!("CARGO_BIN_EXE_dutype"))
+        let mut child = Command::new(env!("CARGO_BIN_EXE_diskbytype"))
             .args(["--mcp", "--config"])
             .arg(self.0.join("config.toml"))
             .args(extra_args)
@@ -241,7 +241,7 @@ fn tool_text_and_structured_content_agree_and_execution_errors_stay_results() {
     let input = [
         json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
             "params": {"protocolVersion": "2025-06-18", "capabilities": {},
-                "clientInfo": {"name": "dutype-regression-test", "version": "1"}}}),
+                "clientInfo": {"name": "diskbytype-regression-test", "version": "1"}}}),
         json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
         json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
             "params": {"name": "disk_usage", "arguments": {"path": directory}}}),

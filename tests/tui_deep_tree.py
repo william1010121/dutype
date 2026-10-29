@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Opt-in Linux deep-tree PTY coverage; temporary fixtures, no external actions.
 
-python3 tests/tui_deep_tree.py --binary target/debug/dutype --output /tmp/dutype-deep-proof
+python3 tests/tui_deep_tree.py --binary target/debug/diskbytype --output /tmp/diskbytype-deep-proof
 """
 import argparse
 from contextlib import contextmanager
@@ -28,7 +28,7 @@ from tui_result_jump import Screen
 @contextmanager
 def fixture(depth):
     """Track only owned paths, and remove deepest-first without Python recursion."""
-    base = Path(tempfile.mkdtemp(prefix="dutype-deep-tui-"))
+    base = Path(tempfile.mkdtemp(prefix="diskbytype-deep-tui-"))
     dirs, file = [base], None
     try:
         root = base / "fixture"

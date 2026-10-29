@@ -46,7 +46,7 @@ pub struct Registry {
     marker_lens: u64,
     other: Category,
     pub icons: IconMode,
-    /// Hash of the rules and the dutype version; a cached scan made with a
+    /// Hash of the rules and the diskbytype version; a cached scan made with a
     /// different fingerprint has stale categories.
     pub fingerprint: u64,
 }
@@ -142,9 +142,20 @@ pub fn init(explicit: Option<&Path>, icons: Option<IconMode>) -> Result<Option<P
 }
 
 pub fn default_config_path() -> Option<PathBuf> {
-    if let Some(p) = std::env::var_os("DUTYPE_CONFIG") {
+    if let Some(p) = std::env::var_os("DISKBYTYPE_CONFIG").or_else(|| std::env::var_os("DUTYPE_CONFIG")) {
         return Some(PathBuf::from(p));
     }
+    let new = config_path_for("diskbytype")?;
+    if !new.exists()
+        && let Some(old) = config_path_for("dutype").filter(|p| p.exists())
+    {
+        // Pre-rename config, read until the user moves it.
+        return Some(old);
+    }
+    Some(new)
+}
+
+fn config_path_for(app: &str) -> Option<PathBuf> {
     let base = if cfg!(windows) {
         std::env::var_os("APPDATA").map(PathBuf::from)
     } else {
@@ -152,7 +163,7 @@ pub fn default_config_path() -> Option<PathBuf> {
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
     };
-    base.map(|b| b.join("dutype").join("config.toml"))
+    base.map(|b| b.join(app).join("config.toml"))
 }
 
 impl Registry {

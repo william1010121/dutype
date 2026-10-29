@@ -245,7 +245,7 @@ mod tests {
     /// Cancelled before (or between) FIEMAP batches: nothing is read.
     #[test]
     fn probe_stops_when_cancelled() {
-        let d = std::env::temp_dir().join(format!("dutype-fiemap-cancel-{}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("diskbytype-fiemap-cancel-{}", std::process::id()));
         std::fs::write(&d, vec![1u8; 1 << 16]).unwrap();
         std::fs::File::open(&d).unwrap().sync_all().unwrap();
         let mut p = SharedExtentProbe::new();

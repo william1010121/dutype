@@ -23,7 +23,7 @@ tap = "william1010121/homebrew-tap"
 # Publish jobs to run in CI
 publish-jobs = ["npm"]
 # The npm package should have this name
-npm-package = "dutype"
+npm-package = "diskbytype"
 # Path that installers should place binaries in
 install-path = "CARGO_HOME"
 # Whether to install an updater program

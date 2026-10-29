@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Create synthetic ordinary/hard-link scan fixtures in a NEW directory.
 
-Usage: python3 bench/hardlinks.py /tmp/dutype-bench-new
+Usage: python3 bench/hardlinks.py /tmp/diskbytype-bench-new
 Each tree has 160,000 directory entries in 80 sibling directories. The
 hard-link tree contains 20,000 unique 4-KiB files with eight cross-directory
 links each. Never run against user data; an existing destination is rejected.

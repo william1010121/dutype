@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Real PTY smoke test for result jumps; only synthetic temporary fixtures.
 
-Usage: python3 tests/tui_result_jump.py --binary target/debug/dutype --output /tmp/dutype-tui-proof
+Usage: python3 tests/tui_result_jump.py --binary target/debug/diskbytype --output /tmp/diskbytype-tui-proof
 Linux inotify watches assert that jumps do not open or read fixture files/directories.
 These counters detect rescans; they do not trace metadata-only syscalls.
 No reveal, file-opening, or clipboard key is sent while a popup is open.
@@ -133,7 +133,7 @@ class Session:
                                         env=env, start_new_session=True)
         atexit.register(self.cleanup)
         self.drain("initial", .55)
-        assert "dutype" in self.screen.text(), self.screen.text()
+        assert "diskbytype" in self.screen.text(), self.screen.text()
         self.initial_accesses = self.watch.events()
         assert self.initial_accesses > 0, "watch did not observe initial scan"
 
@@ -236,7 +236,7 @@ def main():
     binary, output = args.binary.resolve(), args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
     results = []
-    with tempfile.TemporaryDirectory(prefix="dutype-tui-jump-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="diskbytype-tui-jump-") as tmp:
         root = Path(tmp) / "fixture"
         fixture(root)
         for mode in ("du", "dedup"):

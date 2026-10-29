@@ -1,28 +1,28 @@
 <div align="center">
 
-<img src="https://raw.githubusercontent.com/william1010121/dutype/main/assets/logo.svg" width="112" alt="dutype logo">
+<img src="https://raw.githubusercontent.com/william1010121/diskbytype/main/assets/logo.svg" width="112" alt="diskbytype logo">
 
-# dutype
+# diskbytype
 
 **Disk usage by kind.**<br>
-`du` tells you *where* your space went. dutype tells you *what* it is.
+`du` tells you *where* your space went. diskbytype tells you *what* it is.
 
-[![npm](https://img.shields.io/npm/v/dutype?logo=npm&color=cb3837)](https://www.npmjs.com/package/dutype)
-[![GitHub release](https://img.shields.io/github/v/release/william1010121/dutype?logo=github)](https://github.com/william1010121/dutype/releases/latest)
-[![CI](https://github.com/william1010121/dutype/actions/workflows/ci.yml/badge.svg)](https://github.com/william1010121/dutype/actions/workflows/ci.yml)
+[![npm](https://img.shields.io/npm/v/diskbytype?logo=npm&color=cb3837)](https://www.npmjs.com/package/diskbytype)
+[![GitHub release](https://img.shields.io/github/v/release/william1010121/diskbytype?logo=github)](https://github.com/william1010121/diskbytype/releases/latest)
+[![CI](https://github.com/william1010121/diskbytype/actions/workflows/ci.yml/badge.svg)](https://github.com/william1010121/diskbytype/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 **Try it now, nothing to install:**
 
 ```bash
-npx dutype
+npx diskbytype
 ```
 
-<img src="https://raw.githubusercontent.com/william1010121/dutype/main/assets/demo.gif" alt="dutype demo" width="900">
+<img src="https://raw.githubusercontent.com/william1010121/diskbytype/main/assets/demo.gif" alt="diskbytype demo" width="900">
 
 </div>
 
-Point dutype at a folder and it tells you, in one screen, how much of it is
+Point diskbytype at a folder and it tells you, in one screen, how much of it is
 **video, PDFs, archives, ML checkpoints, datasets** — and how much is
 **`node_modules`, Python virtualenvs, `.git`, build output and caches**. Every
 row gets a bar colored by what is inside it, so you can see *why* a folder is
@@ -31,9 +31,9 @@ big before you even open it.
 ## How it compares
 
 Tools like gdu, ncdu, dua and dust help locate large folders.
-dutype focuses on "big *with what*?" through category composition:
+diskbytype focuses on "big *with what*?" through category composition:
 
-| | **dutype** | gdu | ncdu | dua | dust | diskonaut |
+| | **diskbytype** | gdu | ncdu | dua | dust | diskonaut |
 |:---|:---:|:---:|:---:|:---:|:---:|:---:|
 | Breakdown by file type (video, PDF, model, …) | ✅ | filter only (`-T`) | — | — | raw extensions (`-t`), non-interactive | — |
 | Category composition for `node_modules`, venvs, `.git`, `target/`, caches | ✅ | — | — | — | — | — |
@@ -53,14 +53,14 @@ Python caches and virtual environments, Cargo `target` and Zig output/cache
 directories. Discovery respects traversal exclusions; in Git repositories,
 candidates must be ignored and contain no tracked files. Directories containing
 a `.git` entry are skipped. Nothing is deleted automatically. This is cleanup
-discovery, distinct from dutype's category-composition totals and per-row bars. This comparison credits documented
+discovery, distinct from diskbytype's category-composition totals and per-row bars. This comparison credits documented
 behavior, not a side-by-side runtime test.
 
 And it is the fastest of the bunch in 3 of our 4 benchmarks (see [Performance](#performance)).
 
 ### Directory rules, not just extensions
 
-dutype classifies **directories by what they are**, then files by extension:
+diskbytype classifies **directories by what they are**, then files by extension:
 
 - `node_modules/`, `bower_components/` → **node_modules**
 - any folder containing `pyvenv.cfg` or `conda-meta/` (whatever it is named) → **Python env**
@@ -77,78 +77,89 @@ syscalls.
 
 <table>
 <tr>
-<td width="50%"><img src="https://raw.githubusercontent.com/william1010121/dutype/main/assets/screenshot-projects.png" alt="Folder composition"><br><sub><b>What is each project made of?</b> Bars are split by category; the panel on the right breaks the current folder down.</sub></td>
-<td width="50%"><img src="https://raw.githubusercontent.com/william1010121/dutype/main/assets/screenshot-popup.png" alt="List every Python env"><br><sub><b>Select a category, press Enter</b>: every Python env (or node_modules, or the biggest PDFs) below this folder, largest first.</sub></td>
+<td width="50%"><img src="https://raw.githubusercontent.com/william1010121/diskbytype/main/assets/screenshot-projects.png" alt="Folder composition"><br><sub><b>What is each project made of?</b> Bars are split by category; the panel on the right breaks the current folder down.</sub></td>
+<td width="50%"><img src="https://raw.githubusercontent.com/william1010121/diskbytype/main/assets/screenshot-popup.png" alt="List every Python env"><br><sub><b>Select a category, press Enter</b>: every Python env (or node_modules, or the biggest PDFs) below this folder, largest first.</sub></td>
 </tr>
 <tr>
-<td width="50%"><img src="https://raw.githubusercontent.com/william1010121/dutype/main/assets/screenshot-extensions.png" alt="Extension mode"><br><sub><b>Press <code>m</code></b> to switch from categories to raw extensions, with file counts.</sub></td>
-<td width="50%"><img src="https://raw.githubusercontent.com/william1010121/dutype/main/assets/screenshot-nerd.png" alt="Nerd Font icons"><br><sub><b>Icons</b>: emoji by default, Nerd Font glyphs with <code>--icons nerd</code>, or none.</sub></td>
+<td width="50%"><img src="https://raw.githubusercontent.com/william1010121/diskbytype/main/assets/screenshot-extensions.png" alt="Extension mode"><br><sub><b>Press <code>m</code></b> to switch from categories to raw extensions, with file counts.</sub></td>
+<td width="50%"><img src="https://raw.githubusercontent.com/william1010121/diskbytype/main/assets/screenshot-nerd.png" alt="Nerd Font icons"><br><sub><b>Icons</b>: emoji by default, Nerd Font glyphs with <code>--icons nerd</code>, or none.</sub></td>
 </tr>
 </table>
+
+## Renamed from dutype
+
+diskbytype was called **dutype** until 0.1.4. The `dutype` command is still
+installed as an alias and behaves identically, so existing scripts and MCP
+configs keep working (the npm package and the GitHub repository moved to the
+new name). New defaults are `~/.config/diskbytype/config.toml` and
+`~/.cache/diskbytype`; the old `~/.config/dutype/config.toml` is still read if
+the new file does not exist, and `$DUTYPE_CONFIG` / `$DUTYPE_CACHE_DIR` are
+honoured when the `DISKBYTYPE_*` ones are not set. Old cache snapshots are
+ignored (and never counted), so the first `--cache` scan runs in full.
 
 ## Install
 
 **Match the docs to your build.** This README on `main` describes current source;
 npm and release installers below use published binaries (currently
-[v0.1.4](https://github.com/william1010121/dutype/releases/tag/v0.1.4)). For that
-release, use its [tagged README](https://github.com/william1010121/dutype/blob/v0.1.4/README.md)
-and [tagged agent skill](https://github.com/william1010121/dutype/blob/v0.1.4/skills/dutype/SKILL.md)
+[v0.1.4](https://github.com/william1010121/diskbytype/releases/tag/v0.1.4)). For that
+release, use its [tagged README](https://github.com/william1010121/diskbytype/blob/v0.1.4/README.md)
+and [tagged agent skill](https://github.com/william1010121/diskbytype/blob/v0.1.4/skills/dutype/SKILL.md)
 directly, not the tagged README’s older skill-download snippet pointing to `main`.
 Newer options such as `--include-files` and MCP pagination need a matching source
 build (the **From source** method below), not merely an installed release. Check
-`dutype --help` and MCP tool schemas: development builds can retain the release
+`diskbytype --help` and MCP tool schemas: development builds can retain the release
 version string. Update these documentation pins with future releases.
 
 **Run without installing** (needs Node.js 16+; downloads a native binary, nothing runs in Node):
 
 ```bash
-npx dutype                 # current directory
-npx dutype ~/Projects      # any directory
-npx dutype --report ~      # plain-text report
+npx diskbytype                 # current directory
+npx diskbytype ~/Projects      # any directory
+npx diskbytype --report ~      # plain-text report
 ```
 
 **Install:**
 
 | Method | Command |
 |:---|:---|
-| npm | `npm install -g dutype` |
-| Shell (macOS, Linux) | `curl -LsSf https://github.com/william1010121/dutype/releases/latest/download/dutype-installer.sh \| sh` |
-| PowerShell (Windows) | `irm https://github.com/william1010121/dutype/releases/latest/download/dutype-installer.ps1 \| iex` |
-| Binaries | [GitHub Releases](https://github.com/william1010121/dutype/releases/latest): macOS (arm64, x64), Linux (x64, arm64, static musl), Windows (x64) |
-| From source | `cargo install --git https://github.com/william1010121/dutype` |
+| npm | `npm install -g diskbytype` |
+| Shell (macOS, Linux) | `curl -LsSf https://github.com/william1010121/diskbytype/releases/latest/download/diskbytype-installer.sh \| sh` |
+| PowerShell (Windows) | `irm https://github.com/william1010121/diskbytype/releases/latest/download/diskbytype-installer.ps1 \| iex` |
+| Binaries | [GitHub Releases](https://github.com/william1010121/diskbytype/releases/latest): macOS (arm64, x64), Linux (x64, arm64, static musl), Windows (x64) |
+| From source | `cargo install --git https://github.com/william1010121/diskbytype` |
 
-Coming soon: `cargo install dutype` (crates.io), `pip install dutype` / `uv tool install dutype` (PyPI) and `brew install william1010121/tap/dutype`.
+Coming soon: `cargo install diskbytype` (crates.io), `pip install diskbytype` / `uv tool install diskbytype` (PyPI) and `brew install william1010121/tap/diskbytype`.
 
 **Kaggle / Colab / Jupyter**: notebooks have no TTY, so use the report modes.
 The shell installer only needs `curl` and puts the binary in `~/.cargo/bin`:
 
 ```python
-!curl -LsSf https://github.com/william1010121/dutype/releases/latest/download/dutype-installer.sh | sh
-!~/.cargo/bin/dutype --report --top 10 /kaggle/working
-!~/.cargo/bin/dutype --report --category "ML model" /kaggle/input
+!curl -LsSf https://github.com/william1010121/diskbytype/releases/latest/download/diskbytype-installer.sh | sh
+!~/.cargo/bin/diskbytype --report --top 10 /kaggle/working
+!~/.cargo/bin/diskbytype --report --category "ML model" /kaggle/input
 ```
 
-If the notebook has Node.js, `!npx -y dutype --report /kaggle/working` works too.
+If the notebook has Node.js, `!npx -y diskbytype --report /kaggle/working` works too.
 
 ## Usage
 
 ```bash
-npx dutype             # try it without installing
-dutype                 # current directory, interactive
-dutype ~/Projects      # any directory
-dutype --report ~      # plain-text report
-dutype --json ~        # JSON report
-dutype --json --category node_modules ~   # largest node_modules with sizes (default: 20)
-dutype --cache ~       # reuse the last scan of ~ (instant), save new ones
-dutype --refresh ~     # rescan and update the disk cache
-dutype --json --private ~/.cache/uv   # macOS: also what deleting each partial clone frees
-dutype --clones --size-mode dedup /data     # count clones / reflinked extents once
+npx diskbytype             # try it without installing
+diskbytype                 # current directory, interactive
+diskbytype ~/Projects      # any directory
+diskbytype --report ~      # plain-text report
+diskbytype --json ~        # JSON report
+diskbytype --json --category node_modules ~   # largest node_modules with sizes (default: 20)
+diskbytype --cache ~       # reuse the last scan of ~ (instant), save new ones
+diskbytype --refresh ~     # rescan and update the disk cache
+diskbytype --json --private ~/.cache/uv   # macOS: also what deleting each partial clone frees
+diskbytype --clones --size-mode dedup /data     # count clones / reflinked extents once
 ```
 
-With `--cache`, scans are saved in `~/.cache/dutype` (`$XDG_CACHE_HOME/dutype`,
-`%LOCALAPPDATA%\dutype\cache` on Windows, or `$DUTYPE_CACHE_DIR`). A cache is
+With `--cache`, scans are saved in `~/.cache/diskbytype` (`$XDG_CACHE_HOME/diskbytype`,
+`%LOCALAPPDATA%\diskbytype\cache` on Windows, or `$DISKBYTYPE_CACHE_DIR`). A cache is
 reused until you rescan (`r` for the current folder, `R` for everything) or pass `--refresh`; it is ignored automatically
-after a dutype upgrade or a category rule change. dutype never counts its own
+after a diskbytype upgrade or a category rule change. diskbytype never counts its own
 cache directory, so totals are the same with or without `--cache`. Snapshots
 list every file name, so they are private: the cache directory must belong to
 you and is set to mode 0700, snapshots to 0600. `--json` reports `cached_at`
@@ -162,7 +173,7 @@ you and is set to mode 0700, snapshots to 0600. `--json` reports `cached_at`
 | `Tab` | switch between the folder list and the breakdown |
 | `m` | categories ⇄ extensions |
 | `c` | sizes: allocated (like `du`) ⇄ deduplicated (APFS clones or shared extents counted once; needs `--clones`) |
-| `s` | in a category/extension result popup: jump inside dutype to the directory, or select the file in its parent |
+| `s` | in a category/extension result popup: jump inside diskbytype to the directory, or select the file in its parent |
 | `o` | reveal in Finder / Explorer / file manager (also `Enter` in a result popup) |
 | `y` | copy the selected path to the clipboard (OSC 52 over SSH) |
 | `r` | rescan the current folder only (fast; updates the `--cache`) |
@@ -175,7 +186,7 @@ Extension breakdown rows use allocated size descending, then display label ascen
 <summary>All options</summary>
 
 ```text
-Usage: dutype [OPTIONS] [PATH]
+Usage: diskbytype [OPTIONS] [PATH]
 
 Arguments:
   [PATH]  Directory to analyze [default: .]
@@ -187,11 +198,11 @@ Options:
       --include-files    With --category and --report / --json: add matching files for mixed categories
       --top <N>          Number of entries in each list of --report / --json [default: 20]
       --cross-fs         Descend into other filesystems / mount points
-      --config <FILE>    Category config file [default: ~/.config/dutype/config.toml]
+      --config <FILE>    Category config file [default: ~/.config/diskbytype/config.toml]
       --icons <SET>      Icon set for categories [possible values: emoji, nerd, none]
       --dump-config      Print the built-in category rules (a config template) and exit
       --mcp              Run as an MCP server on stdio, for LLM agents
-      --cache            Reuse the last scan of this path if there is one, and save new scans (in ~/.cache/dutype, or $DUTYPE_CACHE_DIR)
+      --cache            Reuse the last scan of this path if there is one, and save new scans (in ~/.cache/diskbytype, or $DISKBYTYPE_CACHE_DIR)
       --refresh          Ignore a cached scan: scan again and update the cache (implies --cache)
       --clones           Detect shared blocks: APFS clones (macOS) or, on Linux btrfs / XFS / bcachefs, reflinked and snapshot-shared extents. Counts them once (dedup sizes, the TUI's `c` key) and gives a lower bound of what deleting each item frees. Makes scans slower [alias: --reflinks]
       --size-mode <MODE> Size to show and sort by: `du` (allocated, like `du -skx`) or `dedup` (each APFS clone family or shared extent counted once; implies --clones) [default: du]
@@ -221,9 +232,9 @@ benchmark](bench/hardlinks.md) for the measured time and peak-memory tradeoff.
 
 On APFS (macOS), `cp -c`, Finder's Duplicate, uv, bun and pnpm make *clones*:
 files with their own inode that share their blocks with another file. `du`,
-and dutype's main number, count every clone in full, so a `.venv` or
+and diskbytype's main number, count every clone in full, so a `.venv` or
 `node_modules` cloned from a package cache can look huge while deleting it
-frees almost nothing. With `--clones`, dutype detects identical clones while
+frees almost nothing. With `--clones`, diskbytype detects identical clones while
 it scans and adds two numbers next to the `du` size:
 
 - **dedup**: the size with each clone family counted once (on one member,
@@ -292,7 +303,7 @@ Known limitations:
 
 `cp --reflink`, deduplication tools and btrfs snapshots share extents between
 files the same way. With `--clones` (alias `--reflinks`; MCP: `clones: true`),
-when the scan root is on btrfs, XFS (`reflink=1`) or bcachefs, dutype reads
+when the scan root is on btrfs, XFS (`reflink=1`) or bcachefs, diskbytype reads
 every file's extent map (`FS_IOC_FIEMAP`, one ioctl per file: about 3–6×
 slower on a warm cache, still several times faster than `btrfs filesystem du`)
 and finds the physical ranges shared with other files. Then:
@@ -338,18 +349,18 @@ extents are not read at all (dedup equals the `du` size).
 | | | 📜 Log | ⏳ Temp/backup |
 | | | 🧩 Binary | 💻 Code |
 
-`dutype --dump-config` prints every rule.
+`diskbytype --dump-config` prints every rule.
 
 ### Make it yours
 
-Add rules in `~/.config/dutype/config.toml` (or pass `--config`). A
+Add rules in `~/.config/diskbytype/config.toml` (or pass `--config`). A
 `[[category]]` with an existing name extends it; a new name creates a category.
 
-Config paths are selected in this order: `--config FILE`, `$DUTYPE_CONFIG`,
-then `$XDG_CONFIG_HOME/dutype/config.toml` (or `~/.config/dutype/config.toml`
+Config paths are selected in this order: `--config FILE`, `$DISKBYTYPE_CONFIG` (or the legacy `$DUTYPE_CONFIG`),
+then `$XDG_CONFIG_HOME/diskbytype/config.toml` (or `~/.config/diskbytype/config.toml`
 when `XDG_CONFIG_HOME` is unset). Windows uses
-`%APPDATA%\dutype\config.toml` for the default location. A missing implicit
-config, including a missing `$DUTYPE_CONFIG` target or dangling symlink, uses
+`%APPDATA%\diskbytype\config.toml` for the default location. A missing implicit
+config, including a missing `$DISKBYTYPE_CONFIG` (or the legacy `$DUTYPE_CONFIG`) target or dangling symlink, uses
 only the built-in rules; no config file is created. Other read errors (such
 as permission denied), invalid UTF-8 and invalid config contents stop startup
 before scanning, including in `--report`, `--json` and `--mcp` modes.
@@ -382,8 +393,8 @@ still lists matching directories only. To include loose exports as well with a
 matching source build (`--include-files` is not in v0.1.4; see [Install](#install)):
 
 ```sh
-dutype --json --category Unity --include-files /projects
-# or: dutype --report --category Unity --include-files /projects
+diskbytype --json --category Unity --include-files /projects
+# or: diskbytype --report --category Unity --include-files /projects
 ```
 
 This adds files only when both their scanned category and their direct filename
@@ -400,12 +411,12 @@ root/directory-own bytes and inherited files can remain outside the list.
 
 ## For LLM agents
 
-dutype is built to be called by agents as well as people.
+diskbytype is built to be called by agents as well as people.
 
-**JSON** — `dutype --json PATH` returns totals, every category's share, the
+**JSON** — `diskbytype --json PATH` returns totals, every category's share, the
 biggest children, the biggest special directories (the usual cleanup
 candidates) and the biggest files, with absolute paths and byte sizes (here
-`dutype --json --clones ~` on a Mac):
+`diskbytype --json --clones ~` on a Mac):
 
 ```json
 {
@@ -506,13 +517,13 @@ are reported. A `--cache` snapshot made with `--private` keeps the values (and
 also serves runs without it); one made without it is not used for a `--private`
 run.
 
-**MCP server** — `dutype --mcp` exposes two read-only tools,
+**MCP server** — `diskbytype --mcp` exposes two read-only tools,
 `disk_usage(path, top?, cross_fs?, refresh?, clones?, size_mode?, private?)` and
 `find_by_category(path, category, top?, cross_fs?, refresh?, clones?, size_mode?, private?, include_files?, paginate?, cursor?)`
 (`clones: true`, `size_mode: "dedup"` or `private: true` turns on clone detection).
 They never write files.
-With `dutype --mcp --cache`, repeated calls on the same path reuse the scan from
-memory (or a snapshot the CLI saved in `~/.cache/dutype`) instead of walking the
+With `diskbytype --mcp --cache`, repeated calls on the same path reuse the scan from
+memory (or a snapshot the CLI saved in `~/.cache/diskbytype`) instead of walking the
 disk again. `refresh: true` rescans and replaces only that session's in-memory
 snapshot; MCP never writes or replaces the CLI's disk cache. A new MCP session
 can still load the old disk snapshot until a CLI run with `--refresh` updates it.
@@ -521,7 +532,7 @@ can still load the old disk snapshot until a CLI run with `--refresh` updates it
 ### Sequential category pages
 
 For an occasional complete category inventory beyond 500 matches, start the
-server with `dutype --mcp --cache` (without server-wide `--refresh`) and opt in:
+server with `diskbytype --mcp --cache` (without server-wide `--refresh`) and opt in:
 
 ```json
 {"path":"/data/projects","category":"node_modules","top":500,"paginate":true}
@@ -580,18 +591,18 @@ existing session cache's total memory across different roots is not capped.
 Add the server to an MCP client:
 
 ```bash
-claude mcp add dutype -- npx -y dutype --mcp      # Claude Code
-codex mcp add dutype -- npx -y dutype --mcp       # Codex CLI
+claude mcp add diskbytype -- npx -y diskbytype --mcp      # Claude Code
+codex mcp add diskbytype -- npx -y diskbytype --mcp       # Codex CLI
 ```
 
 ```json
-{ "mcpServers": { "dutype": { "command": "npx", "args": ["-y", "dutype", "--mcp"] } } }
+{ "mcpServers": { "diskbytype": { "command": "npx", "args": ["-y", "diskbytype", "--mcp"] } } }
 ```
 
-(Claude Desktop, Cursor and other MCP clients.) With dutype installed, use
-`dutype --mcp` as the command instead of `npx -y dutype --mcp`.
+(Claude Desktop, Cursor and other MCP clients.) With diskbytype installed, use
+`diskbytype --mcp` as the command instead of `npx -y diskbytype --mcp`.
 
-**Agent skill** — [`skills/dutype/SKILL.md`](skills/dutype/SKILL.md) teaches an
+**Agent skill** — [`skills/diskbytype/SKILL.md`](skills/diskbytype/SKILL.md) teaches an
 agent the "my disk is full" workflow. For Claude Code:
 
 The install below pins the skill to the current published release, **v0.1.4**,
@@ -601,8 +612,8 @@ use it only with a matching source build. Check CLI help and the MCP tool schema
 before relying on options from a different revision.
 
 ```bash
-mkdir -p ~/.claude/skills/dutype && curl -fsSL -o ~/.claude/skills/dutype/SKILL.md \
-  https://raw.githubusercontent.com/william1010121/dutype/v0.1.4/skills/dutype/SKILL.md
+mkdir -p ~/.claude/skills/diskbytype && curl -fsSL -o ~/.claude/skills/diskbytype/SKILL.md \
+  https://raw.githubusercontent.com/william1010121/diskbytype/v0.1.4/skills/dutype/SKILL.md
 ```
 
 When a new version is released, update this pin and the packaged skill guidance
@@ -615,12 +626,12 @@ There is also an [`llms.txt`](llms.txt).
 
 ## Performance
 
-Mean wall time, lower is better. dutype also classifies every file while it
+Mean wall time, lower is better. diskbytype also classifies every file while it
 scans; the others only sum sizes.
 
 | | `~` warm | `~` cold | `/usr` warm | `/usr` cold |
 |:---|---:|---:|---:|---:|
-| **dutype** 0.1.0 | **304 ms** | 1.02 s | **79 ms** | **300 ms** |
+| **diskbytype** 0.1.0 | **304 ms** | 1.02 s | **79 ms** | **300 ms** |
 | gdu 5.38.0 | 393 ms | **0.93 s** ± 0.11 | 114 ms | 382 ms |
 | dua-cli 2.45.1 | 476 ms | 1.07 s | 128 ms | 308 ms |
 | dust 1.2.6 | 639 ms | 1.33 s | 148 ms | 371 ms |
@@ -628,23 +639,23 @@ scans; the others only sum sizes.
 | ncdu 2.9.1 (default, 1 thread) | 3,237 ms | 13.55 s | 901 ms | 3,938 ms |
 | GNU du 9.4 | 2,056 ms | 12.65 s | 558 ms | 3,660 ms |
 
-- **Warm cache** (repeat scans): dutype is 1.3–2× faster than the other parallel tools.
-- **Cold cache** (first scan after boot): everything is bound by the SSD. dutype,
-  dua and gdu are within run-to-run noise of each other on `~`; dutype is
+- **Warm cache** (repeat scans): diskbytype is 1.3–2× faster than the other parallel tools.
+- **Cold cache** (first scan after boot): everything is bound by the SSD. diskbytype,
+  dua and gdu are within run-to-run noise of each other on `~`; diskbytype is
   fastest on `/usr`.
 
 CPU time and peak memory (warm, mean of 5 runs, GNU time):
 
 | | `~` CPU | `~` peak RSS | `/usr` CPU | `/usr` peak RSS |
 |:---|---:|---:|---:|---:|
-| **dutype** | **3.46 s** | 117 MiB | **0.90 s** | 35 MiB |
+| **diskbytype** | **3.46 s** | 117 MiB | **0.90 s** | 35 MiB |
 | gdu | 4.62 s | 99 MiB | 1.26 s | 34 MiB |
 | dua-cli | 5.52 s | **27 MiB** | 1.32 s | **8 MiB** |
 | dust | 6.88 s | 245 MiB | 1.59 s | 59 MiB |
 | ncdu `-t 16` † | 2.76 s | 49 MiB | 0.65 s | 9 MiB |
 | GNU du (1 thread) | 2.05 s | 10 MiB | 0.55 s | 5 MiB |
 
-dutype uses the least CPU of the parallel tools. It keeps the whole tree in
+diskbytype uses the least CPU of the parallel tools. It keeps the whole tree in
 memory (so the TUI can browse it without rescanning) plus a per-directory
 category breakdown, which costs more RAM than dua's streaming aggregate.
 † ncdu runs in export mode (`-o /dev/null`), which streams instead of keeping
@@ -661,9 +672,9 @@ a tree, so its memory is not comparable.
   runs + 10 measured. Cold: 5 runs, `sync; echo 3 > /proc/sys/vm/drop_caches`
   before each.
 - Every tool stays on one filesystem and runs non-interactively:
-  `dutype --report`, `dua -x aggregate`, `gdu -npsx`, `dust -x -d 0 -P`,
+  `diskbytype --report`, `dua -x aggregate`, `gdu -npsx`, `dust -x -d 0 -P`,
   `ncdu -x -0 -o /dev/null`, `du -skx`. Totals agree across tools.
-- No tuning: dutype uses one thread per logical CPU, like everywhere else.
+- No tuning: diskbytype uses one thread per logical CPU, like everywhere else.
 - Scripts and raw results: [`bench/`](bench/).
 
 </details>

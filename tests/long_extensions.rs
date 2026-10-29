@@ -22,7 +22,7 @@ impl Fixture {
     fn new(config: &str) -> Self {
         let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let base = std::env::temp_dir().join(format!(
-            "dutype-long-extensions-{}-{nonce}-{}",
+            "diskbytype-long-extensions-{}-{nonce}-{}",
             std::process::id(),
             NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
         ));
@@ -38,7 +38,7 @@ impl Fixture {
     }
 
     fn run(&self, options: &[&str]) -> Value {
-        let output = Command::new(env!("CARGO_BIN_EXE_dutype"))
+        let output = Command::new(env!("CARGO_BIN_EXE_diskbytype"))
             .arg("--config")
             .arg(&self.config)
             .arg("--json")

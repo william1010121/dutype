@@ -1670,7 +1670,7 @@ mod tests {
 
     #[test]
     fn top_n_ties_use_the_same_path_order_as_sorting() {
-        let root_path = std::env::temp_dir().join(format!("dutype-report-ties-{}", std::process::id()));
+        let root_path = std::env::temp_dir().join(format!("diskbytype-report-ties-{}", std::process::id()));
         std::fs::create_dir(&root_path).unwrap();
         for name in ["a.rs", "b.rs", "c.rs"] {
             std::fs::write(root_path.join(name), []).unwrap();
@@ -1711,7 +1711,7 @@ mod tests {
     #[test]
     fn private_sizes_skip_lossy_names() {
         use crate::scan::{Progress, scan_excluding};
-        let d = std::env::temp_dir().join(format!("dutype-report-lossy-{}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("diskbytype-report-lossy-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         let mut f = d.clone();

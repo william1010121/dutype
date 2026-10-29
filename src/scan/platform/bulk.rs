@@ -462,7 +462,7 @@ mod tests {
     /// length, returned set, then the name's attrreference pointing just
     /// past itself. Later attributes are left out.
     fn synthetic(tag: &str, common: u32, error: u32) -> (std::path::PathBuf, Fd, Vec<u8>) {
-        let d = std::env::temp_dir().join(format!("dutype-bulk-{tag}-{}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("diskbytype-bulk-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(d.join("f.bin"), vec![1u8; 10_000]).unwrap();

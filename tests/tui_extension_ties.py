@@ -17,7 +17,7 @@ def main():
     output = args.output
     output.mkdir(parents=True, exist_ok=True)
     expected = ['.mp4', '.pdf', '.rs', '.zip', '(none)', '.é', '.中']
-    with tempfile.TemporaryDirectory(prefix='dutype-ext-ties-') as tmp:
+    with tempfile.TemporaryDirectory(prefix='diskbytype-ext-ties-') as tmp:
         root = Path(tmp) / 'tree'
         root.mkdir()
         for extension in ['zip', 'rs', 'pdf', 'mp4']:

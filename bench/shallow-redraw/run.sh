@@ -2,7 +2,7 @@
 # Standalone build copy. Never changes production Cargo.toml or builds in it.
 set -euo pipefail
 repo=$(cd "$(dirname "$0")/../.." && pwd)
-work=$(mktemp -d "${TMPDIR:-/tmp}/dutype-shallow-redraw.XXXXXX")
+work=$(mktemp -d "${TMPDIR:-/tmp}/diskbytype-shallow-redraw.XXXXXX")
 printf 'Isolated benchmark build: %s\n' "$work" >&2
 cp "$repo/Cargo.toml" "$repo/Cargo.lock" "$work/"
 cp -R "$repo/src" "$work/src"

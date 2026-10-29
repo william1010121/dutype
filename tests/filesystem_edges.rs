@@ -24,7 +24,7 @@ impl Fixture {
     fn new(name: &str) -> Self {
         let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let base = std::env::temp_dir().join(format!(
-            "dutype-edge-{name}-{}-{nonce}-{}",
+            "diskbytype-edge-{name}-{}-{nonce}-{}",
             std::process::id(),
             NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
         ));
@@ -45,7 +45,7 @@ impl Fixture {
     }
 
     fn command_for_top(&self, format: &str, top: usize) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_dutype"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_diskbytype"));
         command
             .arg(format)
             .arg("--config")
@@ -561,7 +561,7 @@ fn symlink_loop_as_root_fails_cleanly_without_json_or_hanging() {
         "an invalid root must not emit a partial JSON document"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.starts_with("dutype: "), "missing CLI error prefix: {stderr}");
+    assert!(stderr.starts_with("diskbytype: "), "missing CLI error prefix: {stderr}");
     assert!(
         stderr.contains(fixture.root.to_str().unwrap()),
         "error should identify the invalid root: {stderr}"
@@ -809,7 +809,7 @@ fn relative_root_reports_absolute_paths() {
     let fixture = Fixture::new("relative-root");
     fs::write(fixture.root.join("paper.pdf"), b"content").unwrap();
     let output = bounded_output(
-        Command::new(env!("CARGO_BIN_EXE_dutype"))
+        Command::new(env!("CARGO_BIN_EXE_diskbytype"))
             .args(["--json", "--config"])
             .arg(&fixture.config)
             .arg("tree")
@@ -1013,7 +1013,7 @@ fn include_files_rejects_ignored_cli_combinations_before_any_scan_or_server() {
         vec!["--include-files", "--category", "PDF", "--report", "--dump-config"],
     ] {
         let output = bounded_output(
-            Command::new(env!("CARGO_BIN_EXE_dutype"))
+            Command::new(env!("CARGO_BIN_EXE_diskbytype"))
                 .args(&args)
                 .arg("--config")
                 .arg(&fixture.config)

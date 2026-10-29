@@ -109,7 +109,7 @@ def build(args):
                 command += ['--features', 'bench_metrics']
             with (root / 'logs' / f'build-{variant}-{suffix}.log').open('w') as stream:
                 subprocess.run(command, env=env, stdout=stream, stderr=subprocess.STDOUT, check=True)
-            shutil.copy2(root / f'target-{variant}/release/dutype', root / 'bin' / f'{variant}-{suffix}')
+            shutil.copy2(root / f'target-{variant}/release/diskbytype', root / 'bin' / f'{variant}-{suffix}')
     if platform.system() == 'Linux':
         subprocess.run([os.environ.get('CC', 'cc'), '-O2', '-Wall', '-Wextra', '-Werror', str(HERE / 'rss_exec.c'), '-o', str(root / 'bin/rss_exec')], check=True)
     check_identities(root, metadata, root / 'binary-identities.json')
