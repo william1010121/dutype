@@ -8,7 +8,7 @@ fn deep_directory_json_finishes_without_stack_overflow() {
         thread,
         time::{Duration, Instant},
     };
-    let root = std::env::temp_dir().join(format!("dutype-deep-{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!("diskbytype-deep-{}", std::process::id()));
     fs::create_dir(&root).unwrap();
     struct Tree(Vec<std::path::PathBuf>);
     impl Drop for Tree {
@@ -34,7 +34,7 @@ fn deep_directory_json_finishes_without_stack_overflow() {
     // Cold then repeated cache-enabled scans exercise full snapshot writing
     // and loading. The final request must be a cache hit, not a silent rescan.
     for (use_cache, expect_hit) in [(false, false), (true, false), (true, true)] {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_dutype"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_diskbytype"));
         if use_cache {
             command.arg("--cache");
         }

@@ -325,7 +325,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     let cur = app.current();
     let total = app.shown_total(cur);
     let dedup = app.size_mode == SizeMode::Dedup;
-    let mut left = vec![Span::raw(" "), chip("◆ dutype", ACCENT), Span::raw(" ")];
+    let mut left = vec![Span::raw(" "), chip("◆ diskbytype", ACCENT), Span::raw(" ")];
     if dedup {
         left.push(chip("dedup", Color::Indexed(117)));
         left.push(Span::raw(" "));
@@ -776,7 +776,7 @@ pub fn draw_scanning(f: &mut Frame, path: &Path, files: u64, bytes: u64, elapsed
         .border_style(Style::new().fg(ACCENT))
         .title(Line::from(vec![
             Span::raw(" "),
-            chip("◆ dutype", ACCENT),
+            chip("◆ diskbytype", ACCENT),
             Span::raw(" "),
         ]))
         .title_bottom(keycaps(&[("q", "abort")]).right_aligned())

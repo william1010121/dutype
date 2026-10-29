@@ -1,16 +1,18 @@
 # AGENTS.md
 
-dutype is a Rust disk usage analyzer that attributes every byte to a category
+diskbytype (formerly `dutype`, still shipped as an alias binary) is a Rust disk usage analyzer that attributes every byte to a category
 (file types and special directories such as node_modules or Python envs). It
 has a ratatui TUI, `--report` / `--json` output and an MCP server (`--mcp`).
 
 ## Layout
 
+- `src/lib.rs`: the CLI (`run_cli`); `src/main.rs` (`diskbytype`) and
+  `src/bin/dutype.rs` (compat alias) are one-line wrappers around it.
 - `src/scan.rs`: parallel directory scan (rayon), tree, top-N helpers. Hot path.
 - `src/category.rs`: category registry built from `src/default_config.toml`
-  plus the user's `~/.config/dutype/config.toml`.
+  plus the user's `~/.config/diskbytype/config.toml`.
 - `src/report.rs`: text and JSON reports, `find` by category.
-- `src/cache.rs`: `--cache` snapshots of a scan in `~/.cache/dutype`, keyed
+- `src/cache.rs`: `--cache` snapshots of a scan in `~/.cache/diskbytype`, keyed
   by path and invalidated by the category rules' fingerprint.
 - `src/mcp.rs`: MCP server over stdio (JSON-RPC, one message per line).
 - `src/app.rs`, `src/ui.rs`: TUI state and rendering.
@@ -51,7 +53,7 @@ hand-edited (`allow-dirty = ["ci"]`): if you run `dist generate`, keep its
 ### Correctness
 
 - Sizes are allocated bytes (`blocks * 512` on unix) and hard links count once;
-  totals must keep matching `du -skx`, except that dutype's own cache
+  totals must keep matching `du -skx`, except that diskbytype's own cache
   directory is always skipped (so `--cache` never changes the totals).
 - Directory rules beat extension rules; inside a non-weak special directory,
   every file inherits its category.

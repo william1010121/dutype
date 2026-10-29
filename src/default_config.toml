@@ -1,7 +1,7 @@
-# dutype built-in categories.
+# diskbytype built-in categories.
 #
-# Print this file with `dutype --dump-config`. Put your own rules in
-# ~/.config/dutype/config.toml (or pass --config): a [[category]] with an
+# Print this file with `diskbytype --dump-config`. Put your own rules in
+# ~/.config/diskbytype/config.toml (or pass --config): a [[category]] with an
 # existing name extends it, a new name adds a category.
 #
 # Fields:

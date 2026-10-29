@@ -763,7 +763,7 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     fn temp(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("dutype-account-{name}-{}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("diskbytype-account-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d
@@ -1625,7 +1625,7 @@ mod synthetic {
     #[test]
     fn unreadable_family_size_is_not_read_again() {
         let mut root = tree(false);
-        account(&mut root, Some(Path::new("/nonexistent-dutype-root")));
+        account(&mut root, Some(Path::new("/nonexistent-diskbytype-root")));
         assert_eq!(root.freeable(), S);
         let d = root.children()[0].dir.as_ref().unwrap();
         assert!(d.shared().iter().all(|s| s.refcnt == 1));
@@ -1754,7 +1754,7 @@ mod extent_tests {
     #[test]
     fn shared_extents_count_once_at_the_first_path() {
         const M: u64 = 1 << 20;
-        let d = std::env::temp_dir().join(format!("dutype-account-extents-{}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("diskbytype-account-extents-{}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(d.join("sub")).unwrap();
         for f in ["a", "c", "sub/b", "plain"] {

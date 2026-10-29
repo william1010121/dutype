@@ -52,7 +52,7 @@ def main():
     output.mkdir(parents=True, exist_ok=True)
     binary_hash = hashlib.sha256(binary.read_bytes()).hexdigest()
     results = []
-    with tempfile.TemporaryDirectory(prefix="dutype-tui-ties-") as temp:
+    with tempfile.TemporaryDirectory(prefix="diskbytype-tui-ties-") as temp:
         for count, size in [(499, 1), (500, 1), (501, 1), (501, 0)]:
             root = Path(temp) / f"files-{count}-{size}"
             root.mkdir()

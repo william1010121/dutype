@@ -24,7 +24,7 @@ impl Fixture {
     fn new() -> Self {
         let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let base = std::env::temp_dir().join(format!(
-            "dutype-mcp-pagination-{}-{nonce}-{}",
+            "diskbytype-mcp-pagination-{}-{nonce}-{}",
             std::process::id(),
             NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
         ));
@@ -36,7 +36,7 @@ impl Fixture {
     }
 
     fn command(&self, threads: &str) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_dutype"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_diskbytype"));
         command
             .arg("--config")
             .arg(&self.config)
@@ -113,7 +113,7 @@ fn wait_for_exit(child: &mut Child) -> std::process::ExitStatus {
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            panic!("dutype subprocess timed out");
+            panic!("diskbytype subprocess timed out");
         }
         thread::sleep(Duration::from_millis(10));
     }

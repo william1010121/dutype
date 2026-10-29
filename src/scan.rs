@@ -898,8 +898,8 @@ struct Ctx<'a> {
     /// Detect APFS clones (`--clones`).
     clones: bool,
     seen_inodes: Mutex<FxHashSet<(u64, u64)>>,
-    /// A directory never to descend into (dutype's own cache), as (name, full path).
-    exclude: Option<(OsString, PathBuf)>,
+    /// Directories never to descend into (diskbytype's own caches), as (name, full path).
+    exclude: Vec<(OsString, PathBuf)>,
 }
 
 impl Ctx<'_> {
@@ -976,14 +976,14 @@ fn file_name_of(p: &Path) -> String {
         .unwrap_or_default()
 }
 
-/// Scan `root`. dutype's own cache directory is always skipped, so `--cache`
+/// Scan `root`. diskbytype's own cache directories are always skipped, so `--cache`
 /// writing a snapshot under the scanned tree never changes the totals.
 /// `clones` also reads APFS clone identity (`--clones`), which costs time.
 pub fn scan(root: &Path, one_fs: bool, clones: bool, progress: &Progress) -> std::io::Result<Node> {
-    let cache_dir = crate::cache::dir().and_then(|d| fs::canonicalize(d).ok());
-    scan_excluding(root, one_fs, clones, progress, cache_dir.as_deref())
+    scan_root(root, one_fs, clones, progress, crate::cache::skip_dirs(), None, None)
 }
 
+#[cfg(test)]
 pub fn scan_excluding(
     root: &Path,
     one_fs: bool,
@@ -991,7 +991,15 @@ pub fn scan_excluding(
     progress: &Progress,
     exclude: Option<&Path>,
 ) -> std::io::Result<Node> {
-    scan_root(root, one_fs, clones, progress, exclude, None, None)
+    scan_root(
+        root,
+        one_fs,
+        clones,
+        progress,
+        exclude.map(Path::to_path_buf).into_iter().collect(),
+        None,
+        None,
+    )
 }
 
 /// Rescan one directory of an existing tree. `inherited` is the special
@@ -1016,13 +1024,12 @@ pub fn scan_subtree(
     if one_fs && root_dev.is_some_and(|dev| device_of(path).ok() != Some(dev)) {
         return Err(std::io::Error::other("now on another filesystem"));
     }
-    let cache_dir = crate::cache::dir().and_then(|d| fs::canonicalize(d).ok());
     scan_root(
         path,
         one_fs,
         clones,
         progress,
-        cache_dir.as_deref(),
+        crate::cache::skip_dirs(),
         inherited,
         root_dev,
     )
@@ -1043,7 +1050,7 @@ fn scan_root(
     one_fs: bool,
     clones: bool,
     progress: &Progress,
-    exclude: Option<&Path>,
+    exclude: Vec<PathBuf>,
     inherited: Option<Category>,
     root_dev: Option<u64>,
 ) -> std::io::Result<Node> {
@@ -1063,7 +1070,10 @@ fn scan_root(
         one_fs,
         clones,
         seen_inodes: Mutex::new(FxHashSet::default()),
-        exclude: exclude.and_then(|p| Some((p.file_name()?.to_os_string(), p.to_path_buf()))),
+        exclude: exclude
+            .into_iter()
+            .filter_map(|p| Some((p.file_name()?.to_os_string(), p)))
+            .collect(),
     };
     let name: Box<str> = root.display().to_string().into();
     if !meta.is_dir() {
@@ -1349,8 +1359,8 @@ fn scan_dir_inner(
         // Compare the name first so the full path is only built for a likely match.
         .filter(|e| {
             ctx.exclude
-                .as_ref()
-                .is_none_or(|(name, full)| e.name != *name || path.join(&e.name) != *full)
+                .iter()
+                .all(|(name, full)| e.name != *name || path.join(&e.name) != *full)
         })
         .map(|e| {
             let child_path = path.join(&e.name);
@@ -1585,7 +1595,7 @@ mod record_private_tests {
             one_fs: true,
             clones: true,
             seen_inodes: Mutex::new(FxHashSet::default()),
-            exclude: None,
+            exclude: Vec::new(),
         };
         let raw = |b: &[u8]| OsStr::from_bytes(b).to_os_string();
         record_private(&root.join("d"), vec![(raw(b"\\xff"), 1)], &ctx);
@@ -1648,7 +1658,7 @@ mod progress_tests {
     /// still counts every file exactly once.
     #[test]
     fn huge_dirs_report_progress_while_read() {
-        let d = std::env::temp_dir().join(format!("dutype-progress-{}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("diskbytype-progress-{}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(d.join("sub")).unwrap();
         let n = REPORT_EVERY + 1000;
@@ -1743,7 +1753,7 @@ mod bulk_tests {
     use std::process::Command;
 
     fn tree(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("dutype-bulk-{name}-{}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("diskbytype-bulk-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(d.join("sub/deeper")).unwrap();
         fs::write(d.join("small.txt"), b"hi").unwrap();
@@ -1817,7 +1827,7 @@ mod bulk_tests {
     /// flags), and a tree without files has known freeable bytes anyway.
     #[test]
     fn dirs_only_tree_reports_detection() {
-        let d = std::env::temp_dir().join(format!("dutype-bulk-dirs-{}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("diskbytype-bulk-dirs-{}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(d.join("a/b")).unwrap();
         let progress = Progress::default();
@@ -1847,7 +1857,7 @@ mod bulk_tests {
     #[test]
     fn clone_families_count_once() {
         use std::io::{Seek, Write};
-        let d = std::env::temp_dir().join(format!("dutype-bulk-clones-{}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("diskbytype-bulk-clones-{}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(d.join("sub")).unwrap();
         fs::write(d.join("a"), vec![7u8; 8 << 20]).unwrap();
@@ -1936,7 +1946,7 @@ mod bulk_tests {
     fn private_size_of_partial_clone() {
         use std::io::{Seek, Write};
         let since = test_support::stamp();
-        let d = std::env::temp_dir().join(format!("dutype-bulk-private-{}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("diskbytype-bulk-private-{}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(d.join("sub")).unwrap();
         fs::write(d.join("a"), vec![7u8; 8 << 20]).unwrap();
@@ -2043,7 +2053,7 @@ mod bulk_tests {
     fn missing_dir_is_an_error() {
         let mut v = Vec::new();
         let r = platform::bulk::read_entries(
-            Path::new("/nonexistent-dutype"),
+            Path::new("/nonexistent-diskbytype"),
             &Progress::default(),
             &mut v,
             true,
@@ -2061,7 +2071,7 @@ mod private_tests {
 
     #[test]
     fn private_is_a_no_op_elsewhere() {
-        let d = std::env::temp_dir().join(format!("dutype-private-{}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("diskbytype-private-{}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(d.join("sub")).unwrap();
         fs::write(d.join("sub/f"), vec![1u8; 1 << 16]).unwrap();
@@ -2131,7 +2141,7 @@ pub(crate) mod reflink_tests {
 
     pub fn fixture(name: &str) -> Option<PathBuf> {
         let base = std::env::var_os("DUTYPE_REFLINK_TEST_DIR")?;
-        let d = PathBuf::from(base).join(format!("dutype-{name}-{}", std::process::id()));
+        let d = PathBuf::from(base).join(format!("diskbytype-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(d.join("sub")).unwrap();
         Some(d)
@@ -2299,7 +2309,7 @@ mod disappearing_entry_tests {
 
     #[test]
     fn disappeared_entry_is_counted_without_losing_healthy_sibling() {
-        let dir = std::env::temp_dir().join(format!("dutype-disappeared-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("diskbytype-disappeared-{}", std::process::id()));
         fs::create_dir(&dir).unwrap();
         fs::write(dir.join("vanished.txt"), b"gone").unwrap();
         fs::write(dir.join("healthy.txt"), b"kept").unwrap();
@@ -2327,7 +2337,7 @@ mod deep_stack_tests {
 
     #[test]
     fn deep_scan_report_account_and_drop_on_small_stack() {
-        let root = std::env::temp_dir().join(format!("dutype-small-stack-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("diskbytype-small-stack-{}", std::process::id()));
         fs::create_dir(&root).unwrap();
         let mut paths = vec![root.clone()];
         let mut leaf = root.clone();

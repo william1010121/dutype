@@ -1,43 +1,43 @@
 ---
-name: dutype
-description: Find out what is filling a disk or directory, broken down by kind — videos, PDFs, archives, ML models, node_modules, Python envs, .git, build output, caches — using the dutype CLI. Use when the user asks why a disk is full, what takes up space in a folder, how to free space, or wants every node_modules / virtualenv / cache listed with sizes.
+name: diskbytype
+description: Find out what is filling a disk or directory, broken down by kind — videos, PDFs, archives, ML models, node_modules, Python envs, .git, build output, caches — using the diskbytype CLI. Use when the user asks why a disk is full, what takes up space in a folder, how to free space, or wants every node_modules / virtualenv / cache listed with sizes.
 ---
 
-# dutype
+# diskbytype
 
 ## Match the skill to the binary
 
 This `main`-branch skill documents the matching source revision, including
 features not present in the current published v0.1.4 package. For that package,
-use the [v0.1.4 skill](https://github.com/william1010121/dutype/blob/v0.1.4/skills/dutype/SKILL.md)
+use the [v0.1.4 skill](https://github.com/william1010121/diskbytype/blob/v0.1.4/skills/diskbytype/SKILL.md)
 instead. CLI `--include-files` and MCP pagination/cursors below require a source
-build that exposes those options. Check `dutype --help` and the MCP tool schema;
+build that exposes those options. Check `diskbytype --help` and the MCP tool schema;
 the version string alone may not distinguish development builds.
 
-`dutype` scans a directory in parallel and attributes every byte to a category.
+`diskbytype` scans a directory in parallel and attributes every byte to a category.
 Directory rules win over extensions: everything inside `node_modules/` counts as
 `node_modules`, everything inside a folder with `pyvenv.cfg` counts as `Python env`.
 
 ## Commands
 
 ```bash
-dutype --json PATH                        # full report as JSON
-dutype --json --top 50 PATH               # longer lists
-dutype --json --category node_modules PATH   # largest node_modules with sizes (default: 20)
-dutype --json --category "Python env" ~      # largest venvs / conda envs (default: 20)
-dutype --json --category Video ~/Movies      # biggest video files
-dutype --json --category Unity --include-files PATH # custom mixed directory/file category
-dutype --json --clones PATH               # macOS: also detect APFS clones (slower)
-dutype --json --size-mode dedup PATH      # rank by size with APFS clones counted once (implies --clones)
-dutype --report PATH                      # same data as plain text
-dutype --dump-config                      # list all categories and rules
+diskbytype --json PATH                        # full report as JSON
+diskbytype --json --top 50 PATH               # longer lists
+diskbytype --json --category node_modules PATH   # largest node_modules with sizes (default: 20)
+diskbytype --json --category "Python env" ~      # largest venvs / conda envs (default: 20)
+diskbytype --json --category Video ~/Movies      # biggest video files
+diskbytype --json --category Unity --include-files PATH # custom mixed directory/file category
+diskbytype --json --clones PATH               # macOS: also detect APFS clones (slower)
+diskbytype --json --size-mode dedup PATH      # rank by size with APFS clones counted once (implies --clones)
+diskbytype --report PATH                      # same data as plain text
+diskbytype --dump-config                      # list all categories and rules
 ```
 
-Never run plain `dutype PATH` from an agent: without `--json` / `--report` it
+Never run plain `diskbytype PATH` from an agent: without `--json` / `--report` it
 opens an interactive TUI and waits for keyboard input.
 
-If using the published package, pair `npx -y dutype@0.1.4 --json PATH` (or
-`npm i -g dutype@0.1.4`) with the tagged v0.1.4 skill above. Do not send the
+If using the published package, pair `npx -y diskbytype@0.1.4 --json PATH` (or
+`npm i -g diskbytype@0.1.4`) with the tagged v0.1.4 skill above. Do not send the
 unreleased options in this `main` skill to that binary. Update package and skill
 versions together when a new release becomes available.
 
@@ -144,7 +144,7 @@ the clone-family estimate above. Never add these values up per folder.
 
 ## Workflow for "my disk is full"
 
-1. `dutype --json --top 15 ~` (or the path the user names) and summarize the
+1. `diskbytype --json --top 15 ~` (or the path the user names) and summarize the
    top categories and children in a few lines.
 2. Drill into the biggest child, or use `--category` for the dominant kind.
 3. Propose concrete actions with sizes: regenerable items first (`Build output`,
@@ -157,19 +157,19 @@ the clone-family estimate above. Never add these values up per folder.
 
 ## MCP
 
-`dutype --mcp` is an MCP server on stdio with two read-only tools,
+`diskbytype --mcp` is an MCP server on stdio with two read-only tools,
 `disk_usage(path, top?, cross_fs?, refresh?, clones?, size_mode?, private?)` and
 `find_by_category(path, category, top?, cross_fs?, refresh?, clones?, size_mode?, private?, include_files?, paginate?, cursor?)`,
 with the same fields as `--json`. `size_mode` is `"du"` (default) or `"dedup"`
 (implies `clones: true`); `private: true` adds `private_bytes` (implies
 `clones: true`).
-With `dutype --mcp --cache`, `refresh: true` replaces the session's in-memory
+With `diskbytype --mcp --cache`, `refresh: true` replaces the session's in-memory
 snapshot only; MCP never writes or replaces the CLI's disk cache. Use a CLI
 run with `--refresh` to update the disk snapshot used by future sessions.
-Claude Code: `claude mcp add dutype -- npx -y dutype --mcp`.
+Claude Code: `claude mcp add diskbytype -- npx -y diskbytype --mcp`.
 
 
-For category inventories beyond 500 matches, use `dutype --mcp --cache` without
+For category inventories beyond 500 matches, use `diskbytype --mcp --cache` without
 server-wide `--refresh`. Start with `paginate: true`; follow
 `pagination.next_cursor`, repeating the returned absolute `path`, category and
 effective options, including `include_files` (changing it rejects the cursor,

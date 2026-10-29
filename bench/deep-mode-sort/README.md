@@ -10,10 +10,10 @@ The summary and limitations are in [the deep-tree testing guide](../../docs/deep
 With Rust 1.99.1, Python 3 and a C compiler already available:
 
 ```sh
-python3 bench/deep-mode-sort/build.py --output /tmp/dutype-sort-bench
-cc -O2 bench/deep-mode-sort/rss_exec.c -o /tmp/dutype-sort-bench/rss_exec
+python3 bench/deep-mode-sort/build.py --output /tmp/diskbytype-sort-bench
+cc -O2 bench/deep-mode-sort/rss_exec.c -o /tmp/diskbytype-sort-bench/rss_exec
 # Wait until other builds/benchmarks are idle before measuring.
-python3 bench/deep-mode-sort/measure.py --output /tmp/dutype-sort-bench
+python3 bench/deep-mode-sort/measure.py --output /tmp/diskbytype-sort-bench
 ```
 
 The output path must be new. The build uses local git objects at the pinned

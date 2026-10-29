@@ -9,7 +9,7 @@ measure() {
 }
 echo "| Tool | user (s) | sys (s) | CPU total (s) | Peak RSS (MiB) |"
 echo "|:---|---:|---:|---:|---:|"
-measure dutype $DUTYPE --report $T
+measure diskbytype $DUTYPE --report $T
 measure dua dua -x aggregate $T
 measure gdu gdu -npsx $T
 measure dust dust -x -d 0 -P $T

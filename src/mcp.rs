@@ -1,5 +1,5 @@
-//! Minimal Model Context Protocol server over stdio (`dutype --mcp`), so LLM
-//! agents can call dutype as a tool. One JSON-RPC message per line.
+//! Minimal Model Context Protocol server over stdio (`diskbytype --mcp`), so LLM
+//! agents can call diskbytype as a tool. One JSON-RPC message per line.
 
 use crate::cache::{self, Snapshot};
 use crate::category::reg;
@@ -44,7 +44,7 @@ fn tools() -> Value {
                     "path": {"type": "string", "description": "Directory to scan. Absolute paths are best; ~ is expanded."},
                     "top": {"type": "integer", "minimum": 1, "maximum": 500, "default": 20, "description": "Length of each list."},
                     "cross_fs": {"type": "boolean", "default": false, "description": "Descend into other mounted filesystems."},
-                    "refresh": {"type": "boolean", "default": false, "description": "Rescan even if a cached scan exists (only matters with dutype --mcp --cache; see cached_at in the result)."},
+                    "refresh": {"type": "boolean", "default": false, "description": "Rescan even if a cached scan exists (only matters with diskbytype --mcp --cache; see cached_at in the result)."},
                     "clones": {"type": "boolean", "default": false, "description": "Detect shared blocks (makes the scan slower): APFS clones on macOS, shared extents (reflinks, snapshots; one FIEMAP ioctl per file) on Linux btrfs/XFS/bcachefs. Fills dedup_bytes and freeable_min_bytes."},
                     "size_mode": {"type": "string", "enum": ["du", "dedup"], "default": "du", "description": "Rank lists by allocated size (du) or by size with APFS clones counted once (dedup; implies clones)."},
                     "private": {"type": "boolean", "default": false, "description": "Also read the APFS private size (private_bytes) of partial clones: bytes freed immediately if that file alone is deleted; affected by APFS snapshots, never summed into folders. Slower; implies clones; macOS only (elsewhere accepted, no values; see accounting.private)."}
@@ -101,7 +101,7 @@ fn expand(path: &str) -> PathBuf {
     }
 }
 
-/// Cache behaviour for the whole server, from `dutype --mcp [--cache|--refresh]`.
+/// Cache behaviour for the whole server, from `diskbytype --mcp [--cache|--refresh]`.
 #[derive(Clone, Copy)]
 pub struct CacheOpts {
     pub use_cache: bool,
@@ -167,7 +167,7 @@ impl CursorState {
         Self {
             epoch: fingerprint(
                 &[RandomState::new(), RandomState::new()],
-                ("dutype-mcp-epoch", std::process::id()),
+                ("diskbytype-mcp-epoch", std::process::id()),
             ),
             query: [RandomState::new(), RandomState::new()],
             integrity: [RandomState::new(), RandomState::new()],
@@ -307,7 +307,7 @@ fn call_tool(name: &str, args: &Value, opts: CacheOpts) -> Result<Value, ToolErr
     let token = args.get("cursor").and_then(Value::as_str);
     let paginate = category.is_some() && (token.is_some() || args.get("paginate") == Some(&Value::Bool(true)));
     if paginate && (!use_cache || opts.always_refresh) {
-        return Err("category pagination requires dutype --mcp --cache without --refresh".into());
+        return Err("category pagination requires diskbytype --mcp --cache without --refresh".into());
     }
     let state = cursor_state();
     let cursor = token.map(|token| Cursor::decode(token, state)).transpose()?;
@@ -657,7 +657,7 @@ fn handle(msg: &Value, opts: CacheOpts) -> Option<Value> {
             json!({
                 "protocolVersion": PROTOCOL_VERSION,
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "dutype", "title": "dutype", "version": env!("CARGO_PKG_VERSION")},
+                "serverInfo": {"name": "diskbytype", "title": "diskbytype", "version": env!("CARGO_PKG_VERSION")},
                 "instructions": "Use disk_usage to see what kinds of data fill a directory, and \
                     find_by_category to list e.g. every node_modules or the biggest videos. \
                     Both are read-only; never delete files without the user's confirmation."
@@ -714,7 +714,7 @@ mod tests {
         fn new(shares: bool, private: bool) -> Self {
             static NEXT: AtomicU64 = AtomicU64::new(0);
             let dir = std::env::temp_dir().join(format!(
-                "dutype-pagination-unit-{}-{}",
+                "diskbytype-pagination-unit-{}-{}",
                 std::process::id(),
                 NEXT.fetch_add(1, Ordering::Relaxed)
             ));
@@ -958,7 +958,7 @@ mod tests {
     fn category_results_serialize_scan_wide_snapshot_errors_including_empty_matches() {
         use std::time::{Duration, UNIX_EPOCH};
 
-        let dir = std::env::temp_dir().join(format!("dutype-mcp-scan-errors-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("diskbytype-mcp-scan-errors-{}", std::process::id()));
         std::fs::create_dir(&dir).unwrap();
         std::fs::write(dir.join("paper.pdf"), b"pdf").unwrap();
         let path = std::fs::canonicalize(&dir).unwrap();
@@ -1104,7 +1104,7 @@ mod tests {
 
     #[test]
     fn tool_options_must_match_the_advertised_schema() {
-        let path = std::env::temp_dir().join(format!("dutype-mcp-invalid-options-{}", std::process::id()));
+        let path = std::env::temp_dir().join(format!("diskbytype-mcp-invalid-options-{}", std::process::id()));
         for (name, values) in [
             (
                 "top",
@@ -1132,7 +1132,7 @@ mod tests {
 
     #[test]
     fn integral_numeric_top_values_are_valid_and_honored() {
-        let dir = std::env::temp_dir().join(format!("dutype-mcp-integral-top-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("diskbytype-mcp-integral-top-{}", std::process::id()));
         std::fs::create_dir(&dir).unwrap();
         for i in 0..25 {
             std::fs::write(dir.join(format!("file-{i}.pdf")), b"pdf").unwrap();
@@ -1173,7 +1173,7 @@ mod tests {
 
     #[test]
     fn size_mode_is_validated_and_reported() {
-        let dir = std::env::temp_dir().join(format!("dutype-mcp-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("diskbytype-mcp-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("f"), b"x").unwrap();
         let path = dir.display().to_string();

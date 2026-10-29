@@ -1,6 +1,6 @@
 //! On-disk cache of scan results (`--cache`), so a big tree opens instantly
-//! the second time. One file per (path, --cross-fs) in ~/.cache/dutype.
-//! A cache is never trusted across dutype versions or category rule changes.
+//! the second time. One file per (path, --cross-fs) in ~/.cache/diskbytype.
+//! A cache is never trusted across diskbytype versions or category rule changes.
 
 use crate::category::{Category, reg};
 use crate::scan::{CloneInfo, DirInfo, Extents, Node, PrivateSizes, Reflink, ReflinkFs, Shared};
@@ -79,20 +79,40 @@ pub fn fnv1a(seed: u64, bytes: &[u8]) -> u64 {
     h
 }
 
-/// `$DUTYPE_CACHE_DIR`, else the OS cache directory plus `dutype`.
+/// `$DISKBYTYPE_CACHE_DIR` (or the legacy `$DUTYPE_CACHE_DIR`), else the OS
+/// cache directory plus `diskbytype`.
 pub fn dir() -> Option<PathBuf> {
-    if let Some(p) = std::env::var_os("DUTYPE_CACHE_DIR") {
+    if let Some(p) = std::env::var_os("DISKBYTYPE_CACHE_DIR").or_else(|| std::env::var_os("DUTYPE_CACHE_DIR")) {
         return Some(PathBuf::from(p));
     }
+    default_dir("diskbytype")
+}
+
+/// The cache directory of the pre-rename `diskbytype`, if it exists. Never
+/// written to; scans skip it so old snapshots do not count towards totals.
+pub fn legacy_dir() -> Option<PathBuf> {
+    default_dir("dutype").filter(|p| p.is_dir())
+}
+
+fn default_dir(app: &str) -> Option<PathBuf> {
     let env = |k| std::env::var_os(k).map(PathBuf::from);
-    // Like the config (~/.config/dutype): one global place, also on macOS.
+    // Like the config (~/.config/diskbytype): one global place, also on macOS.
     if cfg!(windows) {
-        env("LOCALAPPDATA").map(|b| b.join("dutype").join("cache"))
+        env("LOCALAPPDATA").map(|b| b.join(app).join("cache"))
     } else {
         env("XDG_CACHE_HOME")
             .or_else(|| env("HOME").map(|h| h.join(".cache")))
-            .map(|b| b.join("dutype"))
+            .map(|b| b.join(app))
     }
+}
+
+/// Every cache directory a scan must skip: the current one and the legacy one.
+pub fn skip_dirs() -> Vec<PathBuf> {
+    [dir(), legacy_dir()]
+        .into_iter()
+        .flatten()
+        .filter_map(|d| std::fs::canonicalize(d).ok())
+        .collect()
 }
 
 /// Create the cache directory up front. Called before any scan when caching
@@ -776,7 +796,7 @@ mod tests {
     }
 
     pub(super) fn temp(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("dutype-cache-{name}-{}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("diskbytype-cache-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d
@@ -1127,7 +1147,7 @@ mod tests {
     fn cache_dir_inside_root_is_not_counted() {
         let root = fs::canonicalize(temp("excl")).unwrap();
         fs::write(root.join("a.pdf"), vec![1u8; 10_000]).unwrap();
-        let cache = root.join(".cache").join("dutype");
+        let cache = root.join(".cache").join("diskbytype");
         fs::create_dir_all(&cache).unwrap();
         let before = crate::scan::scan_excluding(&root, true, false, &Progress::default(), Some(&cache)).unwrap();
         fs::write(cache.join("snap.bin"), vec![2u8; 200_000]).unwrap();
