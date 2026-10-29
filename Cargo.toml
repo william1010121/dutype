@@ -1,6 +1,7 @@
 [package]
 name = "diskbytype"
 version = "0.1.4"
+default-run = "diskbytype"
 edition = "2024"
 rust-version = "1.88"
 description = "Disk usage by kind: a fast parallel TUI that shows how much of a folder is video, PDFs, node_modules, Python envs, caches, ML models, ..."

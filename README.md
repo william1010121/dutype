@@ -103,7 +103,7 @@ ignored (and never counted), so the first `--cache` scan runs in full.
 npm and release installers below use published binaries (currently
 [v0.1.4](https://github.com/william1010121/diskbytype/releases/tag/v0.1.4)). For that
 release, use its [tagged README](https://github.com/william1010121/diskbytype/blob/v0.1.4/README.md)
-and [tagged agent skill](https://github.com/william1010121/diskbytype/blob/v0.1.4/skills/diskbytype/SKILL.md)
+and [tagged agent skill](https://github.com/william1010121/diskbytype/blob/v0.1.4/skills/dutype/SKILL.md)
 directly, not the tagged README’s older skill-download snippet pointing to `main`.
 Newer options such as `--include-files` and MCP pagination need a matching source
 build (the **From source** method below), not merely an installed release. Check
@@ -613,7 +613,7 @@ before relying on options from a different revision.
 
 ```bash
 mkdir -p ~/.claude/skills/diskbytype && curl -fsSL -o ~/.claude/skills/diskbytype/SKILL.md \
-  https://raw.githubusercontent.com/william1010121/diskbytype/v0.1.4/skills/diskbytype/SKILL.md
+  https://raw.githubusercontent.com/william1010121/diskbytype/v0.1.4/skills/dutype/SKILL.md
 ```
 
 When a new version is released, update this pin and the packaged skill guidance
